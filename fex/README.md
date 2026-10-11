@@ -35,5 +35,11 @@ M1 Pro (2026-10-10 and 2026-10-11). The Wine half is `patches-arm64/0022` to `00
 - `0013` self-modifying code across threads: a block whose guest code changed before its page was
   protected is compiled again. A thread kept running code another thread had patched in about 1 of
   300 patches, for good.
-- `0014` the same string-instruction resume as `0005` for 32-bit programs (the WoW64 module). Built,
-  not yet run: the measurements above are all x86-64.
+- `0014` the same string-instruction resume as `0005` for 32-bit programs (the WoW64 module).
+- `0015` MXCSR and the x87 status word through the 32-bit context. Without it `0001` hangs a 32-bit
+  program that unmasks an SSE exception and masks it again in its handler (the trap re-armed from a
+  copy the context never reached). 32-bit SSE exceptions arrive as STATUS_FLOAT_MULTIPLE_TRAPS, as
+  32-bit Windows reports them.
+
+32-bit programs were measured with the engine built by CI (it has the i386 half): x87test32 120/128,
+the same eight x87 gaps as the 64-bit build; the string resume and the code patching probe pass.

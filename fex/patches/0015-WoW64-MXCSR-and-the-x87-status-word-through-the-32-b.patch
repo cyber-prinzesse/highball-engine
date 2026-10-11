@@ -1,0 +1,249 @@
+From 9e5676e44bc21b1c75fb9db50926e89d10992300 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 10:34:00 +0200
+Subject: [PATCH] WoW64: MXCSR and the x87 status word through the 32-bit
+ context
+
+The WoW64 module never loaded MXCSR from the 32-bit context and never stored it (ReconstructWowContext even forced
+0x1f80), and it carried only IE, C0-C3 and TOP of the x87 status word. With the floating-point exceptions of patch 0001
+that hung 32-bit programs: an SSE exception unmasked with _controlfp trapped, the handler masked it in the context and
+continued, and the JIT re-armed the trap from its own copy and trapped again, forever (x87test32 on the engine built by
+CI). The MXCSR flags also did not survive the native code of a system call.
+
+The context now carries MXCSR (control bits from the state, status flags from FPSR: the faulting context's for an
+exception or suspend, the live one at a system call) and the whole status word, and loading it sets the state and FPSR.
+An SSE exception that trapped on the host sets its flag in the context's MXCSR and is reported as
+STATUS_FLOAT_MULTIPLE_TRAPS, which 32-bit Windows does for every SIMD floating-point exception (Windows Server 2022 and
+2025; x64 programs get the specific code). The x87 status word conversion is now shared with the ARM64EC module.
+x87test32 120/128 like the 64-bit build (the eight known x87 gaps), every _controlfp check passes.
+---
+ Source/Windows/ARM64EC/Module.cpp | 32 +++----------------
+ Source/Windows/Common/Exception.h | 27 ++++++++++++++++
+ Source/Windows/WOW64/Module.cpp   | 51 ++++++++++++++++++++-----------
+ 3 files changed, 65 insertions(+), 45 deletions(-)
+
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 32cb3a4..0842404 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -399,30 +399,6 @@ static bool HasTag(const CONTEXT& Context) {
+   return Value == Tag;
+ }
+ 
+-static uint16_t FSW(const FEXCore::Core::CPUState& State) {
+-  using namespace FEXCore::X86State;
+-  uint16_t Value = (State.flags[X87FLAG_TOP_LOC] & 7) << 11;
+-  Value |= (State.flags[X87FLAG_C0_LOC] & 1) << 8 | (State.flags[X87FLAG_C1_LOC] & 1) << 9 | (State.flags[X87FLAG_C2_LOC] & 1) << 10 |
+-           (State.flags[X87FLAG_C3_LOC] & 1) << 14;
+-  for (int i = 0; i < 7; ++i) {
+-    Value |= (State.flags[X87FLAG_IE_LOC + i] & 1) << i; // IE DE ZE OE UE PE SF
+-  }
+-  Value |= (State.flags[X87FLAG_ES_LOC] & 1) << 7 | (State.flags[X87FLAG_ES_LOC] & 1) << 15; // ES and B
+-  return Value;
+-}
+-
+-static void SetFSW(FEXCore::Core::CPUState& State, uint16_t Value) {
+-  using namespace FEXCore::X86State;
+-  for (int i = 0; i < 7; ++i) {
+-    State.flags[X87FLAG_IE_LOC + i] = (Value >> i) & 1;
+-  }
+-  State.flags[X87FLAG_ES_LOC] = (Value >> 7) & 1;
+-  State.flags[X87FLAG_C0_LOC] = (Value >> 8) & 1;
+-  State.flags[X87FLAG_C1_LOC] = (Value >> 9) & 1;
+-  State.flags[X87FLAG_C2_LOC] = (Value >> 10) & 1;
+-  State.flags[X87FLAG_C3_LOC] = (Value >> 14) & 1;
+-  State.flags[X87FLAG_TOP_LOC] = (Value >> 11) & 0b111;
+-}
+ } // namespace X64StateExtension
+ 
+ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, CONTEXT& Context) {
+@@ -492,7 +468,7 @@ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, C
+     if (Extended) {
+       // The x87 environment and the registers in stack order (FloatRegisters[i] is ST(i), mm[] is physical)
+       State.FCW = Context.FltSave.ControlWord;
+-      X64StateExtension::SetFSW(State, Context.FltSave.StatusWord);
++      FEX::Windows::SetX87StatusWord(State, Context.FltSave.StatusWord);
+       State.AbridgedFTW = Context.FltSave.TagWord;
+       const uint32_t Top = State.flags[FEXCore::X86State::X87FLAG_TOP_LOC];
+       for (uint32_t i = 0; i < 8; ++i) {
+@@ -505,7 +481,7 @@ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, C
+       // occurs in practice (Windows initialises 0x27f); a context from NtSetContextThread or an FXSAVE image has one.
+       memcpy(State.mm, Context.FltSave.FloatRegisters, sizeof(State.mm));
+       State.FCW = Context.FltSave.ControlWord;
+-      X64StateExtension::SetFSW(State, Context.FltSave.StatusWord);
++      FEX::Windows::SetX87StatusWord(State, Context.FltSave.StatusWord);
+       State.AbridgedFTW = Context.FltSave.TagWord;
+     }
+   }
+@@ -595,7 +571,7 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
+   // The rest of the x64 state (see X64StateExtension): x87 environment, the guest's MXCSR with its flags (FPSR holds
+   // them while the JIT runs), all of EFlags. NZCV+SS below stay authoritative for the flags they map.
+   const uint32_t MXCSR = (State.mxcsr & 0xFFC0) | FEX::Windows::MXCSRFlagsFromFPSR(FPSR);
+-  ECContext.X13 = State.FCW | static_cast<uint64_t>(X64StateExtension::FSW(State)) << 16 | static_cast<uint64_t>(State.AbridgedFTW) << 32;
++  ECContext.X13 = State.FCW | static_cast<uint64_t>(FEX::Windows::X87StatusWord(State)) << 16 | static_cast<uint64_t>(State.AbridgedFTW) << 32;
+   ECContext.X14 = MXCSR | static_cast<uint64_t>(EFlags) << 32;
+   ECContext.X28 = X64StateExtension::Marker | X64StateExtension::FlagX87;
+   if (ECContext.ContextFlags & CONTEXT_ARM64_FEX_YMMSTATE & ~CONTEXT_ARM64) {
+@@ -1296,7 +1272,7 @@ void GetX87State(XMM_SAVE_AREA32* FltSave) {
+   const auto& State = Thread->CurrentFrame->State;
+   const unsigned Top = State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] & 7;
+   FltSave->ControlWord = State.FCW;
+-  FltSave->StatusWord = Exception::X64StateExtension::FSW(State);
++  FltSave->StatusWord = FEX::Windows::X87StatusWord(State);
+   FltSave->TagWord = State.AbridgedFTW;
+   for (unsigned i = 0; i < 8; ++i) {
+     memset(&FltSave->FloatRegisters[i], 0, sizeof(FltSave->FloatRegisters[i]));
+diff --git a/Source/Windows/Common/Exception.h b/Source/Windows/Common/Exception.h
+index 8821d09..c913d8b 100644
+--- a/Source/Windows/Common/Exception.h
++++ b/Source/Windows/Common/Exception.h
+@@ -30,6 +30,33 @@ static inline uint32_t MXCSRFlagsFromFPSR(uint32_t FPSR) {
+   return (FPSR & 1) | ((FPSR >> 1) & 0xf) << 2 | ((FPSR >> 7) & 1) << 1;
+ }
+ 
++// The x87 status word from FEX's flags (IE DE ZE OE UE PE SF, ES with B mirroring it, C0-C3, TOP), and back
++static inline uint16_t X87StatusWord(const FEXCore::Core::CPUState& State) {
++  using namespace FEXCore::X86State;
++  uint16_t Value = (State.flags[X87FLAG_TOP_LOC] & 7) << 11;
++  Value |= (State.flags[X87FLAG_C0_LOC] & 1) << 8 | (State.flags[X87FLAG_C1_LOC] & 1) << 9 | (State.flags[X87FLAG_C2_LOC] & 1) << 10 |
++           (State.flags[X87FLAG_C3_LOC] & 1) << 14;
++  for (int i = 0; i < 7; ++i) {
++    Value |= (State.flags[X87FLAG_IE_LOC + i] & 1) << i;
++  }
++  Value |= (State.flags[X87FLAG_ES_LOC] & 1) << 7 | (State.flags[X87FLAG_ES_LOC] & 1) << 15;
++  return Value;
++}
++
++static inline void SetX87StatusWord(FEXCore::Core::CPUState& State, uint16_t Value) {
++  using namespace FEXCore::X86State;
++  for (int i = 0; i < 7; ++i) {
++    State.flags[X87FLAG_IE_LOC + i] = (Value >> i) & 1;
++  }
++  State.flags[X87FLAG_ES_LOC] = (Value >> 7) & 1;
++  State.flags[X87FLAG_B_LOC] = (Value >> 7) & 1;
++  State.flags[X87FLAG_C0_LOC] = (Value >> 8) & 1;
++  State.flags[X87FLAG_C1_LOC] = (Value >> 9) & 1;
++  State.flags[X87FLAG_C2_LOC] = (Value >> 10) & 1;
++  State.flags[X87FLAG_C3_LOC] = (Value >> 14) & 1;
++  State.flags[X87FLAG_TOP_LOC] = (Value >> 11) & 0b111;
++}
++
+ // The unmasked pending x87 exception flags (bits 0-5) and the stack fault bit (bit 6) for the #MF decode
+ static inline uint32_t X87PendingExceptions(const FEXCore::Core::CPUState& State) {
+   uint32_t Flags = 0;
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index 45541b8..e1934fd 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -239,16 +239,21 @@ void LoadStateFromWowContext(FEXCore::Core::InternalThreadState* Thread) {
+   memcpy(State.mm, XSave->FloatRegisters, sizeof(State.mm));
+ 
+   State.FCW = XSave->ControlWord;
+-  State.flags[FEXCore::X86State::X87FLAG_IE_LOC] = XSave->StatusWord & 1;
+-  State.flags[FEXCore::X86State::X87FLAG_C0_LOC] = (XSave->StatusWord >> 8) & 1;
+-  State.flags[FEXCore::X86State::X87FLAG_C1_LOC] = (XSave->StatusWord >> 9) & 1;
+-  State.flags[FEXCore::X86State::X87FLAG_C2_LOC] = (XSave->StatusWord >> 10) & 1;
+-  State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = (XSave->StatusWord >> 14) & 1;
+-  State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = (XSave->StatusWord >> 11) & 0b111;
++  FEX::Windows::SetX87StatusWord(State, XSave->StatusWord);
+   State.AbridgedFTW = XSave->TagWord;
++
++  // MXCSR: the JIT keeps the control bits in the state and arms the trap enables from them; the status flags are
++  // the FPSR cumulative bits while it runs. Native code ran since the context was stored (a system call, an exception
++  // handler that may have changed MXCSR), so both come from the context.
++  State.mxcsr = XSave->MxCsr & 0xFFC0;
++  uint64_t FPSR;
++  __asm volatile("mrs %[fpsr], fpsr" : [fpsr] "=r"(FPSR));
++  FPSR = (FPSR & ~0x9fULL) | FEX::Windows::FPSRBitsFromMXCSRFlags(XSave->MxCsr & 0x3f);
++  __asm volatile("msr fpsr, %[fpsr]" ::[fpsr] "r"(FPSR));
+ }
+ 
+-void StoreWowContextFromState(WOW64_CONTEXT* Context) {
++// FPSR: the host FPSR holding the guest's MXCSR status flags (the faulting context's for an exception)
++void StoreWowContextFromState(WOW64_CONTEXT* Context, uint64_t FPSR) {
+   auto Thread = GetTLS().ThreadState();
+   auto& State = Thread->CurrentFrame->State;
+ 
+@@ -281,10 +286,10 @@ void StoreWowContextFromState(WOW64_CONTEXT* Context) {
+   memcpy(XSave->FloatRegisters, State.mm, sizeof(State.mm));
+ 
+   XSave->ControlWord = State.FCW;
+-  XSave->StatusWord = (State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] << 11) | (State.flags[FEXCore::X86State::X87FLAG_C0_LOC] << 8) |
+-                      (State.flags[FEXCore::X86State::X87FLAG_C1_LOC] << 9) | (State.flags[FEXCore::X86State::X87FLAG_C2_LOC] << 10) |
+-                      (State.flags[FEXCore::X86State::X87FLAG_C3_LOC] << 14) | State.flags[FEXCore::X86State::X87FLAG_IE_LOC];
++  XSave->StatusWord = FEX::Windows::X87StatusWord(State);
+   XSave->TagWord = State.AbridgedFTW;
++  XSave->MxCsr = (State.mxcsr & 0xFFC0) | FEX::Windows::MXCSRFlagsFromFPSR(static_cast<uint32_t>(FPSR));
++  XSave->MxCsr_Mask = 0xFFFF;
+ 
+   Context->FloatSave.ControlWord = XSave->ControlWord;
+   Context->FloatSave.StatusWord = XSave->StatusWord;
+@@ -297,7 +302,9 @@ void StoreWowContextFromState(WOW64_CONTEXT* Context) {
+ }
+ 
+ void FlushThreadStateContext() {
+-  StoreWowContextFromState(GetWow64Context());
++  uint64_t FPSR;
++  __asm volatile("mrs %[fpsr], fpsr" : [fpsr] "=r"(FPSR));
++  StoreWowContextFromState(GetWow64Context(), FPSR);
+ }
+ 
+ void ReconstructThreadState(CONTEXT* Context) {
+@@ -331,11 +338,7 @@ WOW64_CONTEXT* ReconstructWowContext(CONTEXT* Context) {
+   }
+ 
+   WOW64_CONTEXT* WowContext = GetWow64Context();
+-  auto* XSave = reinterpret_cast<XSAVE_FORMAT*>(WowContext->ExtendedRegisters);
+-  XSave->ControlWord = 0x27f;
+-  XSave->MxCsr = 0x1f80;
+-
+-  StoreWowContextFromState(WowContext);
++  StoreWowContextFromState(WowContext, Context->Fpsr);
+   return WowContext;
+ }
+ 
+@@ -379,12 +382,17 @@ bool HandleSuspendInterrupt(CONTEXT* Context) {
+ 
+   // Since interrupts only happen at the start of blocks, the reconstructed state should be entirely accurate
+   ReconstructThreadState(Context);
+-  FlushThreadStateContext();
++  StoreWowContextFromState(GetWow64Context(), Context->Fpsr);
+ 
+   // Yield to the suspender
+   UnlockJITContext();
+   LockJITContext();
+ 
++  // The context may have been changed meanwhile (SetThreadContext): continue with the MXCSR flags it holds now
++  uint64_t FPSR;
++  __asm volatile("mrs %[fpsr], fpsr" : [fpsr] "=r"(FPSR));
++  Context->Fpsr = static_cast<DWORD>(FPSR);
++
+   // Adjust context to return to the dispatcher, reloading SRA from thread state
+   const auto& Config = SignalDelegator->GetConfig();
+   Context->Pc = Config.AbsoluteLoopTopAddressFillSRA;
+@@ -793,6 +801,7 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+   LogMan::Msg::DFmt("pc: {:X} eip: {:X} code: {:X}", Context->Pc, WowContext->Eip, Exception->ExceptionCode);
+ 
+   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
++  const bool HostFault = !Fault.FaultToTopAndGeneratedException;
+   BOOL FirstChance = TRUE;
+   EXCEPTION_RECORD GuestException =
+     FEX::Windows::HandleGuestException(Fault, *Exception, WowContext->Eip, WowContext->Eax, WowContext->Ecx, FirstChance,
+@@ -800,6 +809,14 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+   if (GuestException.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+     WowContext->EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
+   }
++  if (const uint32_t Flags = HostFault ? FEX::Windows::MXCSRFlagsForFloatException(GuestException.ExceptionCode) : 0) {
++    // An unmasked SSE exception trapped on the host (the trap enables follow the guest's MXCSR masks in JIT code). x86
++    // sets the flag in MXCSR, and 32-bit Windows reports every SIMD floating-point exception as
++    // STATUS_FLOAT_MULTIPLE_TRAPS (measured on Windows Server 2022 and 2025; x64 programs get the specific code).
++    reinterpret_cast<XSAVE_FORMAT*>(WowContext->ExtendedRegisters)->MxCsr |= Flags;
++    GuestException.ExceptionCode = STATUS_FLOAT_MULTIPLE_TRAPS;
++    GuestException.NumberParameters = 0;
++  }
+   // wow64.dll will handle adjusting PC in the dispatched context after a breakpoint
+ 
+   Context::UnlockJITContext();
+-- 
+2.50.1 (Apple Git-155)
+
