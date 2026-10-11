@@ -643,6 +643,7 @@ static void group_crt(void)
     fid_check(!(csr & 0x200), "crt.em.mxcsr", "MXCSR %#x after unmasking ZE with _controlfp", csr);
     fid_check(g_crt_hits == 1, "crt.em.trap", "1/0 with ZE unmasked by _controlfp: %ld exceptions (code %#lx)", g_crt_hits,
               g_crt_code);
+    fid_info("crt.em.code", "%#lx", g_crt_code);
     fid_check((getcsr() & 0x1f80) == 0x1f80, "crt.em.restore", "MXCSR %#x after masking again", getcsr());
 
     /* the CRT reads back masks set with LDMXCSR (32-bit: _controlfp reports the x87 word, with _EM_AMBIGUOUS when
