@@ -31,8 +31,9 @@
 /* DR7: L0 with an instruction breakpoint in DR0, L1 with a 4-byte write breakpoint in DR1 */
 #define DR7_EXEC0   0x1
 #define DR7_WRITE1  (0x4 | (1u << 20) | (3u << 22))
-/* how the registers read back (drtest measured it): x64 sets bit 10, WoW64 does not */
-#define DR7_READ(v) ((v) | (WOW64 ? 0 : 0x400))
+/* How DR7 reads back (measured on Windows Server 2022 and 2025): as it was set until the thread runs with it; then a
+ * 64-bit thread's has bit 10 set, as the processor gives it back. WoW64 reads it through 0xffff0155, never bit 10. */
+#define DR7_RAN(v) ((v) | (WOW64 ? 0 : 0x400))
 
 struct shared
 {
@@ -224,11 +225,11 @@ static void test_event(void)
             fid_check(set_dr(thread, sh->target, sh->watch, DR7_EXEC0 | DR7_WRITE1), "event.set",
                       "SetThreadContext failed, error %lu", GetLastError());
             get_dr(thread, &c, CONTEXT_DEBUG_REGISTERS);
-            fid_check(c.Dr0 == sh->target && c.Dr1 == sh->watch && c.Dr7 == DR7_READ(DR7_EXEC0 | DR7_WRITE1),
+            fid_check(c.Dr0 == sh->target && c.Dr1 == sh->watch && c.Dr7 == (DR7_EXEC0 | DR7_WRITE1),
                       "event.readback", "Dr0 %#llx Dr1 %#llx Dr7 %#llx (want %#llx %#llx %#llx)",
                       (unsigned long long)c.Dr0, (unsigned long long)c.Dr1, (unsigned long long)c.Dr7,
                       (unsigned long long)sh->target, (unsigned long long)sh->watch,
-                      (unsigned long long)DR7_READ(DR7_EXEC0 | DR7_WRITE1));
+                      (unsigned long long)(DR7_EXEC0 | DR7_WRITE1));
             break;
         case EXCEPTION_DEBUG_EVENT:
         {
@@ -323,7 +324,7 @@ static void test_suspend(void)
               (unsigned long long)c.Dr0, (unsigned long long)c.Dr1, (unsigned long long)c.Dr7);
     fid_check(set_dr(main_t, sh->target, 0, DR7_EXEC0), "suspend.set", "SetThreadContext failed, error %lu", GetLastError());
     get_dr(main_t, &c, CONTEXT_DEBUG_REGISTERS);
-    fid_check(c.Dr0 == sh->target && c.Dr7 == DR7_READ(DR7_EXEC0), "suspend.readback", "Dr0 %#llx Dr7 %#llx",
+    fid_check(c.Dr0 == sh->target && c.Dr7 == DR7_EXEC0, "suspend.readback", "Dr0 %#llx Dr7 %#llx",
               (unsigned long long)c.Dr0, (unsigned long long)c.Dr7);
     ResumeThread(main_t);
     fid_check(wait_for(&sh->main_hits, 3, 10000), "suspend.exec", "%ld hits on the instruction breakpoint after 10 s", sh->main_hits);
@@ -331,7 +332,7 @@ static void test_suspend(void)
     /* read back while it runs into its breakpoint, add a data breakpoint to what was read (as a debugger does) */
     SuspendThread(main_t);
     get_dr(main_t, &c, CONTEXT_DEBUG_REGISTERS);
-    fid_check(c.Dr0 == sh->target && c.Dr7 == DR7_READ(DR7_EXEC0), "suspend.readback.running", "Dr0 %#llx Dr7 %#llx",
+    fid_check(c.Dr0 == sh->target && c.Dr7 == DR7_RAN(DR7_EXEC0), "suspend.readback.running", "Dr0 %#llx Dr7 %#llx",
               (unsigned long long)c.Dr0, (unsigned long long)c.Dr7);
     c.Dr1 = sh->watch;
     c.Dr7 |= DR7_WRITE1;
@@ -363,7 +364,7 @@ static void test_suspend(void)
               (unsigned long long)c.Dr0, (unsigned long long)c.Dr7);
     set_dr(wait_t, sh->target, 0, DR7_EXEC0);
     get_dr(wait_t, &c, CONTEXT_DEBUG_REGISTERS);
-    fid_check(c.Dr0 == sh->target && c.Dr7 == DR7_READ(DR7_EXEC0), "suspend.wait.readback", "Dr0 %#llx Dr7 %#llx",
+    fid_check(c.Dr0 == sh->target && c.Dr7 == DR7_EXEC0, "suspend.wait.readback", "Dr0 %#llx Dr7 %#llx",
               (unsigned long long)c.Dr0, (unsigned long long)c.Dr7);
     ResumeThread(wait_t);
     ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, evname);
@@ -416,7 +417,7 @@ static void test_created(void)
     target = base + ((uintptr_t)target_fn - (uintptr_t)GetModuleHandleA(NULL));
     fid_check(set_dr(pi.hThread, target, 0, DR7_EXEC0), "created.set", "SetThreadContext failed, error %lu", GetLastError());
     get_dr(pi.hThread, &c, CONTEXT_DEBUG_REGISTERS);
-    fid_check(c.Dr0 == target && c.Dr7 == DR7_READ(DR7_EXEC0), "created.readback", "Dr0 %#llx Dr7 %#llx (want %#llx)",
+    fid_check(c.Dr0 == target && c.Dr7 == DR7_EXEC0, "created.readback", "Dr0 %#llx Dr7 %#llx (want %#llx)",
               (unsigned long long)c.Dr0, (unsigned long long)c.Dr7, (unsigned long long)target);
     ResumeThread(pi.hThread);
     WaitForSingleObject(pi.hProcess, 10000);
