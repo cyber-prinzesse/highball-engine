@@ -1,9 +1,19 @@
-From cec94ecd43a0b8b3913f9160d5bf4f0c72588a57 Mon Sep 17 00:00:00 2001
-From: fid <fid@local>
-Date: Sun, 11 Oct 2026 07:06:28 +0200
-Subject: [PATCH 02/13] ARM64EC: raise the guest divide error (#DE) for
- DIV/IDIV
+From c8af934a5362adbbde396c7cf6275ce10594cad8 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 11:50:51 +0200
+Subject: [PATCH] ARM64EC: raise the guest divide error (#DE) for DIV and IDIV
 
+FEX lowered DIV and IDIV to udiv and sdiv with no check, so a zero divisor or an overflowing quotient
+produced a value and no exception (FEX issue 1980 lists it as a known failure). .NET, Mono and Java
+rely on #DE for their DivideByZeroException.
+
+The Div and UDiv IR ops carry a TrapBits argument, the x86 quotient width, set by DIV, IDIV and AAM.
+With HostFeatures::EmitDivideTraps (ARM64EC only) the backend checks without touching NZCV: cbz and
+cbnz on computed values, MIN / -1 for the sign-extended fast path, the quotient range for 8, 16 and
+32-bit results, and the long-divide helpers return remainder == divisor on overflow. A failed check
+branches to brk #0xDE00 (zero divisor) or brk #0xDE01 (overflow). ResetToConsistentState maps them to
+STATUS_INTEGER_DIVIDE_BY_ZERO and STATUS_INTEGER_OVERFLOW at the DIV's RIP with the state from before
+the instruction, as x86-64 Windows reports them (ctxtest div0, idivovf and divovf).
 ---
  FEXCore/Source/Interface/Core/JIT/ALUOps.cpp  | 106 ++++++++++++++++++
  FEXCore/Source/Interface/Core/JIT/JIT.cpp     |  24 +++-
@@ -423,6 +433,3 @@ index c033db8..35a70b3 100644
  
    if (HostType == FEXCore::HostFeatures::HostTypeEnum::Wow64) {
      // AVX is unsupported for WOW64
--- 
-2.50.1 (Apple Git-155)
-

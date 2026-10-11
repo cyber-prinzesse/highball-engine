@@ -1,8 +1,7 @@
-From 23882a3ff002cd88a5eb23a7ea92c3ec242dc0da Mon Sep 17 00:00:00 2001
+From 51b29db3674e6dd4f32afc04883f699ce37dd2c1 Mon Sep 17 00:00:00 2001
 From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
 Date: Sun, 11 Oct 2026 08:05:45 +0200
-Subject: [PATCH 04/13] Keep FEX's own C++ code out of the guest's MXCSR status
- flags
+Subject: [PATCH] Keep FEX's own C++ code out of the guest's MXCSR status flags
 
 With the fp-exceptions change the guest's MXCSR status flags are the host FPSR cumulative bits while the JIT runs. The compiler, the block linker and code invalidation are C++ and set host flags as they go, inexact above all (hash table load factors), so the first call of every API set MXCSR.PE in the guest, and a program testing PE after an exact computation saw it set.
 
@@ -119,6 +118,3 @@ index 3b6b31c..521fc20 100644
  
      auto* Thread = GetCPUArea().ThreadState();
      KiUserExceptionDispatcherStackLayout DispatchArgs {
--- 
-2.50.1 (Apple Git-155)
-

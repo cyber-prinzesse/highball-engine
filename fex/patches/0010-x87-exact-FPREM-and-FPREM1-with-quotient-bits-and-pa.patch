@@ -1,8 +1,8 @@
-From d2ec3c11a643649e387d9cddea470ad5a8eec9e9 Mon Sep 17 00:00:00 2001
+From 943ed32e5f0406407f8e04306a50b7c06e5fc180 Mon Sep 17 00:00:00 2001
 From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
 Date: Sun, 11 Oct 2026 08:20:41 +0200
-Subject: [PATCH 10/13] x87: exact FPREM and FPREM1 with quotient bits and
- partial reduction
+Subject: [PATCH] x87: exact FPREM and FPREM1 with quotient bits and partial
+ reduction
 
 FPREM divided, rounded the quotient to 64 bits, truncated it and multiplied back, so the remainder was wrong whenever the quotient needed more bits: 2^100 mod 3 gave 0 instead of 1, and 1 mod 2^-16400 gave minus infinity. C0, C3 and C1 never held the quotient bits that trigonometric range reduction reads, and C2 was always cleared, so programs never saw a partial remainder. FPREM1 used SoftFloat's IEEE remainder, right in value but also without the condition codes.
 
@@ -175,6 +175,3 @@ index 4785d59..27883ab 100644
    {OPD(0xD9, 0xF9), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87FYL2X, true>},
    {OPD(0xD9, 0xFA), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80SQRTSTACK, false>},
    {OPD(0xD9, 0xFB), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80SINCOSSTACK, true>},
--- 
-2.50.1 (Apple Git-155)
-

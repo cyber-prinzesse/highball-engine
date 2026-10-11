@@ -62,15 +62,22 @@ are unwelcome by their own policies.
 Apple ends most of Rosetta 2 in macOS 28 (September 2027). The second workflow here,
 [`build-arm64.yml`](.github/workflows/build-arm64.yml), builds the engine Highball will need for
 that: upstream Wine ([`inputs-arm64.json`](inputs-arm64.json)) compiled natively for Apple silicon
-with ARM64X builtins, FEX for x86 and x86-64 programs (Hangover's DLLs under Wine's emulator names,
-with a Darwin build of FEX's Unix helper from [`fex/`](fex/)), and the three patches in
-[`patches-arm64/`](patches-arm64/). It runs only through Highball's signed Wine loader, the helper
+with ARM64X builtins, FEX for x86 and x86-64 programs (Hangover's DLLs under Wine's emulator names
+by default, or FEX 2610 built from source with the series in [`fex/patches/`](fex/patches/) when
+dispatched with `fex_build: source`, either with a Darwin build of FEX's Unix helper from
+[`fex/`](fex/)), and the series in [`patches-arm64/`](patches-arm64/). It runs only through Highball's signed Wine loader, the helper
 bundle inside Highball.app that carries Apple's cross-architecture entitlement; the loader in the
 tarball is for development. State on 2026-10-04, measured on an M4 running macOS 27.0: a prefix
 boots in 2.4 s with both halves populated, 32-bit and 64-bit x86 programs run within 20 percent of
 Rosetta on a compute loop, and there is no renderer yet, because DXMT needs the Mac driver's Metal
 glue that only CrossOver's tree has. The decision document and the measurements are in Highball's
 `private/notes/rosetta-transition-plan.md`. The Intel line stays the default for every macOS up to 27.
+
+What an x86-64 program can observe about the CPU and the Windows exception and memory model is
+covered by [`tests/x64-fidelity/`](tests/x64-fidelity/): standalone programs whose expectations hold
+on real x86-64 Windows (the `x64-fidelity` workflow runs them there, and on Windows 11 ARM64's own
+emulation for comparison). Each engine fix in `patches-arm64/0022` onwards and in `fex/patches/`
+comes from one of their checks; the READMEs beside the patches say which, and what is left open.
 
 ## Releases
 

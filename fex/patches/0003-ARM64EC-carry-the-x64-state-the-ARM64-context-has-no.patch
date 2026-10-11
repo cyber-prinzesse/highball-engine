@@ -1,8 +1,8 @@
-From ab2ef6f971eda9c8e220a64a9b09ce8f7ec50138 Mon Sep 17 00:00:00 2001
+From 68f794d50de67e018c63b7bfbb2cefa79106249a Mon Sep 17 00:00:00 2001
 From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
 Date: Sun, 11 Oct 2026 08:05:24 +0200
-Subject: [PATCH 03/13] ARM64EC: carry the x64 state the ARM64 context has no
- room for through ntdll
+Subject: [PATCH] ARM64EC: carry the x64 state the ARM64 context has no room
+ for through ntdll
 
 The ARM64EC register mapping keeps the x87 registers but not the x87 control, status and tag words, the MXCSR control bits beyond what FPCR holds (DAZ), or the EFLAGS bits NZCV cannot express (PF, AF, DF, TF and the rest). Every exception and every continue lost them: handlers saw a default control word, a continued context reset the x87 state, and DF, PF and AF came back from stale JIT state.
 
@@ -200,6 +200,3 @@ index 3f5e23e..3b6b31c 100644
    Exception::LoadStateFromECContext(Thread, *Context);
  }
  
--- 
-2.50.1 (Apple Git-155)
-

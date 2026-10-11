@@ -1,8 +1,8 @@
-From e49d9eba7555b2ddc33d315a9fbf033f710499bc Mon Sep 17 00:00:00 2001
+From e2ec898c12cc2e772b1d19adb6fbaa7d0706c095 Mon Sep 17 00:00:00 2001
 From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
 Date: Sun, 11 Oct 2026 09:10:05 +0200
-Subject: [PATCH 13/13] SMC: recompile a block whose guest code changed before
- its page was protected
+Subject: [PATCH] SMC: recompile a block whose guest code changed before its
+ page was protected
 
 CompileBlock write-protects a page that holds no compiled code only after decoding it (MarkGuestExecutableRange). A store
 from another thread that landed between the decode and the protection did not fault, so the old instructions were
@@ -138,6 +138,3 @@ index 1fc0e6e..c12579a 100644
    uint8_t LastEscapePrefix {};
    FEXCore::X86Tables::DecodedInst* DecodeInst;
  
--- 
-2.50.1 (Apple Git-155)
-

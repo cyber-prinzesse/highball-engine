@@ -6,7 +6,7 @@
 name: x64-fidelity-reference
 on:
   push:
-    branches: [x64-fidelity]
+    branches: [main]
     paths: ['tests/x64-fidelity/**', '.github/workflows/x64-fidelity.yml']
   workflow_dispatch:
 permissions:

@@ -1,7 +1,7 @@
-From 6f2804c160482cd30a73d9c5b62e20cfab8c6071 Mon Sep 17 00:00:00 2001
+From 71e0df7adaf25cc7b2e3aad528d9be156befeea2 Mon Sep 17 00:00:00 2001
 From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
 Date: Sun, 11 Oct 2026 08:13:41 +0200
-Subject: [PATCH 09/13] ARM64EC: one MXCSR for x64 code and the native CRT
+Subject: [PATCH] ARM64EC: one MXCSR for x64 code and the native CRT
 
 x64 programs change MXCSR through the CRT's _controlfp, which is native ARM64EC code and sets FPCR and FPSR through __os_arm64x_set_x64_information. The JIT kept its own copy of the control bits and never looked at FPCR again: after _controlfp(_RC_DOWN) the arithmetic rounded down but STMXCSR still said nearest (and a save and restore of MXCSR then undid it), _DN_FLUSH never showed, and an exception unmasked with _controlfp never trapped, because the trap enables were armed from the stale copy on the way back into the JIT. Windows x64 shows all of them; Windows 11 on Arm shows the first two.
 
@@ -101,6 +101,3 @@ index fe46723..97086b5 100644
    GetX87State
 +  GetX64Mxcsr
 +  SetX64Mxcsr
--- 
-2.50.1 (Apple Git-155)
-

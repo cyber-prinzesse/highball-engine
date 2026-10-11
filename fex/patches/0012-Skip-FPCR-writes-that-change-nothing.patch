@@ -1,7 +1,7 @@
-From 45139c6e595ffc0d731ff60ac6e11c3584800fd0 Mon Sep 17 00:00:00 2001
+From ca69712e0791da9454568af3765c8777d58b85a4 Mon Sep 17 00:00:00 2001
 From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
 Date: Sun, 11 Oct 2026 08:59:17 +0200
-Subject: [PATCH 12/13] Skip FPCR writes that change nothing
+Subject: [PATCH] Skip FPCR writes that change nothing
 
 Writing FPCR costs about 4 ns on Apple cores even when the value does not change; reading it costs almost nothing. The
 fp-exceptions change made every fill and spill of the static registers write FPCR on hosts without AFP (the M1), which
@@ -73,6 +73,3 @@ index deee6c3..754511c 100644
    ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
    strb wzr, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
    ldr x17, [x17, #0x20] // ChpeV2CpuAreaInfo->SuspendDoorbell
--- 
-2.50.1 (Apple Git-155)
-

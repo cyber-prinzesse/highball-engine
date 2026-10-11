@@ -1,8 +1,35 @@
-From a1fb2e2dada75c19b5ca8b170bd148a44e6e80ab Mon Sep 17 00:00:00 2001
-From: fid <fid@local>
-Date: Sun, 11 Oct 2026 06:58:24 +0200
-Subject: [PATCH 01/13] fp-exceptions (gin-fpexc, 2026-10-10)
+From 548c7e7257c8863ffb14f8cba85d5d0312ef7b11 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 11:50:51 +0200
+Subject: [PATCH] Floating-point exceptions: unmasked SSE and x87 exceptions
+ trap and arrive as on x86-64 Windows
 
+FEX masked every floating-point exception and never set the MXCSR status flags, so a program that
+unmasks an exception (the CRT's _controlfp, or LDMXCSR) never got it, and STMXCSR after an overflow
+showed nothing. The MXCSR status flags now live in the host FPSR while JIT code runs and the six
+MXCSR masks arm the FPCR trap enables (IM DM ZM OM UM PM to IOE IDE DZE OFE UFE IXE), the model
+ntdll's ARM64EC fpcsr_to_mxcsr and mxcsr_to_fpcsr already assume. FillSpecialRegs arms the enables
+on every JIT entry; SpillStaticRegs and ExitFunctionEC clear them so native code never traps.
+
+An unmasked SSE exception traps on the host and is delivered as the guest's #XM: RethrowGuestException
+gives a host FLT_* record from JIT code the x64 shape (NumberParameters 2, [0] = 0, [1] = MXCSR with
+the new flag, the flag also set in the context's FPSR so STMXCSR sees it afterwards). Every XMM
+instruction gets a guest-opcode marker when traps can be armed, so the fault maps to the instruction
+itself and not to the previous one. RCPSS, RSQRTSS, RCPPS and RSQRTPS lower with the enables off.
+COMISS and COMISD use fcmpe (FCmp gained a Signalling flag); UCOMISS stays fcmp. A FLT trap in native
+EC code (trap bits carried by an NtContinue into ntdll) is recorded as a masked exception and
+continued with the traps off.
+
+x87: SoftFloat's invalid, infinite, overflow, underflow and inexact set IE, ZE, OE, UE and PE; ES and
+B are any flag whose mask is clear. FNSTSW, FNSTENV and FNSAVE store them, FLDENV, FRSTOR and FXRSTOR
+load them, FNCLEX and FNINIT clear them, FLDCW recomputes ES. Every waiting x87 instruction and FWAIT
+first checks ES and raises FAULT_SIGFPE (X87CheckPendingException, hooked for the x87 tables minus
+the FN* forms); the Windows side decodes it in the kernel's priority order (stack fault or invalid,
+denormal, zero divide, overflow, underflow, precision) with the waiting instruction as RIP.
+
+GetFPCR and SetFPCR are volatile. Opt-out: FEX_HOSTFEATURES=disablefloatexceptions. The Wine half
+(macOS reports an FP trap as SIGILL with ESR EC 0x2c) is highball-engine patches-arm64/0022.
+Measured with fpexc.c on an M4 (2026-10-10): 14 passed and 43 failed before, 134 and 9 after.
 ---
  CodeEmitter/CodeEmitter/Emitter.h             |  1 +
  CodeEmitter/CodeEmitter/ScalarOps.inl         | 12 +++
@@ -1079,6 +1106,3 @@ index 8c6b7f7..5c7b6b2 100644
    if (GuestException.ExceptionCode == EXCEPTION_SINGLE_STEP) {
      WowContext->EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
    }
--- 
-2.50.1 (Apple Git-155)
-

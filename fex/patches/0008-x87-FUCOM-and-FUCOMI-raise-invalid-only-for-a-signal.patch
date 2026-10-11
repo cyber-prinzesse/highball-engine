@@ -1,8 +1,7 @@
-From b9dcbddcb2778052821bc1d14e5dd6e8678a9895 Mon Sep 17 00:00:00 2001
+From c1a1f007c0a749737af70c755a3681589c75b045 Mon Sep 17 00:00:00 2001
 From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
 Date: Sun, 11 Oct 2026 08:12:28 +0200
-Subject: [PATCH 08/13] x87: FUCOM and FUCOMI raise invalid only for a
- signalling NaN
+Subject: [PATCH] x87: FUCOM and FUCOMI raise invalid only for a signalling NaN
 
 Every x87 compare set IE when the result was unordered, and the SoftFloat compare signalled invalid for any NaN, so FUCOM, FUCOMP, FUCOMPP, FUCOMI and FUCOMIP with a quiet NaN set IE, and raised #MF when the program had unmasked it. Those are the unordered compares compilers use for == and !=; only a signalling NaN or an unsupported encoding (unnormal, pseudo-NaN, pseudo-infinity) raises invalid there. FCMP now checks the operands itself and signals only for those, which is right for every compare, and FCOMI adds IE for a quiet NaN only for the FCOM, FCOMI and FICOM forms (a new Quiet argument in the opcode tables). FTST keeps its own IE.
 ---
@@ -385,6 +384,3 @@ index 5d2dff3..4785d59 100644
  }};
  #undef OPD
  #undef OPDReg
--- 
-2.50.1 (Apple Git-155)
-

@@ -4,7 +4,7 @@ Applied in lexical order on top of upstream Wine (`inputs-arm64.json`), by `buil
 Intel line's series in `patches/` is for CrossOver's tree and does not apply here; what the arm64
 line needs of it is carried over by number.
 
-Measured on an M4 (macOS 27.0, 2026-10-04): with these three patches, Hangover's FEX DLLs and the
+Measured on an M4 (macOS 27.0, 2026-10-04): with 0003, 0018 and 0019, Hangover's FEX DLLs and the
 Darwin helper in `fex/`, the native arm64 Wine boots a prefix in 2.4 s with both halves populated,
 and 32-bit and 64-bit x86 programs run within 20 percent of Rosetta on a compute loop. Graphics are
 not covered yet: DXMT needs the Mac driver's Metal glue, which upstream Wine does not carry (the

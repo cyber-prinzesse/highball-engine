@@ -1,4 +1,4 @@
-From 9e5676e44bc21b1c75fb9db50926e89d10992300 Mon Sep 17 00:00:00 2001
+From c02a8f0174818bdac880bf9dc25b11929b118518 Mon Sep 17 00:00:00 2001
 From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
 Date: Sun, 11 Oct 2026 10:34:00 +0200
 Subject: [PATCH] WoW64: MXCSR and the x87 status word through the 32-bit
@@ -244,6 +244,3 @@ index 45541b8..e1934fd 100644
    // wow64.dll will handle adjusting PC in the dispatched context after a breakpoint
  
    Context::UnlockJITContext();
--- 
-2.50.1 (Apple Git-155)
-

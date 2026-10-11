@@ -1,4 +1,4 @@
-From 527f1ad6f7741e05a19d220a8b8723054ebe5357 Mon Sep 17 00:00:00 2001
+From 23e34c3af8f89df905c383c2d916201ef41e7baf Mon Sep 17 00:00:00 2001
 From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
 Date: Sun, 11 Oct 2026 09:18:40 +0200
 Subject: [PATCH] WoW64: resume an interrupted REP MOVS/STOS where it stopped
@@ -26,6 +26,3 @@ index 5c7b6b2..45541b8 100644
    // Spill all SRA FPRs
    for (size_t i = 0; i < Config.SRAFPRCount; i++) {
      memcpy(State.xmm.sse.data[i], &Context->V[Config.SRAFPRMapping[i]], sizeof(__uint128_t));
--- 
-2.50.1 (Apple Git-155)
-

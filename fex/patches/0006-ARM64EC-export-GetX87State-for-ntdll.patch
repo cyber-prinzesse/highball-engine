@@ -1,7 +1,7 @@
-From 042c1af8ac6e11ea26c4e14a4fe8b388b216b090 Mon Sep 17 00:00:00 2001
+From 5581a7b4fc426a2d70df32dcf98c440c9fdf5041 Mon Sep 17 00:00:00 2001
 From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
 Date: Sun, 11 Oct 2026 08:05:45 +0200
-Subject: [PATCH 06/13] ARM64EC: export GetX87State for ntdll
+Subject: [PATCH] ARM64EC: export GetX87State for ntdll
 
 ntdll's RtlCaptureContext and setjmp run as native code and cannot read the x87 state, so they reported a control word of 0x27f and RtlRestoreContext and longjmp loaded it back: after every exception raised with RaiseException (a C++ throw) and unwound, or every longjmp, the x87 control word was reset, which drops mingw-w64 programs from 64-bit to 53-bit precision. GetX87State (not part of the Windows interface) fills the x87 part of an FXSAVE image from the thread state; the JIT is not running on the calling thread, so the state is current.
 ---
@@ -64,6 +64,3 @@ index bb51ca8..fe46723 100644
    ThreadTerm
    UpdateProcessorInformation
 +  GetX87State
--- 
-2.50.1 (Apple Git-155)
-

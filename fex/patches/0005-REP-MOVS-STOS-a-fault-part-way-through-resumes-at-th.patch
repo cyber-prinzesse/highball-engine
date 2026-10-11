@@ -1,7 +1,7 @@
-From a3da045f8ff2596e10773db33f9630014343c3af Mon Sep 17 00:00:00 2001
+From 574e5e7213a22ef70125dfd2f317035ac42fbf5e Mon Sep 17 00:00:00 2001
 From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
 Date: Sun, 11 Oct 2026 08:05:45 +0200
-Subject: [PATCH 05/13] REP MOVS/STOS: a fault part way through resumes at the
+Subject: [PATCH] REP MOVS/STOS: a fault part way through resumes at the
  iteration the loop reached
 
 MemCpy and MemSet run the whole instruction as one loop over copies of RCX, RSI and RDI, so a fault inside it left the guest registers at the first iteration and a handler that continued (a page committed on demand, a guard page) restarted the copy from the start. For an overlapping copy (memmove) that reads source bytes the first pass already overwrote: 2047 of 4096 bytes came out wrong in the reproducer. x86 reports the faulting iteration and continues from there.
@@ -230,6 +230,3 @@ index 521fc20..c4cadef 100644
    // Spill all SRA FPRs
    for (size_t i = 0; i < Config.SRAFPRCount; i++) {
      memcpy(State.xmm.sse.data[i], &Context.V[Config.SRAFPRMapping[i]], sizeof(__uint128_t));
--- 
-2.50.1 (Apple Git-155)
-

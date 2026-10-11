@@ -1,7 +1,7 @@
-From 4f95386498873f61633f5bec2700677c69212c76 Mon Sep 17 00:00:00 2001
+From 1d55a46a85f0671dc2aa2b58fc92e0596d844aa7 Mon Sep 17 00:00:00 2001
 From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
 Date: Sun, 11 Oct 2026 08:59:17 +0200
-Subject: [PATCH 11/13] FXSAVE and XSAVE report MXCSR_MASK 0xFFFF
+Subject: [PATCH] FXSAVE and XSAVE report MXCSR_MASK 0xFFFF
 
 The mask was 0xFFC0, which tells software that the six status flags cannot be written. A processor with DAZ reports
 0x0000FFFF (Intel SDM 11.6.6); AMD adds bit 17 (0x2FFFF). Software that sanitises MXCSR with the mask before LDMXCSR
@@ -26,6 +26,3 @@ index 89771fb..af15480 100644
  }
  
  void OpDispatchBuilder::SaveAVXState(Ref MemBase) {
--- 
-2.50.1 (Apple Git-155)
-

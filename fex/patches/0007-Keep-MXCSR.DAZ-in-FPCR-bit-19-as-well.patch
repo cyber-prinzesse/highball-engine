@@ -1,7 +1,7 @@
-From 596ffd4e2797cbd0acc1deac1470bc0af646cb88 Mon Sep 17 00:00:00 2001
+From 6dcf01e8a87d933c99f8311a5be9bfd6bfe1424e Mon Sep 17 00:00:00 2001
 From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
 Date: Sun, 11 Oct 2026 08:05:45 +0200
-Subject: [PATCH 07/13] Keep MXCSR.DAZ in FPCR bit 19 as well
+Subject: [PATCH] Keep MXCSR.DAZ in FPCR bit 19 as well
 
 The ARM64EC context conversion keeps DAZ in FPCR bit 19 (FZ16), and ntdll's RtlCaptureContext reads the live FPCR. A full MXCSR load left that bit alone, so once a context with DAZ had been continued, every later capture reported DAZ set although the guest had cleared it. FZ16 only flushes half-precision arithmetic, not the conversions F16C uses (measured on the M1).
 ---
@@ -27,6 +27,3 @@ index f6cc340..79598f8 100644
    if (Op->SetDAZ && HostSupportsFloatExceptions) {
      // The six exception masks arm the FPCR trap enables, so an unmasked SSE exception traps on the host and is
      // delivered as the guest's #XM. MXCSR IM(7) DM(8) ZM(9) OM(10) UM(11) PM(12) (1 = masked)
--- 
-2.50.1 (Apple Git-155)
-
