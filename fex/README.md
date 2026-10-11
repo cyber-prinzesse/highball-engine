@@ -35,3 +35,5 @@ M1 Pro (2026-10-10 and 2026-10-11). The Wine half is `patches-arm64/0022` to `00
 - `0013` self-modifying code across threads: a block whose guest code changed before its page was
   protected is compiled again. A thread kept running code another thread had patched in about 1 of
   300 patches, for good.
+- `0014` the same string-instruction resume as `0005` for 32-bit programs (the WoW64 module). Built,
+  not yet run: the measurements above are all x86-64.

@@ -1,0 +1,31 @@
+From 527f1ad6f7741e05a19d220a8b8723054ebe5357 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 09:18:40 +0200
+Subject: [PATCH] WoW64: resume an interrupted REP MOVS/STOS where it stopped
+ too
+
+Patch 0005 applies the string progress in ARM64EC's ReconstructThreadState only; 32-bit programs run through the WoW64
+module, whose ReconstructThreadState restarted the instruction from the first iteration as before. The FEXCore function
+reads the guest instruction at RIP, where 32-bit code has no REX prefix, and the loop's 32-bit pointers zero-extended, so
+the same call fits. Built, not run: the test Wine had no i386 half.
+---
+ Source/Windows/WOW64/Module.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index 5c7b6b2..45541b8 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -312,6 +312,9 @@ void ReconstructThreadState(CONTEXT* Context) {
+     State.gregs[i] = Context->X[Config.SRAGPRMapping[i]];
+   }
+ 
++  // A REP MOVS/STOS stopped inside its copy loop continues from the iteration it reached, as on x86
++  CTX->RestoreStringOpProgressFromHostPC(Thread, Context->Pc, Context->X);
++
+   // Spill all SRA FPRs
+   for (size_t i = 0; i < Config.SRAFPRCount; i++) {
+     memcpy(State.xmm.sse.data[i], &Context->V[Config.SRAFPRMapping[i]], sizeof(__uint128_t));
+-- 
+2.50.1 (Apple Git-155)
+
