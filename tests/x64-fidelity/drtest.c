@@ -252,6 +252,19 @@ int main(void)
     set_dr(self, 0, 0, 0xffff0355);
     get_dr(self, &c);
     fid_info("rt.dr7.ge", "Dr7 %#llx after writing 0xffff0355 (LE and GE)", (unsigned long long)c.Dr7);
+    /* when LE shows up: an address with only L0, LE alone, an address with LE alone */
+    set_dr(self, 0x42424240, 0, 1);
+    get_dr(self, &c);
+    fid_info("rt.le.l0", "Dr0 %#llx Dr7 %#llx after writing Dr0 and Dr7 1", (unsigned long long)c.Dr0, (unsigned long long)c.Dr7);
+    set_dr(self, 0, 0, 0x100);
+    get_dr(self, &c);
+    fid_info("rt.le.alone", "Dr0 %#llx Dr7 %#llx after writing Dr7 0x100 and no address", (unsigned long long)c.Dr0, (unsigned long long)c.Dr7);
+    set_dr(self, 0x42424240, 0, 0x100);
+    get_dr(self, &c);
+    fid_info("rt.le.addr", "Dr0 %#llx Dr7 %#llx after writing Dr0 and Dr7 0x100", (unsigned long long)c.Dr0, (unsigned long long)c.Dr7);
+    set_dr(self, 0, 0x126bb070, 0);
+    get_dr(self, &c);
+    fid_info("rt.le.dr1", "Dr1 %#llx Dr7 %#llx after writing Dr1 and Dr7 0", (unsigned long long)c.Dr1, (unsigned long long)c.Dr7);
     set_dr(self, 0, 0, 0);
     {
         /* a new thread starts with clear registers while the creator has one set */
