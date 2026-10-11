@@ -11,7 +11,7 @@
 | wine-mono, wine-gecko | dl.winehq.org | MIT / MPL | as Wine expects |
 | D3DMetal (Apple Game Porting Toolkit) | Apple | Apple licence | never; gated by the app |
 | Wine (WineHQ upstream, arm64 line) | dl.winehq.org/wine/source | LGPL-2.1-or-later | yes, as the arm64 engine |
-| FEX (Hangover's libarm64ecfex.dll and libwow64fex.dll) | github.com/FEX-Emu/FEX, github.com/AndreRH/hangover | MIT | yes, in the arm64 engine, as xtajit64.dll and xtajit.dll |
+| FEX (libarm64ecfex.dll and libwow64fex.dll, built from FEX 2610 with fex/patches/, or Hangover's build) | github.com/FEX-Emu/FEX, github.com/AndreRH/hangover | MIT | yes, in the arm64 engine, as xtajit64.dll and xtajit.dll |
 | FEX Unix helper, Darwin build | fex/fexunixlib_darwin.cpp (after FEX's Source/Windows/UnixLib) | MIT | yes, in the arm64 engine |
 | llvm-mingw | github.com/mstorsjo/llvm-mingw | Apache-2.0 with LLVM exception | build tool only |
 

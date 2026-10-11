@@ -15,14 +15,14 @@
     "note": "The PE side needs clang for ARM64EC (arm64ec-w64-mingw32-clang) and lld 23 for the ARM64X link; Homebrew's gcc mingw-w64 cannot build either. The i386 half is built with the same toolchain's i686-w64-mingw32-gcc wrapper."
   },
   "fex": {
-    "name": "Hangover 11.16 DLLs: FEX 2608 as libarm64ecfex.dll (x86-64 through ARM64EC) and libwow64fex.dll (x86 through WoW64), MIT",
+    "name": "Hangover 11.16 DLLs: FEX 2608 as libarm64ecfex.dll (x86-64 through ARM64EC) and libwow64fex.dll (x86 through WoW64), MIT, used when build-arm64 is dispatched with fex_build: hangover",
     "url": "https://github.com/AndreRH/hangover/releases/download/hangover-11.16/hangover_11.16_dlls.tar",
     "size": 30126080,
     "sha256": "645bcdf861db157b9057854c98797cedb477a00723429a1b996450dfb28fc6d2",
     "note": "Installed under Wine's default emulator names, xtajit64.dll and xtajit.dll, with the Darwin build of FEX's Unix helper (fex/fexunixlib_darwin.cpp) beside ntdll.so. Hangover's own helper is Linux-only and its absence makes FEX issue raw Linux syscalls, which macOS answers with SIGKILL."
   },
   "fex-source": {
-    "name": "FEX 2610 source (MIT), built with fex/patches/ when build-arm64 is dispatched with fex_build: source",
+    "name": "FEX 2610 source (MIT), built with fex/patches/ by build-arm64 (fex_build: source, the default)",
     "url": "https://github.com/FEX-Emu/FEX.git",
     "tag": "FEX-2610",
     "commit": "14c92681f4d62cf84d901460e0358de09c8847a7",
@@ -34,7 +34,7 @@
       "External/xxhash",
       "Source/Common/cpp-optparse"
     ],
-    "note": "The submodules the Windows DLLs need, at the commits the tag records. Built with llvm-mingw for arm64ec (libarm64ecfex.dll) and aarch64 (libwow64fex.dll), Release, no LTO, generic tuning, then installed like Hangover's DLLs. The default stays Hangover's build above until the series is taken."
+    "note": "The submodules the Windows DLLs need, at the commits the tag records. Built with llvm-mingw for arm64ec (libarm64ecfex.dll) and aarch64 (libwow64fex.dll), Release, no LTO, generic tuning, then installed like Hangover's DLLs. The default since 2026-10-11 (the owner's decision). Hangover's build above stays available."
   },
   "toolchain": {
     "runner": "macos-26",

@@ -10,6 +10,9 @@
 # driver's Metal glue, which upstream Wine does not carry (CrossOver's tree does), so no overlay is
 # packaged here until CrossOver 27's sources are out or the glue is ported. GStreamer is left out
 # for the same reason the first Intel build left things out: one thing at a time.
+#
+# FEX: built from FEX 2610 with the series in fex/patches/ (the default since 2026-10-11, the owner's
+# decision). With fex_build: hangover it takes Hangover 11.16's FEX 2608 DLLs instead.
 name: build-engine-arm64
 on:
   workflow_dispatch:
@@ -23,10 +26,10 @@ on:
         required: false
         default: "manual"
       fex_build:
-        description: "FEX DLLs: hangover (Hangover 11.16, FEX 2608) or source (FEX 2610 + fex/patches/, see fex/README.md)"
+        description: "FEX DLLs: source (FEX 2610 + fex/patches/, see fex/README.md) or hangover (Hangover 11.16, FEX 2608)"
         type: choice
-        options: [hangover, source]
-        default: hangover
+        options: [source, hangover]
+        default: source
 permissions:
   contents: write
 jobs:
@@ -35,6 +38,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 300
     env:
+      FEX_BUILD: ${{ github.event.inputs.fex_build || 'source' }}
       # Binaries built against an SDK older than 26.5 keep x18, the register Windows ARM64 code
       # holds its thread block in, across context switches (CodeWeavers' interim rule, wine-devel
       # 2026-08-07). It only matters for the loader, and Highball's signed loader sets it too.
@@ -52,11 +56,13 @@ jobs:
           }
           fetch wine wine.tar.xz
           fetch llvm-mingw llvm-mingw.tar.xz
-          fetch fex hangover_dlls.tar
           mkdir -p src toolchains/llvm-mingw fex-dlls
           tar -xJf wine.tar.xz -C src
           tar -xJf llvm-mingw.tar.xz -C toolchains/llvm-mingw --strip-components 1
-          tar -xf hangover_dlls.tar -C fex-dlls
+          if [ "$FEX_BUILD" = hangover ]; then
+            fetch fex hangover_dlls.tar
+            tar -xf hangover_dlls.tar -C fex-dlls
+          fi
           ls src; ls fex-dlls
       - name: apply patch series
         run: |
@@ -73,11 +79,11 @@ jobs:
           toolchains/llvm-mingw/bin/arm64ec-w64-mingw32-clang --version | head -1
           toolchains/llvm-mingw/bin/ld.lld --version | head -1
           clang --version | head -1
-      # FEX 2610 with the x86-64 fidelity series (fex/README.md), in place of Hangover's DLLs. Both DLLs
-      # come from one source tree: libarm64ecfex.dll (x86-64 through ARM64EC) and libwow64fex.dll (x86
-      # through WoW64). The tag's submodule commits are the pinned ones.
+      # FEX 2610 with the x86-64 fidelity series (fex/README.md). Both DLLs come from one source tree:
+      # libarm64ecfex.dll (x86-64 through ARM64EC) and libwow64fex.dll (x86 through WoW64). The tag's
+      # submodule commits are the pinned ones.
       - name: FEX from source
-        if: ${{ github.event.inputs.fex_build == 'source' }}
+        if: ${{ env.FEX_BUILD == 'source' }}
         run: |
           set -euo pipefail
           field() { python3 -c "import json;v=json.load(open('inputs-arm64.json'))['fex-source']['$1'];print(' '.join(v) if isinstance(v,list) else v)"; }
@@ -219,6 +225,6 @@ jobs:
           set -euo pipefail
           f=$(ls engine-arm64-*.tar.gz | head -1)
           tag="${f%.tar.gz}"
-          fex="FEX (Hangover 11.16)"
-          if [ "${{ github.event.inputs.fex_build }}" = source ]; then fex="FEX 2610 built with fex/patches/"; fi
+          fex="FEX 2610 built with fex/patches/"
+          if [ "$FEX_BUILD" = hangover ]; then fex="FEX (Hangover 11.16)"; fi
           gh release create "$tag" "$f" "$f.sha256" --title "$tag" --notes "Native arm64 Wine from the pinned upstream source (inputs-arm64.json) with the patch series in patches-arm64/ and $fex under Wine's emulator names. Runs through Highball's signed Wine loader only. No renderer overlay yet. Built by run ${{ github.run_id }}. Checksum in the .sha256 file."

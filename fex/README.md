@@ -5,11 +5,12 @@ same call table as FEX's Linux helper, with BSD calls, and TSO through `thread_s
 
 ## Patch series for a FEX 2610 build (`patches/`)
 
-`build-arm64` uses Hangover 11.16's FEX 2608 DLLs by default. Dispatched with `fex_build: source`, it
-builds `libarm64ecfex.dll` and `libwow64fex.dll` from FEX 2610 (`inputs-arm64.json`, `fex-source`)
-with this series applied, for x86-64 programs that see what real x86-64 Windows shows them. Each
-patch was measured with `tests/x64-fidelity`, whose expectations hold on real x86-64 Windows, on an
-M1 Pro (2026-10-10 and 2026-10-11). The Wine half is `patches-arm64/0022` to `0028`.
+`build-arm64` builds `libarm64ecfex.dll` and `libwow64fex.dll` from FEX 2610 (`inputs-arm64.json`,
+`fex-source`) with this series applied, for x86-64 programs that see what real x86-64 Windows shows
+them. That is the default since 2026-10-11. Dispatched with `fex_build: hangover`, it uses Hangover
+11.16's FEX 2608 DLLs instead, which have none of this. Each patch was measured with
+`tests/x64-fidelity`, whose expectations hold on real x86-64 Windows, on an M1 Pro (2026-10-10 and
+2026-10-11). The Wine half is `patches-arm64/0022` to `0029`.
 
 - `0001` floating-point exceptions: unmasked SSE and x87 exceptions trap (FPCR trap enables armed
   from MXCSR in JIT code only), MXCSR status flags live in FPSR as on ARM64EC Windows, x87 status
