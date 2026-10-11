@@ -645,11 +645,16 @@ static void group_crt(void)
               g_crt_code);
     fid_check((getcsr() & 0x1f80) == 0x1f80, "crt.em.restore", "MXCSR %#x after masking again", getcsr());
 
-    /* the CRT reads back masks set with LDMXCSR */
+    /* the CRT reads back masks set with LDMXCSR (32-bit: _controlfp reports the x87 word, with _EM_AMBIGUOUS when
+     * SSE differs; __control87_2 reads the SSE one) */
     setcsr(0x1d80);
+#ifdef __x86_64__
     got = _controlfp(0, 0);
+#else
+    __control87_2(0, 0, NULL, &got);
+#endif
     setcsr(0x1f80);
-    fid_check(!(got & _EM_ZERODIVIDE), "crt.em.readback", "_controlfp %#x after ldmxcsr 0x1d80 (want ZE unmasked)", got);
+    fid_check(!(got & _EM_ZERODIVIDE), "crt.em.readback", "SSE control word %#x after ldmxcsr 0x1d80 (want ZE unmasked)", got);
 
     /* denormal control: _DN_FLUSH sets FTZ and DAZ */
     _controlfp(_DN_FLUSH, _MCW_DN);
