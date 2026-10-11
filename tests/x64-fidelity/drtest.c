@@ -292,7 +292,7 @@ int main(void)
     fid_check(c.Dr7 == (WOW64 ? 0xffff0155 : 0xffff0755), "rt.dr7.ge", "Dr7 %#llx after writing 0xffff0355 (LE and GE; x64 keeps GE, WoW64 does not)", (unsigned long long)c.Dr7);
     set_dr(self, 0, 0, 0x200);
     get_dr(self, &c);
-    fid_info("rt.ge.alone", "Dr7 %#llx after writing GE alone", (unsigned long long)c.Dr7);
+    fid_check(c.Dr7 == (WOW64 ? 0 : 0x600), "rt.ge.alone", "Dr7 %#llx after writing GE alone (x64: kept, 0x600; WoW64: dropped, 0)", (unsigned long long)c.Dr7);
     /* when LE shows up: an address with only L0, LE alone, an address with LE alone */
     set_dr(self, 0x42424240, 0, 1);
     get_dr(self, &c);

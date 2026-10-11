@@ -1254,6 +1254,31 @@ static int want_group(const char *list, const char *g)
     return 0;
 }
 
+/* SetThreadContext on the current thread with one class at a time, values from GetThreadContext: it succeeds and the
+ * thread carries on (a merge with the thread's state read in the same call once sent it back into that call) */
+static void self_set_tests(void)
+{
+    static const struct { DWORD flags; const char *name; } classes[] = {
+        { CONTEXT_FLOATING_POINT, "fp" }, { CONTEXT_SEGMENTS, "segments" }, { CONTEXT_DEBUG_REGISTERS, "debug" },
+    };
+    unsigned i;
+    for (i = 0; i < sizeof(classes) / sizeof(classes[0]); i++)
+    {
+        static CONTEXT c;
+        char name[64];
+        volatile int carried_on = 0;
+        BOOL got, set;
+        memset(&c, 0, sizeof(c));
+        c.ContextFlags = classes[i].flags;
+        got = GetThreadContext(GetCurrentThread(), &c);
+        c.ContextFlags = classes[i].flags;
+        set = SetThreadContext(GetCurrentThread(), &c);
+        carried_on = 1;
+        sprintf(name, "self.set.%s", classes[i].name);
+        fid_check(got && set && carried_on, name, "GetThreadContext %d SetThreadContext %d", got, set);
+    }
+}
+
 int main(int argc, char **argv)
 {
     HMODULE k32 = GetModuleHandleA("kernel32.dll"), ntdll = GetModuleHandleA("ntdll.dll");
@@ -1299,5 +1324,6 @@ int main(int argc, char **argv)
     if (want_group(groups, "capture")) group_capture();
     if (want_group(groups, "thread")) group_thread();
     if (want_group(groups, "stress")) group_stress(count * 3);
+    if (want_group(groups, "self")) self_set_tests();
     return fid_summary();
 }
