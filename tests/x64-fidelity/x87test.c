@@ -11,6 +11,16 @@
 #include "fid.h"
 #include <float.h>
 
+/* the same checks build for 32-bit x86 (WoW64) too */
+#ifdef __x86_64__
+#define FXSAVE "fxsave64"
+#else
+#define FXSAVE "fxsave"
+#endif
+#define STR2_(x) #x
+#define STR_(x) STR2_(x)
+#define ASM_SYM(name) STR_(__USER_LABEL_PREFIX__) name   /* "_name" on 32-bit Windows */
+
 typedef struct f80 { uint8_t b[10]; } f80;
 typedef struct env28 { uint16_t fcw, r0, fsw, r1, ftw, r2; uint32_t fip; uint16_t fcs, fop; uint32_t fdp; uint16_t fds, r3; } env28;
 _Static_assert(sizeof(env28) == 28, "env");
@@ -101,7 +111,7 @@ static void group_tags(void)
 
     __asm__ volatile("fninit\n\t"
                      "fldt %2\n\tfldt %3\n\tfldt %4\n\tfldz\n\tfld1\n\t"
-                     "fnstenv %0\n\tfxsave64 %1\n\t"
+                     "fnstenv %0\n\t" FXSAVE " %1\n\t"
                      "fninit\n\tfldcw %5"
                      : "=m"(env), "=m"(fx) : "m"(den), "m"(inf), "m"(nan), "m"(FCW_DEFAULT) : "memory");
     fid_check(((env.fsw >> 11) & 7) == 3, "tags.top", "TOP %u after five pushes, want 3", (env.fsw >> 11) & 7);
@@ -148,7 +158,7 @@ static void group_saverestore(void)
                      "fnstcw %1\n\tfnstenv %2\n\t"
                      "fldz\n\tfldz\n\tfldz\n\tfldz\n\t"   /* disturb */
                      "frstor %0\n\t"
-                     "fxsave64 %3\n\t"
+                     FXSAVE " %3\n\t"
                      "fninit\n\tfldcw %8"
                      : "+m"(area), "=m"(cw_after_save), "=m"(env_after_save), "=m"(fx)
                      : "m"(fcw), "m"(a), "m"(b), "m"(c), "m"(FCW_DEFAULT) : "memory");
@@ -457,7 +467,7 @@ static void group_mmx(void)
     static const uint64_t pat = 0x0123456789abcdefull;
     env28 e1, e2;
     static DECLSPEC_ALIGN(16) uint8_t fx[512];
-    __asm__ volatile("fninit\n\tmovq %3, %%mm0\n\tfnstenv %0\n\tfxsave64 %1\n\temms\n\tfnstenv %2\n\tfninit\n\tfldcw %4"
+    __asm__ volatile("fninit\n\tmovq %3, %%mm0\n\tfnstenv %0\n\t" FXSAVE " %1\n\temms\n\tfnstenv %2\n\tfninit\n\tfldcw %4"
                      : "=m"(e1), "=m"(fx), "=m"(e2) : "m"(pat), "m"(FCW_DEFAULT) : "memory");
     {
         /* every register non-empty: no 11 pair in the full tag word (the pairs classify the contents) */
@@ -481,9 +491,9 @@ static void group_pointers(void)
     static double d = 1.5;
     static DECLSPEC_ALIGN(16) uint8_t fx[512];
     __asm__ volatile("fninit\n\t"
-                     ".globl fip_marker\nfip_marker:\n\t"
+                     ".globl " ASM_SYM("fip_marker") "\n" ASM_SYM("fip_marker") ":\n\t"
                      "faddl %2\n\t"               /* last non-control x87 instruction; FDP = &d */
-                     "fnstenv %0\n\tfxsave64 %1\n\tfninit\n\tfldcw %3"
+                     "fnstenv %0\n\t" FXSAVE " %1\n\tfninit\n\tfldcw %3"
                      : "=m"(e), "=m"(fx) : "m"(d), "m"(FCW_DEFAULT) : "memory");
     fid_info("pointers.fnstenv", "FIP %#x (marker %#x) FOP %#x FDP %#x (&d %#x)", e.fip, (unsigned)(uintptr_t)fip_marker,
              e.fop, e.fdp, (unsigned)(uintptr_t)&d);
@@ -509,7 +519,7 @@ static void group_mxcsr(void)
     unsigned i;
     const float den = 1e-40f, zero = 0.0f, tiny = 1e-30f;
 
-    __asm__ volatile("fxsave64 %0" : "=m"(fx));
+    __asm__ volatile(FXSAVE " %0" : "=m"(fx));
     mask = *(uint32_t *)(fx + 28);
     fid_info("mxcsr.mask", "MXCSR_MASK %#x", mask);
     for (i = 0; i < sizeof(vals) / sizeof(vals[0]); i++)
@@ -582,8 +592,12 @@ static LONG CALLBACK crt_veh(EXCEPTION_POINTERS *ep)
     g_crt_hits++;
     g_crt_code = code;
     /* mask ZE and run the division again */
+#ifdef __x86_64__
     ep->ContextRecord->MxCsr |= 0x200;
     ep->ContextRecord->FltSave.MxCsr |= 0x200;
+#else
+    ((XSAVE_FORMAT *)ep->ContextRecord->ExtendedRegisters)->MxCsr |= 0x200;
+#endif
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 

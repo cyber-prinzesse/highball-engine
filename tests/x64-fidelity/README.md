@@ -18,6 +18,7 @@ a wrong check, not a finding.
 Output: one line per check, `PASS <id>`, `FAIL <id>: <detail>` or `INFO <id>: <value>`, then
 `SUMMARY <test> pass=N fail=M`; the exit code is the number of failures.
 
-Build with llvm-mingw 20260922: `./build.sh <llvm-mingw>/bin out`. The workflow `x64-fidelity.yml` builds
+Build with llvm-mingw 20260922: `./build.sh <llvm-mingw>/bin out`. x87test is also built as a 32-bit
+program (`x87test32.exe`), which Windows x64 runs through WoW64, as the engine does with FEX's WoW64 DLL. The workflow `x64-fidelity.yml` builds
 them once and runs the same files on Windows Server 2022 and 2025 (x86-64) and on Windows 11 ARM64 (Microsoft's
 x64 emulation, for comparison).
