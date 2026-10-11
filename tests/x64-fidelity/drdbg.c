@@ -42,6 +42,8 @@ struct shared
     volatile DWORD main_tid, wait_tid;
     volatile LONG main_hits, wait_hits, watch_hits, other_hits, raced_hits, spins;
     volatile uint64_t last_dr6, other_ip, other_dr6, other_dr7;
+    volatile LONG faults;
+    volatile uint64_t fault_ip, fault_addr, fault_sp, fault_dr7, fault_eflags;
 };
 
 static struct shared *sh;
@@ -57,7 +59,23 @@ static LONG CALLBACK child_veh(EXCEPTION_POINTERS *ep)
     CONTEXT *c = ep->ContextRecord;
     DWORD tid = GetCurrentThreadId();
 
-    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP)
+    {
+        /* recorded for the parent's report; the child still dies of it */
+        if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && InterlockedIncrement(&sh->faults) == 1)
+        {
+            sh->fault_ip = CTX_IP(c);
+            sh->fault_addr = ep->ExceptionRecord->ExceptionInformation[1];
+#ifdef _WIN64
+            sh->fault_sp = c->Rsp;
+#else
+            sh->fault_sp = c->Esp;
+#endif
+            sh->fault_dr7 = c->Dr7;
+            sh->fault_eflags = c->EFlags;
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     sh->last_dr6 = c->Dr6;
     if (CTX_IP(c) == (uintptr_t)target_fn)
     {
@@ -380,6 +398,11 @@ static void test_suspend(void)
               sh->other_hits, (unsigned long long)sh->other_ip, (unsigned long long)sh->other_dr6,
               (unsigned long long)sh->other_dr7, (unsigned long long)sh->target, exit_code);
     fid_info("suspend.dr6", "last Dr6 in the child's handler %#llx", (unsigned long long)sh->last_dr6);
+    if (sh->faults)
+        fid_info("suspend.fault", "the child faulted at %#llx on %#llx (stack %#llx, Dr7 %#llx, EFlags %#llx; target_fn %#llx, "
+                 "target_fn2 %#llx, watch %#llx)", (unsigned long long)sh->fault_ip, (unsigned long long)sh->fault_addr,
+                 (unsigned long long)sh->fault_sp, (unsigned long long)sh->fault_dr7, (unsigned long long)sh->fault_eflags,
+                 (unsigned long long)sh->target, (unsigned long long)sh->target2, (unsigned long long)sh->watch);
     /* A data breakpoint trap whose exception context already shows the registers the parent cleared or changed while
      * the trap was being dispatched. Windows captures the context at the trap (0 here). The arm64 engine's 32-bit
      * programs can show it: Wine's wow64 reads the 32-bit context back from the thread's CPU area when it dispatches
