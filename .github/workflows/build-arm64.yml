@@ -6,9 +6,10 @@
 # cross-architecture entitlement to a signed bundle with a provisioning profile.
 #
 # What this build has: a prefix that boots in seconds, both halves populated, 32-bit and 64-bit x86
-# programs at Rosetta speed on a compute loop. What it lacks: a renderer. DXMT needs the Mac
-# driver's Metal glue, which upstream Wine does not carry (CrossOver's tree does), so no overlay is
-# packaged here until CrossOver 27's sources are out or the glue is ported. GStreamer is left out
+# programs at Rosetta speed on a compute loop, Vulkan through MoltenVK. What it lacks: a renderer
+# overlay. DXMT needs the Mac driver's Metal glue, which upstream Wine does not carry (CrossOver's
+# tree does), so no overlay is packaged here until CrossOver 27's sources are out or the glue is
+# ported. GStreamer is left out
 # for the same reason the first Intel build left things out: one thing at a time.
 #
 # FEX: built from FEX 2610 with the series in fex/patches/ (the default since 2026-10-11, the owner's
@@ -72,8 +73,8 @@ jobs:
       - name: toolchain
         run: |
           set -euo pipefail
-          # No gstreamer here yet (see the header). MoltenVK for winevulkan's library name.
-          brew install -q bison pkg-config ccache gnutls freetype sdl2 libpng jpeg-turbo molten-vk || true
+          # No gstreamer here yet (see the header). MoltenVK and the Vulkan headers for winevulkan.
+          brew install -q bison pkg-config ccache gnutls freetype sdl2 libpng jpeg-turbo molten-vk vulkan-headers || true
           echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
           echo "$PWD/toolchains/llvm-mingw/bin" >> "$GITHUB_PATH"
           toolchains/llvm-mingw/bin/arm64ec-w64-mingw32-clang --version | head -1
@@ -126,12 +127,14 @@ jobs:
             --without-fontconfig --with-freetype --with-gnutls --without-gphoto --without-gstreamer \
             --without-krb5 --without-netapi --without-oss --without-pulse \
             --without-sane --with-sdl --without-udev --without-usb --without-v4l2 \
-            --without-pcap --without-ffmpeg --disable-tests \
+            --without-pcap --without-ffmpeg --disable-tests --with-vulkan \
+            CPPFLAGS="-I$(brew --prefix vulkan-headers)/include" LDFLAGS="-L$(brew --prefix molten-vk)/lib" \
             CC="ccache /usr/bin/clang" CXX="ccache /usr/bin/clang++" \
             arm64ec_CC="ccache arm64ec-w64-mingw32-clang" aarch64_CC="ccache aarch64-w64-mingw32-clang" \
             i386_CC="ccache i686-w64-mingw32-clang"
           make -j"$(sysctl -n hw.ncpu)"
           make install-lib
+          grep -E "SONAME_LIB(VULKAN|FREETYPE|GNUTLS|SDL2) " include/config.h
       - name: FEX
         run: |
           set -euo pipefail
@@ -166,6 +169,41 @@ jobs:
             curl -sSfL -o "wine-gecko-${arch}.tar.xz" "https://dl.winehq.org/wine/wine-gecko/${gecko}/wine-gecko-${gecko}-${arch}.tar.xz"
             tar -xJf "wine-gecko-${arch}.tar.xz" -C out/engine/share/wine/gecko
           done
+          # The host libraries Wine opens by leaf name (configure's SONAME_*: MoltenVK, FreeType,
+          # GnuTLS, SDL), and what they link, in engine/lib: patches-arm64/0030 looks for them there
+          # when a process has no DYLD variables (the children of a Windows program). Their Homebrew
+          # install names become @loader_path ones, so they load from there with nothing set. SDL2
+          # is sdl2-compat, which opens SDL3 by name at run time: SDL3 goes along.
+          python3 - <<'PY'
+          import os, re, shutil, subprocess
+          conf = open("build/include/config.h").read()
+          names = [re.search(r'#define SONAME_%s "([^"]+)"' % k, conf).group(1)
+                   for k in ("LIBVULKAN", "LIBFREETYPE", "LIBGNUTLS", "LIBSDL2")]
+          prefix = subprocess.run(["brew", "--prefix"], capture_output=True, text=True).stdout.strip()
+          roots = [os.path.join(prefix, "lib", n) for n in names] + [os.path.join(prefix, "lib", "libSDL3.0.dylib")]
+          dest = "out/engine/lib"
+          def deps(f):
+              out = subprocess.run(["otool", "-L", f], capture_output=True, text=True).stdout.splitlines()[1:]
+              return [l.split()[0] for l in out if l.split()[0].startswith(("/opt/homebrew", "/usr/local"))]
+          todo, seen = list(roots), {}
+          while todo:
+              f = todo.pop()
+              real = os.path.realpath(f)
+              leaf = os.path.basename(f)
+              if leaf in seen: continue
+              seen[leaf] = real
+              todo += deps(real)
+          for leaf, real in seen.items():
+              d = os.path.join(dest, leaf)
+              shutil.copy2(real, d); os.chmod(d, 0o755)
+              subprocess.run(["install_name_tool", "-id", "@loader_path/" + leaf, d], check=True, stderr=subprocess.DEVNULL)
+              for dep in deps(real):
+                  subprocess.run(["install_name_tool", "-change", dep, "@loader_path/" + os.path.basename(dep), d], check=True, stderr=subprocess.DEVNULL)
+              subprocess.run(["codesign", "-f", "-s", "-", d], check=True, stderr=subprocess.DEVNULL)
+          left = [l for leaf in seen for l in deps(os.path.join(dest, leaf))]
+          assert not left, left
+          print("host libraries in engine/lib:", sorted(seen))
+          PY
           # The Homebrew libraries the Unix side links (freetype, gnutls, sdl2 and what they pull
           # in), copied flat into frameworks/. Highball runs every Wine process with
           # DYLD_FALLBACK_LIBRARY_PATH on that directory, and dyld resolves an absolute install name

@@ -1,0 +1,150 @@
+From 5061e1dee41f58eb6b98edf05ff4d04ef5f7e431 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 17:02:32 +0200
+Subject: [PATCH] unixlib.h: find a host library next to Wine on macOS
+ (MoltenVK, FreeType, GnuTLS, SDL)
+
+A child process of a Windows program starts without the DYLD variables its parent had, and ~/lib is not on dyld's
+default fallback path, so a library Wine opens by its leaf name (SONAME_*) was missing there: no Vulkan in a game a
+launcher started, no text in an x64 program's child, no TLS, no SDL controllers. dlopen_host_lib, in unixlib.h for
+every Unix module, also looks two directories above the calling module (lib/wine/<arch>-unix/x.so -> lib/<name>),
+where the arm64 engine ships those libraries. Used for Vulkan and FreeType (win32u), FreeType (dwrite), GnuTLS
+(crypt32, secur32) and SDL (winebus). First made on an M4 (macOS 27.0, 2026-10-09) for Vulkan and FreeType: Vulkan in
+a child process, text in an x64 program under FEX and Steam's web helper, with no DYLD variable and no symlinks.
+---
+ dlls/crypt32/unixlib.c         |  2 +-
+ dlls/dwrite/freetype.c         |  2 +-
+ dlls/secur32/schannel_gnutls.c |  2 +-
+ dlls/win32u/freetype.c         |  2 +-
+ dlls/win32u/vulkan.c           |  2 +-
+ dlls/winebus.sys/bus_sdl.c     |  2 +-
+ include/wine/unixlib.h         | 28 ++++++++++++++++++++++++++++
+ 7 files changed, 34 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/crypt32/unixlib.c b/dlls/crypt32/unixlib.c
+index 4b9f0da..a5d4fbd 100644
+--- a/dlls/crypt32/unixlib.c
++++ b/dlls/crypt32/unixlib.c
+@@ -108,7 +108,7 @@ static NTSTATUS process_attach( void *args )
+         setenv("GNUTLS_SYSTEM_PRIORITY_FILE", "/dev/null", 0);
+     }
+ 
+-    if (!(libgnutls_handle = dlopen( SONAME_LIBGNUTLS, RTLD_NOW )))
++    if (!(libgnutls_handle = dlopen_host_lib( SONAME_LIBGNUTLS, RTLD_NOW )))
+     {
+         ERR_(winediag)( "failed to load libgnutls, no support for pfx import/export\n" );
+         return STATUS_DLL_NOT_FOUND;
+diff --git a/dlls/dwrite/freetype.c b/dlls/dwrite/freetype.c
+index 13d9a07..e723f74 100644
+--- a/dlls/dwrite/freetype.c
++++ b/dlls/dwrite/freetype.c
+@@ -115,7 +115,7 @@ static NTSTATUS process_attach(void *args)
+ {
+     FT_Version_t FT_Version;
+ 
+-    ft_handle = dlopen(SONAME_LIBFREETYPE, RTLD_NOW);
++    ft_handle = dlopen_host_lib(SONAME_LIBFREETYPE, RTLD_NOW);
+     if (!ft_handle)
+     {
+         WINE_MESSAGE("Wine cannot find the FreeType font library.\n");
+diff --git a/dlls/secur32/schannel_gnutls.c b/dlls/secur32/schannel_gnutls.c
+index 83b9f8f..4f1de0a 100644
+--- a/dlls/secur32/schannel_gnutls.c
++++ b/dlls/secur32/schannel_gnutls.c
+@@ -1471,7 +1471,7 @@ static NTSTATUS process_attach( void *args )
+         setenv("GNUTLS_SYSTEM_PRIORITY_FILE", "/dev/null", 0);
+     }
+ 
+-    libgnutls_handle = dlopen(SONAME_LIBGNUTLS, RTLD_NOW);
++    libgnutls_handle = dlopen_host_lib(SONAME_LIBGNUTLS, RTLD_NOW);
+     if (!libgnutls_handle)
+     {
+         ERR_(winediag)("Failed to load libgnutls, secure connections will not be available.\n");
+diff --git a/dlls/win32u/freetype.c b/dlls/win32u/freetype.c
+index 832043a..4940fbb 100644
+--- a/dlls/win32u/freetype.c
++++ b/dlls/win32u/freetype.c
+@@ -1454,7 +1454,7 @@ static void load_mac_fonts(void)
+ 
+ static BOOL init_freetype(void)
+ {
+-    ft_handle = dlopen(SONAME_LIBFREETYPE, RTLD_NOW);
++    ft_handle = dlopen_host_lib(SONAME_LIBFREETYPE, RTLD_NOW);
+     if(!ft_handle) {
+         WINE_MESSAGE(
+       "Wine cannot find the FreeType font library.  To enable Wine to\n"
+diff --git a/dlls/win32u/vulkan.c b/dlls/win32u/vulkan.c
+index 261c10c..4792631 100644
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -3067,7 +3067,7 @@ static void vulkan_init_once(void)
+     VkResult res;
+ 
+ #ifdef SONAME_LIBVULKAN
+-    vulkan_handle = dlopen( SONAME_LIBVULKAN, RTLD_NOW );
++    vulkan_handle = dlopen_host_lib( SONAME_LIBVULKAN, RTLD_NOW );
+     if (!vulkan_handle) ERR( "Failed to load %s\n", SONAME_LIBVULKAN );
+ #else
+     ERR( "Wine was built without Vulkan support.\n" );
+diff --git a/dlls/winebus.sys/bus_sdl.c b/dlls/winebus.sys/bus_sdl.c
+index 8e343b9..2c96abc 100644
+--- a/dlls/winebus.sys/bus_sdl.c
++++ b/dlls/winebus.sys/bus_sdl.c
+@@ -1081,7 +1081,7 @@ NTSTATUS sdl_bus_init(void *args)
+ 
+     options = (struct bus_options *)args;
+ 
+-    if (!(sdl_handle = dlopen(SONAME_LIBSDL2, RTLD_NOW)))
++    if (!(sdl_handle = dlopen_host_lib(SONAME_LIBSDL2, RTLD_NOW)))
+     {
+         WARN("could not load %s\n", SONAME_LIBSDL2);
+         return STATUS_UNSUCCESSFUL;
+diff --git a/include/wine/unixlib.h b/include/wine/unixlib.h
+index a4b9d36..5411887 100644
+--- a/include/wine/unixlib.h
++++ b/include/wine/unixlib.h
+@@ -50,6 +50,11 @@ NTSYSAPI NTSTATUS ntdll_get_unix_file_name( const WCHAR *dos, char **unix_name,
+ /* exception handling */
+ 
+ #include <setjmp.h>
++#include <dlfcn.h>
++#ifdef __APPLE__
++#include <stdlib.h>
++#include <string.h>
++#endif
+ 
+ NTSYSAPI void ntdll_set_exception_jmp_buf( jmp_buf jmp );
+ 
+@@ -276,6 +281,29 @@ NTSYSAPI int ntdll_wcsnicmp( const WCHAR *str1, const WCHAR *str2, int n );
+ #define wcstol(str,e,b)    ntdll_wcstol(str,e,b)
+ #define wcstoul(str,e,b)   ntdll_wcstoul(str,e,b)
+ 
++/* Opens a host library by the leaf name configure found (SONAME_*). A packaged macOS Wine ships the ones it needs in
++ * its lib directory, where a process that started without its parent's DYLD variables (the children of a Windows
++ * program) does not find them by that name: there the name is also looked for two directories above the calling Unix
++ * module, lib/wine/<arch>-unix/x.so -> lib/<name>. */
++static inline void *dlopen_host_lib( const char *name, int flags )
++{
++    void *handle = dlopen( name, flags );
++#ifdef __APPLE__
++    Dl_info info;
++    char *path, *p;
++
++    if (handle || strchr( name, '/' ) || !dladdr( (void *)dlopen_host_lib, &info ) || !info.dli_fname) return handle;
++    if (!(path = malloc( strlen( info.dli_fname ) + strlen( name ) + 8 ))) return NULL;
++    strcpy( path, info.dli_fname );
++    if ((p = strrchr( path, '/' ))) *p = 0;
++    strcat( path, "/../../" );
++    strcat( path, name );
++    handle = dlopen( path, flags );
++    free( path );
++#endif
++    return handle;
++}
++
+ #else /* WINE_UNIX_LIB */
+ 
+ extern unixlib_handle_t __wine_unixlib_handle;
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,74 @@
+From ff800f1f1f3bf1a9c265faf119e3e6c060381fd6 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 16:59:36 +0200
+Subject: [PATCH] winevulkan: convert the properties inside
+ VkPhysicalDeviceLayeredApiVulkanPropertiesKHR
+
+The generated converter for VkPhysicalDeviceLayeredApiPropertiesKHR left the VkPhysicalDeviceProperties2 embedded in a
+VkPhysicalDeviceLayeredApiVulkanPropertiesKHR entry unconverted, so its pNext chain reached the host uninitialised.
+MoltenVK reports one layered API where Linux drivers report none, and vkd3d-proton's device setup faulted in
+vkGetPhysicalDeviceProperties2 (its maintenance7 probe). The proper fix belongs in make_vulkan; this is the generated
+code changed by hand. Verified on an M4 (macOS 27.0, 2026-10-09): a D3D12 device through vkd3d-proton on MoltenVK,
+every shader test of smprobe correct.
+---
+ dlls/winevulkan/vulkan_private.h | 8 +++++++-
+ dlls/winevulkan/vulkan_thunks.c  | 4 ++++
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winevulkan/vulkan_private.h b/dlls/winevulkan/vulkan_private.h
+index bc8fe30..933c085 100644
+--- a/dlls/winevulkan/vulkan_private.h
++++ b/dlls/winevulkan/vulkan_private.h
+@@ -1,3 +1,4 @@
++#include <stdio.h>
+ /* Wine Vulkan ICD private data structures
+  *
+  * Copyright 2017 Roderick Colenbrander
+@@ -81,7 +82,7 @@ static inline void free_conversion_context(struct conversion_context *pool)
+         free(entry);
+ }
+ 
+-static inline void *conversion_context_alloc(struct conversion_context *pool, size_t size)
++static inline void *conversion_context_alloc_real(struct conversion_context *pool, size_t size)
+ {
+     if (pool->used + size <= sizeof(pool->buffer))
+     {
+@@ -98,6 +99,11 @@ static inline void *conversion_context_alloc(struct conversion_context *pool, si
+         return entry + 1;
+     }
+ }
++static inline void *conversion_context_alloc(struct conversion_context *pool, size_t size)
++{
++    void *p = conversion_context_alloc_real(pool, size);
++    return p;
++}
+ 
+ struct wine_deferred_operation
+ {
+diff --git a/dlls/winevulkan/vulkan_thunks.c b/dlls/winevulkan/vulkan_thunks.c
+index 065d575..6994e5c 100644
+--- a/dlls/winevulkan/vulkan_thunks.c
++++ b/dlls/winevulkan/vulkan_thunks.c
+@@ -40356,6 +40356,7 @@ static void convert_VkPhysicalDeviceProperties_host_to_win32(const VkPhysicalDev
+ }
+ 
+ #ifdef _WIN64
++static void convert_VkPhysicalDeviceProperties2_win64_to_host(struct conversion_context *ctx, const VkPhysicalDeviceProperties2 *in, VkPhysicalDeviceProperties2 *out);
+ static void convert_VkPhysicalDeviceLayeredApiPropertiesKHR_win64_to_host(struct conversion_context *ctx, const VkPhysicalDeviceLayeredApiPropertiesKHR *in, VkPhysicalDeviceLayeredApiPropertiesKHR *out)
+ {
+     const VkBaseInStructure *in_header;
+@@ -40373,8 +40374,11 @@ static void convert_VkPhysicalDeviceLayeredApiPropertiesKHR_win64_to_host(struct
+         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LAYERED_API_VULKAN_PROPERTIES_KHR:
+         {
+             VkPhysicalDeviceLayeredApiVulkanPropertiesKHR *out_ext = conversion_context_alloc(ctx, sizeof(*out_ext));
++            const VkPhysicalDeviceLayeredApiVulkanPropertiesKHR *in_ext = (const VkPhysicalDeviceLayeredApiVulkanPropertiesKHR *)in_header;
+             out_ext->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LAYERED_API_VULKAN_PROPERTIES_KHR;
+             out_ext->pNext = NULL;
++            /* Highball fix: the embedded properties struct has its own pNext chain; convert it, do not leave it uninitialised */
++            convert_VkPhysicalDeviceProperties2_win64_to_host(ctx, &in_ext->properties, &out_ext->properties);
+             out_header->pNext = (void *)out_ext;
+             out_header = (void *)out_ext;
+             break;
+-- 
+2.54.0 (Apple Git-157)
+

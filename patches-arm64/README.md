@@ -114,3 +114,28 @@ exception instead of dying with an illegal instruction, and guard pages fault.
   on x86-64 Windows Server 2022 and 2025. A trap can report registers another process changed while
   it was being dispatched: Windows Server 2025 showed it once for a 64-bit program, and a 32-bit
   program on the engine shows it more readily (Wine's wow64 reads the 32-bit context back then).
+
+The next three come from the MSFS 2024 spike on an M4 (2026-10-09 and 2026-10-10), where they made Steam and
+D3D12 through vkd3d-proton run on this line. They are what Vulkan needs here, and the build now configures Wine
+with it (MoltenVK and the Vulkan headers from Homebrew).
+
+- `0030-unixlib-host-libraries-next-to-wine.patch`: Wine opens MoltenVK, FreeType, GnuTLS and SDL by their leaf
+  names, which a process started without its parent's DYLD variables (the children of a Windows program) does not
+  find. `dlopen_host_lib` in `include/wine/unixlib.h` also looks two directories above the calling Unix module
+  (`lib/wine/<arch>-unix/x.so` -> `lib/<name>`), where the build puts those libraries with `@loader_path` install
+  names. Used by win32u (Vulkan, FreeType), dwrite (FreeType), crypt32 and secur32 (GnuTLS) and winebus (SDL). On an
+  M4 with no DYLD variable at all: 848 font families with TrueType text, MoltenVK loaded and a D3D12 device through
+  vkd3d-proton with all 14 smprobe shader tests correct. The spike's version had the same helper in three files and
+  covered only MoltenVK and FreeType.
+
+- `0031-winemac-child-window-metal-swapchain.patch`: upstream refuses a Metal swapchain on a child window whose
+  toplevel belongs to another process. Chromium's GPU process presents into exactly such a child under the
+  browser's window, so Steam's pages stayed black. The foreign-toplevel path (an offscreen CAMetalLayer exported
+  through a CAContext and hosted by the owner in a CALayerHost) now also serves a child. Verified in the spike:
+  Steam's sign-in page and library render. Not handled yet: a child that moves to another toplevel, DPI changes.
+
+- `0032-winevulkan-layered-api-properties.patch`: the generated converter for
+  `VkPhysicalDeviceLayeredApiPropertiesKHR` left the `VkPhysicalDeviceProperties2` inside a layered Vulkan entry
+  unconverted. MoltenVK reports one layered API where Linux drivers report none, and vkd3d-proton's device setup
+  faulted in `vkGetPhysicalDeviceProperties2`. The proper fix belongs in make_vulkan. Verified: a D3D12 device through
+  vkd3d-proton on MoltenVK.

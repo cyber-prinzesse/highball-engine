@@ -70,7 +70,10 @@ bundle inside Highball.app that carries Apple's cross-architecture entitlement; 
 tarball is for development. State on 2026-10-04, measured on an M4 running macOS 27.0: a prefix
 boots in 2.4 s with both halves populated, 32-bit and 64-bit x86 programs run within 20 percent of
 Rosetta on a compute loop, and there is no renderer yet, because DXMT needs the Mac driver's Metal
-glue that only CrossOver's tree has. The decision document and the measurements are in Highball's
+glue that only CrossOver's tree has. Since 2026-10-11 the build has Vulkan through MoltenVK and ships
+the host libraries Wine opens by name (MoltenVK, FreeType, GnuTLS, SDL) in `lib/`, so D3D12 and D3D11
+through vkd3d-proton and DXVK work with those placed in a prefix; they are not packaged as an
+overlay yet. The decision document and the measurements are in Highball's
 `private/notes/rosetta-transition-plan.md`. The Intel line stays the default for every macOS up to 27.
 
 What an x86-64 program can observe about the CPU and the Windows exception and memory model is
