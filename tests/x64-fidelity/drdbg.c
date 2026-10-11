@@ -403,10 +403,10 @@ static void test_suspend(void)
                  "target_fn2 %#llx, watch %#llx)", (unsigned long long)sh->fault_ip, (unsigned long long)sh->fault_addr,
                  (unsigned long long)sh->fault_sp, (unsigned long long)sh->fault_dr7, (unsigned long long)sh->fault_eflags,
                  (unsigned long long)sh->target, (unsigned long long)sh->target2, (unsigned long long)sh->watch);
-    /* A data breakpoint trap whose exception context already shows the registers the parent cleared or changed while
-     * the trap was being dispatched. Windows captures the context at the trap (0 here). The arm64 engine's 32-bit
-     * programs can show it: Wine's wow64 reads the 32-bit context back from the thread's CPU area when it dispatches
-     * the exception, after another process's SetThreadContext may have written it. */
+    /* A trap whose exception context already shows the registers the parent cleared or changed while it was being
+     * dispatched: a race, not an error, which Windows Server 2025 showed once (run 38144192216). The arm64 engine's
+     * 32-bit programs show it too: Wine's wow64 reads the 32-bit context back from the thread's CPU area when it
+     * dispatches the exception, after another process's SetThreadContext may have written it. */
     fid_info("suspend.raced", "%ld single steps reporting registers changed after the trap", sh->raced_hits);
     CloseHandle(ev);
     CloseHandle(main_t);
