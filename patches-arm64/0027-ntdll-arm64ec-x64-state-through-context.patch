@@ -124,7 +124,7 @@ index 24d3b6d..ab95f38 100644
      return syscall_NtRaiseException( rec, &arm_ctx, first_chance );
  }
  
-@@ -832,9 +876,28 @@ NTSTATUS SYSCALL_API NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
+@@ -832,9 +876,29 @@ NTSTATUS SYSCALL_API NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
  
  NTSTATUS SYSCALL_API NtSetContextThread( HANDLE handle, const CONTEXT *context )
  {
@@ -133,7 +133,8 @@ index 24d3b6d..ab95f38 100644
 +    DWORD flags = context->ContextFlags;
  
 -    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
-+    if ((flags & full) != full)
++    /* The current thread's state is the frame of this very call, which the classes given update as they are */
++    if ((flags & full) != full && handle != GetCurrentThread())
 +    {
 +        /* merge the classes given into the thread's full current state, see NtGetContextThread */
 +        ARM64_NT_CONTEXT cur_arm = { .ContextFlags = CONTEXT_ARM64_FULL };
@@ -154,7 +155,7 @@ index 24d3b6d..ab95f38 100644
      return syscall_NtSetContextThread( handle, &arm_ctx );
  }
  
-@@ -1263,7 +1326,8 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+@@ -1263,7 +1327,8 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
   */
  void dispatch_emulation( ARM64_NT_CONTEXT *arm_ctx )
  {
@@ -164,7 +165,7 @@ index 24d3b6d..ab95f38 100644
      pBeginSimulation();
  }
  __ASM_GLOBAL_FUNC( "#KiUserEmulationDispatcher",
-@@ -1293,10 +1357,12 @@ static void dispatch_syscall( ARM64_NT_CONTEXT *context )
+@@ -1293,10 +1358,12 @@ static void dispatch_syscall( ARM64_NT_CONTEXT *context )
  }
  
  
@@ -179,7 +180,7 @@ index 24d3b6d..ab95f38 100644
      if (pResetToConsistentState) pResetToConsistentState( rec, &context->AMD64_Context, arm_ctx );
      /* call x64 dispatcher if the thunk or the function pointer was modified */
      if (pWow64PrepareForException || memcmp( KiUserExceptionDispatcher_thunk, KiUserExceptionDispatcher_orig,
-@@ -1312,12 +1378,12 @@ void __attribute__((naked)) KiUserExceptionDispatcher( EXCEPTION_RECORD *rec, CO
+@@ -1312,12 +1379,12 @@ void __attribute__((naked)) KiUserExceptionDispatcher( EXCEPTION_RECORD *rec, CO
  {
      asm( ".seh_proc \"#KiUserExceptionDispatcher\"\n\t"
           ".seh_context\n\t"
@@ -196,7 +197,7 @@ index 24d3b6d..ab95f38 100644
           "bl \"#prepare_exception_arm64ec\"\n\t"
           "cbz x0, 1f\n\t"
           /* bypass exit thunk to avoid messing up the stack */
-@@ -1325,7 +1391,7 @@ void __attribute__((naked)) KiUserExceptionDispatcher( EXCEPTION_RECORD *rec, CO
+@@ -1325,7 +1392,7 @@ void __attribute__((naked)) KiUserExceptionDispatcher( EXCEPTION_RECORD *rec, CO
           "ldr x16, [x16, #:lo12:__os_arm64x_dispatch_call_no_redirect]\n\t"
           "mov x9, x0\n\t"
           "blr x16\n"
@@ -205,7 +206,7 @@ index 24d3b6d..ab95f38 100644
           "mov x1, sp\n\t"                   /* context */
           "bl #dispatch_exception\n\t"
           "brk #1\n\t"
-@@ -1340,11 +1406,12 @@ static void __attribute__((used)) dispatch_apc( void (CALLBACK *func)(ULONG_PTR,
+@@ -1340,11 +1407,12 @@ static void __attribute__((used)) dispatch_apc( void (CALLBACK *func)(ULONG_PTR,
                                                  ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3,
                                                  BOOLEAN alertable, ARM64_NT_CONTEXT *arm_ctx )
  {
@@ -222,7 +223,7 @@ index 24d3b6d..ab95f38 100644
  }
  __ASM_GLOBAL_FUNC( "#KiUserApcDispatcher",
                     ".seh_context\n\t"
-@@ -1419,12 +1486,21 @@ static void __attribute__((used)) unwind_entry_thunk( CONTEXT *context )
+@@ -1419,12 +1487,21 @@ static void __attribute__((used)) unwind_entry_thunk( CONTEXT *context )
  /* capture context information; helper for RtlCaptureContext */
  static void __attribute__((used)) capture_context( CONTEXT *context, UINT cpsr, UINT fpcr, UINT fpsr )
  {
@@ -245,7 +246,7 @@ index 24d3b6d..ab95f38 100644
      unwind_entry_thunk( context );
  }
  
-@@ -1483,6 +1559,12 @@ static int __attribute__((used)) do_setjmpex( _JUMP_BUFFER *buf, UINT fpcr, UINT
+@@ -1483,6 +1560,12 @@ static int __attribute__((used)) do_setjmpex( _JUMP_BUFFER *buf, UINT fpcr, UINT
  
      buf->MxCsr = fpcsr_to_mxcsr( fpcr, fpsr );
      buf->FpCsr = 0x27f;

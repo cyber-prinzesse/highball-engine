@@ -83,7 +83,10 @@ dying with an illegal instruction, and guard pages fault. With the FEX build of 
   context with room for the AVX state. `RtlCaptureContext`, `setjmp` and `GetThreadContext` on the
   current thread take the x87 state from the emulator (`GetX87State`): before, a C++ exception
   unwound by `RtlUnwindEx` reset the x87 control word to 0x27f, which drops mingw-w64 programs
-  from 64-bit to 53-bit precision.
+  from 64-bit to 53-bit precision. `SetThreadContext` merges the classes it is given into another
+  thread's full state; on the current thread it applies them as they are (2026-10-11 fix: the merge
+  read the state of the call itself and sent the thread back into it, so a `SetThreadContext` of
+  the current thread with one class killed the program; ctxtest `self.set.*`).
 
 - `0028-ntdll-arm64ec-x64-information-through-emulator.patch`: the CRT's `_controlfp` is native
   code and reads and sets MXCSR through `__os_arm64x_get_x64_information` and
@@ -92,3 +95,15 @@ dying with an illegal instruction, and guard pages fault. With the FEX build of 
   keeps running with them off; the x87 control word comes from `GetX87State` instead of a fixed
   0x27f. With FEX patch 0009, `_controlfp` and `LDMXCSR` see each other's rounding mode, masks and
   denormal control, and an exception unmasked with `_controlfp` traps, as on x86-64 Windows.
+
+- `0029-ntdll-arm64ec-x64-debug-registers.patch`: the x64 debug registers DR0-DR3, DR6 and DR7.
+  The ARM64EC conversions dropped them and the arm64 Unix side answered them with a FIXME, so
+  hardware breakpoints set with `SetThreadContext`, an exception handler's context or `NtContinue`
+  never existed. They belong to the emulator, which compiles a thread's breakpoints into its code
+  (FEX patch 0017), and ntdll hands x64 context operations to it (`GetX64DebugRegisters`,
+  `SetX64DebugRegisters`, for the current thread or another one it knows). A thread created
+  suspended, before the emulator knows it, keeps them in the context the server holds, in the ARM64
+  breakpoint registers with a tag, and gets them with its first context. Contexts the emulator builds
+  carry them the same way, so handlers see them and a hit's DR6. With Hangover's FEX DLLs they are
+  silently ignored, as on Windows on Arm. drtest and drtest32 70 of 70 on an M4, as on x86-64
+  Windows Server 2022 and 2025.

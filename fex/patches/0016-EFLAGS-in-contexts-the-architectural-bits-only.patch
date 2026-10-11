@@ -1,0 +1,29 @@
+From ce4f233cb57aa5b535cc607a1ac3b292d13f90e3 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 14:28:21 +0200
+Subject: [PATCH] EFLAGS in contexts: the architectural bits only
+
+ReconstructCompactedEFLAGS shifted every byte of flags[] it does not treat specially into the result, bytes 24-27
+included, where the packed NZCV lives, so an exception context showed EFLAGS 0xa0000e97 where x86-64 Windows reports
+0xe97. Harmless while a context only carried NZCV and the trap flag, visible since the context extension (0003)
+carries all of EFLAGS. The result is masked to the architectural bits (3, 5, 15 and 22-31 read as 0); pushf builds its
+value separately and was not affected. ctxtest *.ctx.eflags.reserved.
+---
+ FEXCore/Source/Interface/Core/Core.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 00d1898..a86c619 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -342,7 +342,9 @@ uint32_t ContextImpl::ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadSt
+     EFLAGS |= 1 << X86State::RFLAG_DF_RAW_LOC;
+   }
+ 
+-  return EFLAGS;
++  // Only the architectural bits: flags[] also stores the packed NZCV at bytes 24-27, which the loop above shifted in.
++  // Bits 3, 5, 15 and 22-31 read as 0 on x86.
++  return EFLAGS & 0x003F7FD7;
+ }
+ 
+ void ContextImpl::ReconstructXMMRegisters(const FEXCore::Core::InternalThreadState* Thread, __uint128_t* XMM_Low, __uint128_t* YMM_High) {

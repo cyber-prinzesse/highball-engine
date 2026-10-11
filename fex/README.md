@@ -41,5 +41,19 @@ M1 Pro (2026-10-10 and 2026-10-11). The Wine half is `patches-arm64/0022` to `00
   copy the context never reached). 32-bit SSE exceptions arrive as STATUS_FLOAT_MULTIPLE_TRAPS, as
   32-bit Windows reports them.
 
+- `0016` EFLAGS in contexts: only the architectural bits. The NZCV storage bytes leaked into bits
+  24-31 once `0003` passed all of EFLAGS (an int3 context showed 0xa0000e97 where Windows shows
+  0xe97).
+- `0017` the x86 debug registers DR0-DR3, DR6 and DR7, per thread. Instruction breakpoints end a
+  block before the instruction and fault there (#DB, RIP at the instruction); RF from the context
+  the thread resumes with lets it run once, and fault contexts report RF set, as Windows does. Data
+  breakpoints are checked on every guest memory access; a thread with one runs one instruction per
+  block so the trap comes right after the access, and REP string instructions run one element per
+  execution (RIP at the instruction, RCX the count left). A thread with breakpoints compiles into a
+  code buffer of its own. No cost without breakpoints; about three times slower while a data
+  breakpoint is set. The ARM64EC module exports `GetX64DebugRegisters` and `SetX64DebugRegisters`
+  for ntdll (`patches-arm64/0029`); the WoW64 module takes them from the 32-bit context. Registers
+  read back as Windows reports them for a 64-bit and for a 32-bit program, which differ (drtest).
+
 32-bit programs were measured with the engine built by CI (it has the i386 half): x87test32 120/128,
 the same eight x87 gaps as the 64-bit build; the string resume and the code patching probe pass.

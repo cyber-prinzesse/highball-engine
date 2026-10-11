@@ -1,0 +1,233 @@
+From 315665f7201f336825e4588b0df4f0d3fc17b362 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 14:25:10 +0200
+Subject: [PATCH] ntdll: the x64 debug registers of an ARM64EC thread through
+ the emulator
+
+An x64 program's DR0-DR3, DR6 and DR7 were dropped by the ARM64EC context conversion and by the arm64 Unix side
+(FIXME "debug registers not supported"), so hardware breakpoints set with SetThreadContext, an exception handler's
+context or NtContinue never existed. They now belong to the emulator, which compiles a thread's breakpoints into its
+code, and ntdll hands x64 context operations to it through two exports:
+
+- GetX64DebugRegisters(thread, context) and SetX64DebugRegisters(thread, context), for the current thread or any
+  thread the emulator knows. The current thread takes them at once; another one before it runs x64 code again.
+- A thread the emulator does not know yet (created suspended, not started) keeps them in the context the server
+  holds for it: the ARM64 context's breakpoint registers carry them, tagged ("64DR" in Bcr[7]; Bvr[0-3] DR0-DR3,
+  Bvr[4] DR6, Bvr[5] DR7), unwind.h converts that block, init_syscall_frame keeps it for the first context, and the
+  NtContinue at the end of LdrInitializeThunk hands it to the emulator.
+- Contexts the emulator builds (exceptions, suspension) carry the same tagged block, so handlers see the registers
+  and a hit's DR6, and NtContinue gives a handler's changes back.
+
+The Unix side leaves a tagged block of the current thread alone; native ARM64 debug registers keep their existing
+path. With an emulator that has no such exports the registers are silently ignored, as on Windows on Arm.
+---
+ dlls/ntdll/signal_arm64ec.c    | 42 ++++++++++++++++++++++++++++++++++
+ dlls/ntdll/unix/signal_arm64.c | 14 ++++++++++++
+ dlls/ntdll/unwind.h            | 32 ++++++++++++++++++++++++++
+ 3 files changed, 88 insertions(+)
+
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index 45a368b..827a3dc 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -59,6 +59,8 @@ static void     (WINAPI *pUpdateProcessorInformation)(SYSTEM_CPU_INFORMATION*);
+ /* emulator extensions: the calling thread's x87 state, which native code cannot read, and the MXCSR control bits,
+  * whose exception masks the emulator keeps (native code runs with the trap enables off) */
+ static void     (WINAPI *pGetX87State)(XMM_SAVE_AREA32*);
++static BOOL     (WINAPI *pGetX64DebugRegisters)(HANDLE,CONTEXT*);
++static BOOL     (WINAPI *pSetX64DebugRegisters)(HANDLE,const CONTEXT*);
+ static BOOL     (WINAPI *pGetX64Mxcsr)(UINT*);
+ static BOOL     (WINAPI *pSetX64Mxcsr)(UINT);
+ 
+@@ -246,6 +248,8 @@ NTSTATUS arm64ec_process_init( HMODULE module )
+     GET_PTR( ThreadTerm );
+     GET_PTR( UpdateProcessorInformation );
+     GET_PTR( GetX87State );
++    GET_PTR( GetX64DebugRegisters );
++    GET_PTR( SetX64DebugRegisters );
+     GET_PTR( GetX64Mxcsr );
+     GET_PTR( SetX64Mxcsr );
+ #undef GET_PTR
+@@ -697,19 +701,49 @@ NTSTATUS SYSCALL_API NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE
+     return status;
+ }
+ 
++/* The x64 debug registers of an emulated thread belong to the emulator, which compiles the thread's breakpoints
++ * into its code: x64 context operations hand them to it. A thread it does not know yet (created suspended, not
++ * started) keeps them in the context the server holds for it, and gets them with its first context. */
++static BOOL set_x64_debug_registers( HANDLE handle, const CONTEXT *context )
++{
++    if ((context->ContextFlags & CONTEXT_AMD64_DEBUG_REGISTERS) != CONTEXT_AMD64_DEBUG_REGISTERS) return FALSE;
++    return pSetX64DebugRegisters && pSetX64DebugRegisters( handle, context );
++}
++
++static void get_x64_debug_registers( HANDLE handle, ARM64EC_NT_CONTEXT *x64 )
++{
++    ARM64_NT_CONTEXT arm_ctx = { .ContextFlags = CONTEXT_ARM64_DEBUG_REGISTERS };
++
++    x64->ContextFlags |= CONTEXT_AMD64_DEBUG_REGISTERS;
++    if (pGetX64DebugRegisters && pGetX64DebugRegisters( handle, &x64->AMD64_Context )) return;
++    if (handle == GetCurrentThread() || syscall_NtGetContextThread( handle, &arm_ctx )) return;
++    if ((arm_ctx.ContextFlags & CONTEXT_ARM64_DEBUG_REGISTERS) != CONTEXT_ARM64_DEBUG_REGISTERS) return;
++    if (arm_ctx.Bcr[7] != ARM64EC_X64_DEBUG_TAG) return;
++    x64->AMD64_Dr0 = arm_ctx.Bvr[0];
++    x64->AMD64_Dr1 = arm_ctx.Bvr[1];
++    x64->AMD64_Dr2 = arm_ctx.Bvr[2];
++    x64->AMD64_Dr3 = arm_ctx.Bvr[3];
++    x64->AMD64_Dr6 = arm_ctx.Bvr[4];
++    x64->AMD64_Dr7 = arm_ctx.Bvr[5];
++}
++
+ NTSTATUS SYSCALL_API NtContinue( CONTEXT *context, BOOLEAN alertable )
+ {
+     ARM64_NT_CONTEXT arm_ctx;
++    BOOL debug = set_x64_debug_registers( GetCurrentThread(), context );
+ 
+     context_x64_to_arm_xstate( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
++    if (debug) arm_ctx.ContextFlags &= ~(CONTEXT_ARM64_DEBUG_REGISTERS & ~CONTEXT_ARM64);
+     return syscall_NtContinue( &arm_ctx, alertable );
+ }
+ 
+ NTSTATUS SYSCALL_API NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
+ {
+     ARM64_NT_CONTEXT arm_ctx;
++    BOOL debug = set_x64_debug_registers( GetCurrentThread(), context );
+ 
+     context_x64_to_arm_xstate( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
++    if (debug) arm_ctx.ContextFlags &= ~(CONTEXT_ARM64_DEBUG_REGISTERS & ~CONTEXT_ARM64);
+     return syscall_NtContinueEx( &arm_ctx, args );
+ }
+ 
+@@ -766,6 +800,7 @@ NTSTATUS SYSCALL_API NtGetContextThread( HANDLE handle, CONTEXT *context )
+     context_arm_to_x64_ex( x64, &arm_ctx );
+     /* the current thread is in native code here: its x87 state is the emulator's */
+     if (handle == GetCurrentThread() && pGetX87State) pGetX87State( &x64->AMD64_Context.FltSave );
++    if ((flags & CONTEXT_AMD64_DEBUG_REGISTERS) == CONTEXT_AMD64_DEBUG_REGISTERS) get_x64_debug_registers( handle, x64 );
+     if (!(x64->ContextFlags & CONTEXT_AMD64_XSTATE & ~CONTEXT_AMD64)) flags &= ~(CONTEXT_AMD64_XSTATE & ~CONTEXT_AMD64);
+     if ((status = RtlCopyContext( context, flags, &x64->AMD64_Context ))) return status;
+     if (flags & (CONTEXT_AMD64_CONTROL | CONTEXT_AMD64_FLOATING_POINT) & ~CONTEXT_AMD64)
+@@ -884,7 +919,13 @@ NTSTATUS SYSCALL_API NtSetContextThread( HANDLE handle, const CONTEXT *context )
+     static const DWORD full = (CONTEXT_AMD64_CONTROL | CONTEXT_AMD64_INTEGER | CONTEXT_AMD64_FLOATING_POINT) & ~CONTEXT_AMD64;
+     ARM64_NT_CONTEXT arm_ctx;
+     DWORD flags = context->ContextFlags;
++    BOOL debug = set_x64_debug_registers( handle, context );
+ 
++    if (debug)
++    {
++        flags &= ~(CONTEXT_AMD64_DEBUG_REGISTERS & ~CONTEXT_AMD64);
++        if (!(flags & ~(CONTEXT_AMD64 | exception_flags_mask))) return STATUS_SUCCESS;
++    }
+     /* The current thread's state is the frame of this very call, which the classes given update as they are */
+     if ((flags & full) != full && handle != GetCurrentThread())
+     {
+@@ -904,6 +945,7 @@ NTSTATUS SYSCALL_API NtSetContextThread( HANDLE handle, const CONTEXT *context )
+         context_x64_to_arm_xstate( &arm_ctx, x64 );
+     }
+     else context_x64_to_arm_xstate( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
++    if (debug) arm_ctx.ContextFlags &= ~(CONTEXT_ARM64_DEBUG_REGISTERS & ~CONTEXT_ARM64);
+     return syscall_NtSetContextThread( handle, &arm_ctx );
+ }
+ 
+diff --git a/dlls/ntdll/unix/signal_arm64.c b/dlls/ntdll/unix/signal_arm64.c
+index 63075f7..f95fd2e 100644
+--- a/dlls/ntdll/unix/signal_arm64.c
++++ b/dlls/ntdll/unix/signal_arm64.c
+@@ -76,6 +76,16 @@ static inline struct arm64_thread_data *arm64_thread_data( struct thread_data *d
+     return (struct arm64_thread_data *)get_teb_data(data)->cpu_data;
+ }
+ 
++/* An ARM64EC thread's x64 debug registers in the context's breakpoint registers, tagged in Bcr[7] (see
++ * dlls/ntdll/unwind.h). They belong to the x64 emulator, which ntdll hands them to. */
++#define ARM64EC_X64_DEBUG_TAG 0x52443436  /* "64DR" */
++
++static inline BOOL is_x64_debug_context( const CONTEXT *context )
++{
++    return (context->ContextFlags & CONTEXT_DEBUG_REGISTERS) == CONTEXT_DEBUG_REGISTERS &&
++           context->Bcr[7] == ARM64EC_X64_DEBUG_TAG;
++}
++
+ /***********************************************************************
+  * signal context platform-specific definitions
+  */
+@@ -448,6 +458,7 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
+     DWORD flags = context->ContextFlags & ~CONTEXT_ARM64;
+ 
+     if (self && !frame) return STATUS_ACCESS_DENIED;
++    if (self && is_x64_debug_context( context )) flags &= ~CONTEXT_DEBUG_REGISTERS;  /* the emulator's */
+     if (self && (flags & CONTEXT_DEBUG_REGISTERS)) self = FALSE;
+ 
+     if (!self)
+@@ -1713,6 +1724,9 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
+     ctx = (CONTEXT *)((ULONG_PTR)context.Sp & ~15) - 1;
+     *ctx = context;
+     ctx->ContextFlags = CONTEXT_FULL | CONTEXT_ARM64_X18;
++    /* x64 debug registers set while the thread was suspended before it started: LdrInitializeThunk's NtContinue
++     * gives them to the emulator */
++    if (is_x64_debug_context( &context )) ctx->ContextFlags |= CONTEXT_DEBUG_REGISTERS;
+     signal_set_full_context( ctx );
+ 
+     frame->sp    = (ULONG64)ctx;
+diff --git a/dlls/ntdll/unwind.h b/dlls/ntdll/unwind.h
+index 9701a2c..8b15904 100644
+--- a/dlls/ntdll/unwind.h
++++ b/dlls/ntdll/unwind.h
+@@ -48,6 +48,12 @@ static const ULONG exception_flags_mask = CONTEXT_EXCEPTION_ACTIVE |
+ #define ARM64EC_X64_STATE_YMM      0x2
+ #define ARM64EC_X64_STATE_TAG      0x6574617473343678ull  /* "x64state" */
+ #define ARM64EC_X64_STATE_TAG_POS  88                      /* in AMD64_XSAVE_FORMAT_Reserved4: FltSave bytes 504-511 */
++
++/* The x64 debug registers travel in the ARM64 context's breakpoint registers, which nothing uses on this host:
++ * Bvr[0-3] Dr0-Dr3, Bvr[4] Dr6, Bvr[5] Dr7, Bcr[7] the tag. The emulator owns them (it compiles a thread's
++ * breakpoints into its code) and packs them into every context it builds; a context an x64 program sets goes
++ * the other way. CONTEXT_ARM64_DEBUG_REGISTERS says the block is present, the tag that it holds x64 registers. */
++#define ARM64EC_X64_DEBUG_TAG      0x52443436                /* "64DR" */
+ #define EFLAGS_FROM_CPSR           0x09c1                  /* CF ZF SF TF OF */
+ 
+ static inline ULONG ctx_flags_x64_to_arm( ULONG flags )
+@@ -59,6 +65,7 @@ static inline ULONG ctx_flags_x64_to_arm( ULONG flags )
+     if (flags & CONTEXT_AMD64_INTEGER) ret |= CONTEXT_ARM64_INTEGER;
+     if (flags & CONTEXT_AMD64_FLOATING_POINT) ret |= CONTEXT_ARM64_FLOATING_POINT;
+     if ((flags & 0x40) == 0x40) ret |= CONTEXT_ARM64_FEX_YMMSTATE;  /* CONTEXT_AMD64_XSTATE */
++    if (flags & CONTEXT_AMD64_DEBUG_REGISTERS) ret |= CONTEXT_ARM64_DEBUG_REGISTERS;
+     return ret;
+ }
+ 
+@@ -212,6 +219,17 @@ static inline void context_x64_to_arm( ARM64_NT_CONTEXT *arm_ctx, const ARM64EC_
+                    (DWORD64)ec_ctx->AMD64_TagWord << 32 | (DWORD64)(ec_ctx->AMD64_ErrorOpcode & 0x7ff) << 40;
+     arm_ctx->X14 = ec_ctx->AMD64_MxCsr | (DWORD64)ec_ctx->AMD64_EFlags << 32;
+     arm_ctx->X28 = ARM64EC_X64_STATE_MARKER | ARM64EC_X64_STATE_X87;
++
++    if ((ec_ctx->ContextFlags & CONTEXT_AMD64_DEBUG_REGISTERS) == CONTEXT_AMD64_DEBUG_REGISTERS)
++    {
++        arm_ctx->Bvr[0] = ec_ctx->AMD64_Dr0;
++        arm_ctx->Bvr[1] = ec_ctx->AMD64_Dr1;
++        arm_ctx->Bvr[2] = ec_ctx->AMD64_Dr2;
++        arm_ctx->Bvr[3] = ec_ctx->AMD64_Dr3;
++        arm_ctx->Bvr[4] = ec_ctx->AMD64_Dr6;
++        arm_ctx->Bvr[5] = ec_ctx->AMD64_Dr7;
++        arm_ctx->Bcr[7] = ARM64EC_X64_DEBUG_TAG;
++    }
+ }
+ 
+ /* same, also taking the YMM upper halves from the CONTEXT_EX of a context with CONTEXT_AMD64_XSTATE; only for
+@@ -295,6 +313,20 @@ static inline void context_arm_to_x64( ARM64EC_NT_CONTEXT *ec_ctx, const ARM64_N
+         *(ULONG64 *)&ec_ctx->AMD64_XSAVE_FORMAT_Reserved4[ARM64EC_X64_STATE_TAG_POS] = ARM64EC_X64_STATE_TAG;
+     }
+     else ec_ctx->AMD64_ControlWord = 0x27f;  /* the x64 default; the state of native code */
++
++    if ((arm_ctx->ContextFlags & CONTEXT_ARM64_DEBUG_REGISTERS) == CONTEXT_ARM64_DEBUG_REGISTERS)
++    {
++        ec_ctx->ContextFlags |= CONTEXT_AMD64_DEBUG_REGISTERS;
++        if (arm_ctx->Bcr[7] == ARM64EC_X64_DEBUG_TAG)
++        {
++            ec_ctx->AMD64_Dr0 = arm_ctx->Bvr[0];
++            ec_ctx->AMD64_Dr1 = arm_ctx->Bvr[1];
++            ec_ctx->AMD64_Dr2 = arm_ctx->Bvr[2];
++            ec_ctx->AMD64_Dr3 = arm_ctx->Bvr[3];
++            ec_ctx->AMD64_Dr6 = arm_ctx->Bvr[4];
++            ec_ctx->AMD64_Dr7 = arm_ctx->Bvr[5];
++        }
++    }
+ }
+ 
+ /* same, for an x64 context initialized with a CONTEXT_EX (RtlInitializeExtendedContext with

@@ -1,0 +1,1772 @@
+From 5c0dad4304088aad90eb54b6402e1bbecef7e72b Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 14:28:52 +0200
+Subject: [PATCH] x86 debug registers: DR0-DR3, DR6 and DR7 per thread,
+ instruction and data breakpoints
+
+FEX kept no debug register state: SetThreadContext with CONTEXT_DEBUG_REGISTERS did nothing and no hardware
+breakpoint ever fired, which debuggers, crash reporters and programs watching their own memory rely on. Measured
+against x86-64 Windows Server 2022 and 2025 with tests/x64-fidelity/drtest (64-bit and 32-bit).
+
+State and compilation: CPUState holds dr[4], dr6 and dr7 (DR7 as Windows keeps it) and resume_flag_rip. SetDebugRegisters
+turns them into the thread's breakpoints (X86State::DebugBreakpoints: instruction breakpoints by address, data
+breakpoints as aligned ranges; only the local enables count, as on Windows, and an instruction breakpoint with LEN other
+than 0 never fires there). They are compiled into the thread's code: its code cache is cleared when they change, and a
+thread with breakpoints moves to a code buffer of its own, so no other thread runs its blocks or it theirs, and the disk
+cache is not used for it.
+
+Instruction breakpoints: a block that reaches a breakpoint address ends before it, so the check (DebugBreakpoint) runs
+at a block start, where the guest state is all in CPUState: B bits in DR6, then #DB (EXCEPTION_SINGLE_STEP) with RIP at
+the instruction. A context loaded with RF set lets that instruction run once (resume_flag_rip, so EFLAGS never keeps a
+stale RF), and the context of a fault reports RF set as Windows does (ud2, divide errors, access violations, DEP, hlt,
+not int3 or a single step), so continuing from a fault does not take the instruction's breakpoint again.
+
+Data breakpoints: every guest memory access (loads, stores, pairs, vector element and masked forms, x87 stores, push
+and pop, atomics) checks the thread's ranges and sets the B bit and CpuStateFrame::DebugWatchHit. A thread with data
+breakpoints runs one instruction per block, so the check at the next block start raises the trap right after the
+instruction, with exact state; REP string instructions then run one element per execution (MOVS, STOS, LODS, SCAS,
+CMPS), so a hit traps with RIP at the instruction and RCX the count left, as on x86. The checks leave NZCV alone, which
+holds the guest's flags between instructions.
+
+Cost: none for a thread without breakpoints (the doorbell check at every block start now loads 64 bits, which also
+cover the two debug event bytes); a thread with data breakpoints runs about three times slower while they are set.
+
+Windows: the ARM64EC module exports GetX64DebugRegisters and SetX64DebugRegisters(thread, context) for ntdll's x64
+context operations (highball-engine patches-arm64/0029). The current thread takes new registers at once; another thread
+the emulator knows takes them before it runs guest code again (at its next block start, through the doorbell check,
+or when it enters simulation). Contexts built for exceptions and suspension carry them in the ARM64 breakpoint
+registers (Bvr[0-5], tag "64DR" in Bcr[7]), and a loaded context with CONTEXT_DEBUG_REGISTERS sets them. They read as
+Windows reports them: all 0 unless DR7 keeps them (L0-L3, LE, GE), DR7 with bit 10 set, DR6 with the bits x86 reads as 1
+and the B bits of a hit being reported. Recompiling from inside ntdll runs with its memory callbacks off. The WoW64
+module takes them from the 32-bit context, where Wine keeps them: a reload can happen inside a block (after a system
+call), so the thread applies them at its next block start; they read back as WoW64 reports them (LE added for an
+address with nothing enabled, DR7 through 0xffff0155).
+
+On an M4: drtest 70 of 70 and drtest32 70 of 70, as on x86-64 Windows; ctxtest 546 of 546.
+---
+ FEXCore/Source/Interface/Context/Context.h    |   1 +
+ FEXCore/Source/Interface/Core/CPUBackend.cpp  |   5 +-
+ FEXCore/Source/Interface/Core/CPUBackend.h    |   8 +
+ FEXCore/Source/Interface/Core/Core.cpp        |  52 ++++-
+ .../Source/Interface/Core/JIT/AtomicOps.cpp   |  30 +++
+ FEXCore/Source/Interface/Core/JIT/JIT.cpp     |  10 +-
+ FEXCore/Source/Interface/Core/JIT/JITClass.h  |  12 +
+ .../Source/Interface/Core/JIT/MemoryOps.cpp   | 182 +++++++++++++++
+ FEXCore/Source/Interface/Core/JIT/MiscOps.cpp |  50 +++++
+ .../Interface/Core/OpcodeDispatcher.cpp       |  53 ++++-
+ .../Source/Interface/Core/OpcodeDispatcher.h  |  41 ++++
+ .../Core/SharedCodeBufferManager.cpp          |   6 +
+ .../Interface/Core/SharedCodeBufferManager.h  |   4 +
+ FEXCore/Source/Interface/IR/IR.json           |   8 +
+ FEXCore/include/FEXCore/Core/Context.h        |   9 +
+ FEXCore/include/FEXCore/Core/CoreState.h      |  19 +-
+ FEXCore/include/FEXCore/Core/DebugRegisters.h | 143 ++++++++++++
+ .../FEXCore/Debug/InternalThreadState.h       |   4 +
+ Source/Windows/ARM64EC/BTInterface.h          |   2 +
+ Source/Windows/ARM64EC/Module.cpp             | 208 ++++++++++++++++--
+ Source/Windows/ARM64EC/libarm64ecfex.def      |   2 +
+ Source/Windows/Common/Exception.h             |  15 ++
+ Source/Windows/WOW64/Module.cpp               |  92 +++++++-
+ 23 files changed, 918 insertions(+), 38 deletions(-)
+ create mode 100644 FEXCore/include/FEXCore/Core/DebugRegisters.h
+
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 10fe6c6..37bd5c0 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -153,6 +153,7 @@ public:
+ 
+   uint64_t RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) override;
+   bool RestoreStringOpProgressFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, const uint64_t* HostGPRs) override;
++  void SetDebugRegisters(FEXCore::Core::InternalThreadState* Thread, const uint64_t* DR, uint64_t DR7) override;
+   uint32_t ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, bool WasInJIT, const uint64_t* HostGPRs, uint64_t PSTATE) override;
+   void SetFlagsFromCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, uint32_t EFLAGS) override;
+ 
+diff --git a/FEXCore/Source/Interface/Core/CPUBackend.cpp b/FEXCore/Source/Interface/Core/CPUBackend.cpp
+index ac39051..117aa3e 100644
+--- a/FEXCore/Source/Interface/Core/CPUBackend.cpp
++++ b/FEXCore/Source/Interface/Core/CPUBackend.cpp
+@@ -312,7 +312,7 @@ namespace CPU {
+     auto PrevCodeBuffer = CurrentCodeBuffer;
+ 
+     // Resize the code buffer and reallocate our code size
+-    CurrentCodeBuffer = SharedCodeBuffers.StartLargerCodeBuffer();
++    CurrentCodeBuffer = PrivateCodeBuffer ? SharedCodeBuffers.AllocatePrivateCodeBuffer() : SharedCodeBuffers.StartLargerCodeBuffer();
+ 
+     RegisterForSignalHandler(std::move(PrevCodeBuffer));
+     return CurrentCodeBuffer.get();
+@@ -330,6 +330,9 @@ namespace CPU {
+   }
+ 
+   fextl::shared_ptr<CodeBuffer> CPUBackend::CheckCodeBufferUpdate() {
++    if (PrivateCodeBuffer) {
++      return nullptr;
++    }
+     auto NewCodeBuffer = SharedCodeBuffers.GetLatest();
+     if (CurrentCodeBuffer != NewCodeBuffer) {
+       RegisterForSignalHandler(CurrentCodeBuffer);
+diff --git a/FEXCore/Source/Interface/Core/CPUBackend.h b/FEXCore/Source/Interface/Core/CPUBackend.h
+index 0183694..b6c9f54 100644
+--- a/FEXCore/Source/Interface/Core/CPUBackend.h
++++ b/FEXCore/Source/Interface/Core/CPUBackend.h
+@@ -138,6 +138,12 @@ namespace CPU {
+     [[nodiscard]]
+     fextl::shared_ptr<CodeBuffer> CheckCodeBufferUpdate();
+ 
++    // From the next ClearCache on, this thread compiles into code buffers of its own instead of the shared ones
++    // (its code carries its debug breakpoints). Never leaves them again.
++    void SetPrivateCodeBuffer(bool Private) {
++      PrivateCodeBuffer = Private;
++    }
++
+   protected:
+     // Max spill slot size in bytes. We need at most 32 bytes
+     // to be able to handle a 256-bit vector store to a slot.
+@@ -158,6 +164,8 @@ namespace CPU {
+ 
+     SharedCodeBufferManager& SharedCodeBuffers;
+ 
++    bool PrivateCodeBuffer {};
++
+   private:
+     void RegisterForSignalHandler(fextl::shared_ptr<CodeBuffer>);
+   };
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index a86c619..4470789 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -269,6 +269,33 @@ bool ContextImpl::RestoreStringOpProgressFromHostPC(FEXCore::Core::InternalThrea
+   return true;
+ }
+ 
++void ContextImpl::SetDebugRegisters(FEXCore::Core::InternalThreadState* Thread, const uint64_t* DR, uint64_t DR7) {
++  auto& State = Thread->CurrentFrame->State;
++  // The bits Windows keeps: local enables, LE, R/W and LEN
++  DR7 &= X86State::DR7_LEGAL_MASK;
++  memcpy(State.dr, DR, sizeof(State.dr));
++  State.dr7 = DR7;
++
++  const auto Breakpoints = X86State::DebugBreakpoints::FromRegisters(State.dr, DR7);
++  if (Breakpoints == Thread->DebugBreakpoints) {
++    return;
++  }
++  const bool WasActive = Thread->DebugBreakpoints.Active();
++  Thread->DebugBreakpoints = Breakpoints;
++  Thread->CurrentFrame->DebugWatchHit = 0;
++
++  // Blocks compiled with the previous breakpoints are stale. Compiled code is shared between threads, so a thread
++  // with breakpoints moves to a code buffer of its own: no other thread runs its instrumented blocks and it runs
++  // no block compiled without them. It keeps that buffer afterwards (going back would start a new shared
++  // generation and flush every thread's cache).
++  if (Breakpoints.Active() && !WasActive) {
++    Thread->CPUBackend->SetPrivateCodeBuffer(true);
++    ClearCodeCache(Thread, true);
++  } else {
++    ClearCodeCache(Thread, false);
++  }
++}
++
+ uint32_t ContextImpl::ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, bool WasInJIT, const uint64_t* HostGPRs,
+                                                  uint64_t PSTATE) {
+   const auto Frame = Thread->CurrentFrame;
+@@ -730,6 +757,18 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
+         }
+ 
++        // An instruction breakpoint (Thread->DebugBreakpoints) faults before the instruction runs, unless the context
++        // the thread resumed with had RF set for it (CPUState::resume_flag_rip). It is checked where a block starts and
++        // the guest state is all in CPUState: a block that reaches a breakpoint instruction ends before it.
++        if (const uint8_t Mask = Thread->DebugBreakpoints.ExecMaskAt(InstAddress)) {
++          if (i == 0) {
++            Thread->OpDispatcher->DebugBreakpointCheck(DecodedInfo, Mask);
++          } else {
++            Thread->OpDispatcher->ExitFunction(Thread->OpDispatcher->_InlineEntrypointOffset(GPRSize, InstAddress - GuestRIP));
++            break;
++          }
++        }
++
+         if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
+           auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Block.Entry + BlockInstructionsLength);
+           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
+@@ -956,6 +995,12 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+   FEXCORE_PROFILE_SCOPED("CompileBlock");
+   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
+ 
++  // A thread with data breakpoints runs one instruction per block: the check at every block start raises the trap of
++  // an access right after the instruction that made it, with the guest state exact (as for the trap flag)
++  if (Thread->DebugBreakpoints.NumWatch) {
++    MaxInst = 1;
++  }
++
+   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
+ 
+   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
+@@ -974,7 +1019,10 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+   std::optional<uint64_t> DiskCacheGuestCodeKey;
+   {
+     FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedDiskCacheLookupTime);
+-    Hit = DiskCache.Lookup(Thread, Region, GuestRIP, DiskCacheGuestCodeKey);
++    // Code carrying a thread's debug breakpoints is neither loaded from nor stored to the disk cache
++    if (!Thread->DebugBreakpoints.Active()) {
++      Hit = DiskCache.Lookup(Thread, Region, GuestRIP, DiskCacheGuestCodeKey);
++    }
+     if (Hit && !DiskCache.IsValidating()) {
+       auto LoadedCode = Thread->CPUBackend->LoadCachedCode(Hit->HostCode);
+       if (LoadedCode.BlockBegin) {
+@@ -1100,7 +1148,7 @@ RecompileForSMC:
+   }
+ 
+   // Disk Cache
+-  if (!CodeCache.IsGeneratingCache) {
++  if (!CodeCache.IsGeneratingCache && !Thread->DebugBreakpoints.Active()) {
+     if (DiskCacheGuestCodeKey) {
+       std::span<const FEXCore::CPU::Relocation> Relocations;
+       if (DebugData && DebugData->Relocations) {
+diff --git a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+index 014a8c6..eefcc71 100644
+--- a/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/AtomicOps.cpp
+@@ -12,6 +12,9 @@ $end_info$
+ namespace FEXCore::CPU {
+ DEF_OP(CASPair) {
+   auto Op = IROp->C<IR::IROp_CASPair>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->Addr), 2 * IR::OpSizeToSize(IROp->ElementSize), true);
++  }
+   LOGMAN_THROW_A_FMT(IROp->ElementSize == IR::OpSize::i32Bit || IROp->ElementSize == IR::OpSize::i64Bit, "Wrong element size");
+   // Size is the size of each pair element
+   auto Dst0 = GetReg(Op->OutLo);
+@@ -91,6 +94,9 @@ DEF_OP(CASPair) {
+ 
+ DEF_OP(CAS) {
+   auto Op = IROp->C<IR::IROp_CAS>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->Addr), IR::OpSizeToSize(IROp->Size), true);
++  }
+   const auto EmitSize = ConvertSize(IROp);
+   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
+   // DataSrc = *Src1
+@@ -140,6 +146,9 @@ DEF_OP(CAS) {
+ 
+ DEF_OP(AtomicSwap) {
+   auto Op = IROp->C<IR::IROp_AtomicSwap>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->Addr), IR::OpSizeToSize(IROp->Size), true);
++  }
+   const auto OpSize = IROp->Size;
+   LOGMAN_THROW_A_FMT(
+     OpSize == IR::OpSize::i64Bit || OpSize == IR::OpSize::i32Bit || OpSize == IR::OpSize::i16Bit || OpSize == IR::OpSize::i8Bit, "Unexpecte"
+@@ -169,6 +178,9 @@ DEF_OP(AtomicSwap) {
+ 
+ DEF_OP(AtomicFetchAdd) {
+   auto Op = IROp->C<IR::IROp_AtomicFetchAdd>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->Addr), IR::OpSizeToSize(IROp->Size), true);
++  }
+   const auto EmitSize = ConvertSize(IROp);
+   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
+ 
+@@ -190,6 +202,9 @@ DEF_OP(AtomicFetchAdd) {
+ 
+ DEF_OP(AtomicFetchSub) {
+   auto Op = IROp->C<IR::IROp_AtomicFetchSub>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->Addr), IR::OpSizeToSize(IROp->Size), true);
++  }
+   const auto EmitSize = ConvertSize(IROp);
+   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
+ 
+@@ -212,6 +227,9 @@ DEF_OP(AtomicFetchSub) {
+ 
+ DEF_OP(AtomicFetchAnd) {
+   auto Op = IROp->C<IR::IROp_AtomicFetchAnd>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->Addr), IR::OpSizeToSize(IROp->Size), true);
++  }
+   const auto EmitSize = ConvertSize(IROp);
+   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
+ 
+@@ -234,6 +252,9 @@ DEF_OP(AtomicFetchAnd) {
+ 
+ DEF_OP(AtomicFetchCLR) {
+   auto Op = IROp->C<IR::IROp_AtomicFetchCLR>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->Addr), IR::OpSizeToSize(IROp->Size), true);
++  }
+   const auto EmitSize = ConvertSize(IROp);
+   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
+ 
+@@ -255,6 +276,9 @@ DEF_OP(AtomicFetchCLR) {
+ 
+ DEF_OP(AtomicFetchOr) {
+   auto Op = IROp->C<IR::IROp_AtomicFetchOr>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->Addr), IR::OpSizeToSize(IROp->Size), true);
++  }
+   const auto EmitSize = ConvertSize(IROp);
+   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
+ 
+@@ -276,6 +300,9 @@ DEF_OP(AtomicFetchOr) {
+ 
+ DEF_OP(AtomicFetchXor) {
+   auto Op = IROp->C<IR::IROp_AtomicFetchXor>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->Addr), IR::OpSizeToSize(IROp->Size), true);
++  }
+   const auto EmitSize = ConvertSize(IROp);
+   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
+ 
+@@ -297,6 +324,9 @@ DEF_OP(AtomicFetchXor) {
+ 
+ DEF_OP(AtomicFetchNeg) {
+   auto Op = IROp->C<IR::IROp_AtomicFetchNeg>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->Addr), IR::OpSizeToSize(IROp->Size), true);
++  }
+   const auto EmitSize = ConvertSize(IROp);
+   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
+ 
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index a8cc130..cff914c 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -840,9 +840,14 @@ void Arm64JITCore::EmitSuspendInterruptCheck() {
+ #ifdef _WIN32
+   static constexpr uint16_t SuspendMagic {0xCAFE};
+ 
+-  ldr(TMP2.W(), STATE_PTR(CpuStateFrame, SuspendDoorbell));
++  // SuspendDoorbell and the debug events in one load: the trap handler tells them apart
++  static_assert(offsetof(FEXCore::Core::CpuStateFrame, DebugRegistersQueued) ==
++                offsetof(FEXCore::Core::CpuStateFrame, SuspendDoorbell) + sizeof(uint32_t));
++  static_assert(offsetof(FEXCore::Core::CpuStateFrame, DebugEventsPad) + sizeof(uint16_t) ==
++                offsetof(FEXCore::Core::CpuStateFrame, SuspendDoorbell) + sizeof(uint64_t));
++  ldr(TMP2, STATE_PTR(CpuStateFrame, SuspendDoorbell));
+   ARMEmitter::ForwardLabel l_NoSuspend;
+-  (void)cbz(ARMEmitter::Size::i32Bit, TMP2, &l_NoSuspend);
++  (void)cbz(ARMEmitter::Size::i64Bit, TMP2, &l_NoSuspend);
+   brk(SuspendMagic);
+   (void)Bind(&l_NoSuspend);
+ #endif
+@@ -909,6 +914,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+   this->DebugData = DebugData;
+   this->IR = IR;
+   RequiresFarARM64Jumps = false;
++  DebugWatchActive = ThreadState->DebugBreakpoints.NumWatch != 0;
+   SSANodeMultiplier = 24;
+ 
+   // Prepare restart via long jump in case branch encoding fails.
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index f9ffb11..0e7e97c 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -669,6 +669,18 @@ private:
+ 
+   void EmitTFCheck();
+ 
++  // Debug registers (X86State::DebugBreakpoints): the #DB trap of the two debug IR ops, and the data breakpoint
++  // checks every memory access emits while the thread has any (DebugWatchActive, set per compile)
++  bool DebugWatchActive {};
++  void EmitDebugTrap(ARMEmitter::Register RIP);
++  void EmitDebugWatchHit(uint8_t Bit);
++  void EmitDebugWatchCheck(ARMEmitter::Register Address, uint64_t Size, bool IsStore);
++  void EmitDebugWatchCheckMem(IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset, IR::MemOffsetType OffsetType,
++                              uint8_t OffsetScale, uint64_t Size, bool IsStore);
++  void EmitDebugWatchCheckImm(ARMEmitter::Register Base, int64_t Offset, uint64_t Size, bool IsStore);
++  void EmitDebugWatchCheckRange(ARMEmitter::Register Start, ARMEmitter::Register Length, uint64_t ElementSize, IR::OrderedNodeWrapper Direction,
++                                bool IsStore);
++
+   void EmitSuspendInterruptCheck();
+ 
+   void EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF);
+diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+index af418f9..fcf73cb 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+@@ -612,6 +612,110 @@ ARMEmitter::ExtendedMemOperand Arm64JITCore::GenerateMemOperand(
+   FEX_UNREACHABLE;
+ }
+ 
++// Data breakpoints (X86State::DebugBreakpoints::Watches): an access that overlaps a watched range sets the
++// breakpoint's DR6 bit and CpuStateFrame::DebugWatchHit. A thread with data breakpoints runs one instruction per
++// block, so the check at the next block start raises the trap right after the instruction, as x86 does. Emitted before
++// the access, with the thread's ranges as constants: the thread's code is recompiled when they change. Uses TMP3 and
++// TMP4 only, before the op's own code, and leaves NZCV alone (it holds the guest's flags between ops): the range tests
++// are sign tests of differences, exact for user-space addresses (below 2^62).
++void Arm64JITCore::EmitDebugWatchHit(uint8_t Bit) {
++  ldr(TMP4, STATE_PTR(CpuStateFrame, State.dr6));
++  orr(ARMEmitter::Size::i64Bit, TMP4, TMP4, 1ULL << Bit);
++  str(TMP4, STATE_PTR(CpuStateFrame, State.dr6));
++  LoadConstant(ARMEmitter::Size::i32Bit, TMP4, 1);
++  strb(TMP4.W(), STATE_PTR(CpuStateFrame, DebugWatchHit));
++}
++
++void Arm64JITCore::EmitDebugWatchCheck(ARMEmitter::Register Address, uint64_t Size, bool IsStore) {
++  const auto& Breakpoints = ThreadState->DebugBreakpoints;
++  for (uint32_t i = 0; i < Breakpoints.NumWatch; ++i) {
++    const auto& Watch = Breakpoints.Watches[i];
++    if (Watch.WriteOnly && !IsStore) {
++      continue;
++    }
++    ARMEmitter::ForwardLabel Miss;
++    // [Address, Address + Size) overlaps [Start, Start + Length) when Start - Size < Address < Start + Length
++    LoadConstant(ARMEmitter::Size::i64Bit, TMP4, Watch.Start + Watch.Length);
++    sub(ARMEmitter::Size::i64Bit, TMP4, Address, TMP4);
++    (void)tbz(TMP4, 63, &Miss); // Address >= Start + Length
++    LoadConstant(ARMEmitter::Size::i64Bit, TMP4, Watch.Start - Size);
++    sub(ARMEmitter::Size::i64Bit, TMP4, TMP4, Address);
++    (void)tbz(TMP4, 63, &Miss); // Address <= Start - Size
++    EmitDebugWatchHit(Watch.Bit);
++    (void)Bind(&Miss);
++  }
++}
++
++void Arm64JITCore::EmitDebugWatchCheckMem(IR::OpSize AccessSize, ARMEmitter::Register Base, IR::OrderedNodeWrapper Offset,
++                                          IR::MemOffsetType OffsetType, uint8_t OffsetScale, uint64_t Size, bool IsStore) {
++  EmitDebugWatchCheck(ApplyMemOperand(AccessSize, Base, TMP3, Offset, OffsetType, OffsetScale), Size, IsStore);
++}
++
++void Arm64JITCore::EmitDebugWatchCheckImm(ARMEmitter::Register Base, int64_t Offset, uint64_t Size, bool IsStore) {
++  if (Offset == 0) {
++    EmitDebugWatchCheck(Base, Size, IsStore);
++    return;
++  }
++  LoadConstant(ARMEmitter::Size::i64Bit, TMP3, static_cast<uint64_t>(Offset));
++  add(ARMEmitter::Size::i64Bit, TMP3, Base, TMP3);
++  EmitDebugWatchCheck(TMP3, Size, IsStore);
++}
++
++// A string instruction's whole range: Length elements of ElementSize from Start, forwards or backwards (Direction is
++// the +1/-1 of the DF flag, inline or in a register). The trap follows the instruction, not the matching element.
++void Arm64JITCore::EmitDebugWatchCheckRange(ARMEmitter::Register Start, ARMEmitter::Register Length, uint64_t ElementSize,
++                                            IR::OrderedNodeWrapper Direction, bool IsStore) {
++  const auto& Breakpoints = ThreadState->DebugBreakpoints;
++  bool Any = false;
++  for (uint32_t i = 0; i < Breakpoints.NumWatch; ++i) {
++    Any |= !(Breakpoints.Watches[i].WriteOnly && !IsStore);
++  }
++  if (!Any) {
++    return;
++  }
++
++  ARMEmitter::ForwardLabel Done, Backward, Compare;
++  (void)cbz(ARMEmitter::Size::i64Bit, Length, &Done);
++  // TMP3 = bytes, then TMP1 = first byte, TMP2 = one past the last
++  lsl(ARMEmitter::Size::i64Bit, TMP3, Length, FEXCore::ilog2(ElementSize));
++  uint64_t DirectionConstant {};
++  const bool DirectionIsInline = IsInlineConstant(Direction, &DirectionConstant);
++  const bool ConstantBackward = DirectionIsInline && static_cast<int64_t>(DirectionConstant) < 0;
++  if (!DirectionIsInline) {
++    (void)tbnz(GetReg(Direction), 1, &Backward);
++  }
++  if (!ConstantBackward) {
++    mov(ARMEmitter::Size::i64Bit, TMP1, Start);
++    add(ARMEmitter::Size::i64Bit, TMP2, Start, TMP3);
++    if (!DirectionIsInline) {
++      (void)b(&Compare);
++    }
++  }
++  if (!DirectionIsInline || ConstantBackward) {
++    (void)Bind(&Backward);
++    add(ARMEmitter::Size::i64Bit, TMP2, Start, ElementSize);
++    sub(ARMEmitter::Size::i64Bit, TMP1, TMP2, TMP3);
++  }
++  (void)Bind(&Compare);
++  for (uint32_t i = 0; i < Breakpoints.NumWatch; ++i) {
++    const auto& Watch = Breakpoints.Watches[i];
++    if (Watch.WriteOnly && !IsStore) {
++      continue;
++    }
++    ARMEmitter::ForwardLabel Miss;
++    // [TMP1, TMP2) overlaps [Start, Start + Length) when TMP1 < Start + Length and Start < TMP2
++    LoadConstant(ARMEmitter::Size::i64Bit, TMP4, Watch.Start + Watch.Length);
++    sub(ARMEmitter::Size::i64Bit, TMP4, TMP1, TMP4);
++    (void)tbz(TMP4, 63, &Miss);
++    LoadConstant(ARMEmitter::Size::i64Bit, TMP4, Watch.Start);
++    sub(ARMEmitter::Size::i64Bit, TMP4, TMP4, TMP2);
++    (void)tbz(TMP4, 63, &Miss);
++    EmitDebugWatchHit(Watch.Bit);
++    (void)Bind(&Miss);
++  }
++  (void)Bind(&Done);
++}
++
+ ARMEmitter::Register Arm64JITCore::ApplyMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, ARMEmitter::Register Tmp,
+                                                    IR::OrderedNodeWrapper Offset, IR::MemOffsetType OffsetType, uint8_t OffsetScale) {
+   if (Offset.IsInvalid()) {
+@@ -703,6 +807,9 @@ ARMEmitter::SVEMemOperand Arm64JITCore::GenerateSVEMemOperand(IR::OpSize AccessS
+ 
+ DEF_OP(LoadMem) {
+   const auto Op = IROp->C<IR::IROp_LoadMem>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheckMem(IROp->Size, GetReg(Op->Addr), Op->Offset, Op->OffsetType, Op->OffsetScale, IR::OpSizeToSize(IROp->Size), false);
++  }
+   const auto OpSize = IROp->Size;
+ 
+   const auto MemReg = GetReg(Op->Addr);
+@@ -740,6 +847,9 @@ DEF_OP(LoadMem) {
+ 
+ DEF_OP(LoadMemPair) {
+   const auto Op = IROp->C<IR::IROp_LoadMemPair>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheckImm(GetReg(Op->Addr), Op->Offset, 2 * IR::OpSizeToSize(IROp->Size), false);
++  }
+   const auto Addr = GetReg(Op->Addr);
+ 
+   if (Op->Class == IR::RegClass::GPR) {
+@@ -766,6 +876,9 @@ DEF_OP(LoadMemPair) {
+ 
+ DEF_OP(LoadMemTSO) {
+   const auto Op = IROp->C<IR::IROp_LoadMemTSO>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheckMem(IROp->Size, GetReg(Op->Addr), Op->Offset, Op->OffsetType, Op->OffsetScale, IR::OpSizeToSize(IROp->Size), false);
++  }
+   const auto OpSize = IROp->Size;
+ 
+   const auto MemReg = GetReg(Op->Addr);
+@@ -855,6 +968,9 @@ DEF_OP(LoadMemTSO) {
+ DEF_OP(VLoadVectorMasked) {
+ 
+   const auto Op = IROp->C<IR::IROp_VLoadVectorMasked>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheckMem(IROp->Size, GetReg(Op->Addr), Op->Offset, Op->OffsetType, Op->OffsetScale, IR::OpSizeToSize(IROp->Size), false);
++  }
+   const auto OpSize = IROp->Size;
+ 
+   const auto Is256Bit = OpSize == IR::OpSize::i256Bit;
+@@ -958,6 +1074,9 @@ DEF_OP(VLoadVectorMasked) {
+ 
+ DEF_OP(VStoreVectorMasked) {
+   const auto Op = IROp->C<IR::IROp_VStoreVectorMasked>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheckMem(IROp->Size, GetReg(Op->Addr), Op->Offset, Op->OffsetType, Op->OffsetScale, IR::OpSizeToSize(IROp->Size), true);
++  }
+   const auto OpSize = IROp->Size;
+ 
+   const auto Is256Bit = OpSize == IR::OpSize::i256Bit;
+@@ -1361,6 +1480,9 @@ DEF_OP(VLoadVectorGatherMaskedQPS) {
+ 
+ DEF_OP(VLoadVectorElement) {
+   const auto Op = IROp->C<IR::IROp_VLoadVectorElement>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->Addr), IR::OpSizeToSize(IROp->ElementSize), false);
++  }
+   const auto OpSize = IROp->Size;
+ 
+   const auto Is256Bit = OpSize == IR::OpSize::i256Bit;
+@@ -1399,6 +1521,9 @@ DEF_OP(VLoadVectorElement) {
+ 
+ DEF_OP(VStoreVectorElement) {
+   const auto Op = IROp->C<IR::IROp_VStoreVectorElement>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->Addr), IR::OpSizeToSize(IROp->ElementSize), true);
++  }
+   const auto OpSize = IROp->Size;
+ 
+   const auto Is256Bit = OpSize == IR::OpSize::i256Bit;
+@@ -1433,6 +1558,9 @@ DEF_OP(VStoreVectorElement) {
+ 
+ DEF_OP(VBroadcastFromMem) {
+   const auto Op = IROp->C<IR::IROp_VBroadcastFromMem>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->Address), IR::OpSizeToSize(IROp->ElementSize), false);
++  }
+   const auto OpSize = IROp->Size;
+ 
+   const auto Is256Bit = OpSize == IR::OpSize::i256Bit;
+@@ -1480,6 +1608,10 @@ DEF_OP(VBroadcastFromMem) {
+ 
+ DEF_OP(Push) {
+   const auto Op = IROp->C<IR::IROp_Push>();
++  if (DebugWatchActive) {
++    sub(ARMEmitter::Size::i64Bit, TMP3, GetReg(Op->Addr), IR::OpSizeToSize(Op->ValueSize));
++    EmitDebugWatchCheck(TMP3, IR::OpSizeToSize(Op->ValueSize), true);
++  }
+   const auto ValueSize = IR::OpSizeToSize(Op->ValueSize);
+   auto Src = GetReg(Op->Value);
+   const auto AddrSrc = GetReg(Op->Addr);
+@@ -1565,6 +1697,10 @@ DEF_OP(Push) {
+ 
+ DEF_OP(PushTwo) {
+   const auto Op = IROp->C<IR::IROp_PushTwo>();
++  if (DebugWatchActive) {
++    sub(ARMEmitter::Size::i64Bit, TMP3, GetReg(Op->Addr), 2 * IR::OpSizeToSize(Op->ValueSize));
++    EmitDebugWatchCheck(TMP3, 2 * IR::OpSizeToSize(Op->ValueSize), true);
++  }
+   const auto ValueSize = IR::OpSizeToSize(Op->ValueSize);
+   auto Src1 = GetReg(Op->Value1);
+   auto Src2 = GetReg(Op->Value2);
+@@ -1588,6 +1724,9 @@ DEF_OP(PushTwo) {
+ 
+ DEF_OP(Pop) {
+   const auto Op = IROp->C<IR::IROp_Pop>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->InoutAddr), IR::OpSizeToSize(Op->Size), false);
++  }
+   const auto Size = IR::OpSizeToSize(Op->Size);
+   const auto Addr = GetReg(Op->InoutAddr);
+   const auto Dst = GetReg(Op->OutValue);
+@@ -1620,6 +1759,9 @@ DEF_OP(Pop) {
+ 
+ DEF_OP(PopTwo) {
+   const auto Op = IROp->C<IR::IROp_PopTwo>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->InoutAddr), 2 * IR::OpSizeToSize(Op->Size), false);
++  }
+   const auto Size = IR::OpSizeToSize(Op->Size);
+   const auto Addr = GetReg(Op->InoutAddr);
+   auto Dst1 = GetReg(Op->OutValue1);
+@@ -1651,6 +1793,9 @@ DEF_OP(PopTwo) {
+ 
+ DEF_OP(StoreMem) {
+   const auto Op = IROp->C<IR::IROp_StoreMem>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheckMem(IROp->Size, GetReg(Op->Addr), Op->Offset, Op->OffsetType, Op->OffsetScale, IR::OpSizeToSize(IROp->Size), true);
++  }
+   const auto OpSize = IROp->Size;
+ 
+   const auto MemReg = GetReg(Op->Addr);
+@@ -1702,6 +1847,9 @@ DEF_OP(StoreMem) {
+ 
+ DEF_OP(StoreMemX87SVEOptPredicate) {
+   const auto Op = IROp->C<IR::IROp_StoreMemX87SVEOptPredicate>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->Addr), 10, true);
++  }
+   const auto Predicate = PRED_X87_SVEOPT;
+ 
+   LOGMAN_THROW_A_FMT(HostSupportsSVE128 || HostSupportsSVE256, "StoreMemX87SVEOptPredicate needs SVE support");
+@@ -1733,6 +1881,9 @@ DEF_OP(StoreMemX87SVEOptPredicate) {
+ 
+ DEF_OP(LoadMemX87SVEOptPredicate) {
+   const auto Op = IROp->C<IR::IROp_LoadMemX87SVEOptPredicate>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->Addr), 10, false);
++  }
+   const auto Dst = GetVReg(Node);
+   const auto Predicate = PRED_X87_SVEOPT;
+   const auto MemReg = GetReg(Op->Addr);
+@@ -1764,6 +1915,9 @@ DEF_OP(LoadMemX87SVEOptPredicate) {
+ 
+ DEF_OP(StoreMemPair) {
+   const auto Op = IROp->C<IR::IROp_StoreMemPair>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheckImm(GetReg(Op->Addr), Op->Offset, 2 * IR::OpSizeToSize(IROp->Size), true);
++  }
+   const auto OpSize = IROp->Size;
+   const auto Addr = GetReg(Op->Addr);
+ 
+@@ -1790,6 +1944,9 @@ DEF_OP(StoreMemPair) {
+ 
+ DEF_OP(StoreMemTSO) {
+   const auto Op = IROp->C<IR::IROp_StoreMemTSO>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheckMem(IROp->Size, GetReg(Op->Addr), Op->Offset, Op->OffsetType, Op->OffsetScale, IR::OpSizeToSize(IROp->Size), true);
++  }
+   const auto OpSize = IROp->Size;
+ 
+   const auto MemReg = GetReg(Op->Addr);
+@@ -1863,6 +2020,14 @@ DEF_OP(StoreMemTSO) {
+ 
+ DEF_OP(MemSet) {
+   const auto Op = IROp->C<IR::IROp_MemSet>();
++  if (DebugWatchActive) {
++    if (Op->Prefix.IsInvalid()) {
++      EmitDebugWatchCheckRange(GetReg(Op->Addr), GetReg(Op->Length), IR::OpSizeToSize(Op->Size), Op->Direction, true);
++    } else {
++      add(ARMEmitter::Size::i64Bit, TMP2, GetReg(Op->Prefix), GetReg(Op->Addr));
++      EmitDebugWatchCheckRange(TMP2, GetReg(Op->Length), IR::OpSizeToSize(Op->Size), Op->Direction, true);
++    }
++  }
+ 
+   const bool IsAtomic = CTX->IsMemcpyAtomicTSOEnabled();
+   const auto Size = IR::OpSizeToSize(Op->Size);
+@@ -2099,6 +2264,10 @@ DEF_OP(MemSet) {
+ 
+ DEF_OP(MemCpy) {
+   const auto Op = IROp->C<IR::IROp_MemCpy>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheckRange(GetReg(Op->Src), GetReg(Op->Length), IR::OpSizeToSize(Op->Size), Op->Direction, false);
++    EmitDebugWatchCheckRange(GetReg(Op->Dest), GetReg(Op->Length), IR::OpSizeToSize(Op->Size), Op->Direction, true);
++  }
+ 
+   const bool IsAtomic = CTX->IsMemcpyAtomicTSOEnabled();
+   const auto Size = IR::OpSizeToSize(Op->Size);
+@@ -2509,6 +2678,10 @@ DEF_OP(CacheLineClean) {
+ 
+ DEF_OP(CacheLineZero) {
+   auto Op = IROp->C<IR::IROp_CacheLineZero>();
++  if (DebugWatchActive) {
++    and_(ARMEmitter::Size::i64Bit, TMP3, GetReg(Op->Addr), ~63ULL);
++    EmitDebugWatchCheck(TMP3, 64, true);
++  }
+ 
+   auto MemReg = GetReg(Op->Addr);
+ 
+@@ -2568,6 +2741,9 @@ DEF_OP(Prefetch) {
+ 
+ DEF_OP(VStoreNonTemporal) {
+   const auto Op = IROp->C<IR::IROp_VStoreNonTemporal>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheckImm(GetReg(Op->Addr), Op->Offset, IR::OpSizeToSize(IROp->Size), true);
++  }
+   const auto OpSize = IROp->Size;
+ 
+   const auto Is256Bit = OpSize == IR::OpSize::i256Bit;
+@@ -2594,6 +2770,9 @@ DEF_OP(VStoreNonTemporal) {
+ 
+ DEF_OP(VStoreNonTemporalPair) {
+   const auto Op = IROp->C<IR::IROp_VStoreNonTemporalPair>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheckImm(GetReg(Op->Addr), Op->Offset, 2 * IR::OpSizeToSize(IROp->Size), true);
++  }
+   const auto OpSize = IROp->Size;
+ 
+   const auto Is128Bit = OpSize == IR::OpSize::i128Bit;
+@@ -2610,6 +2789,9 @@ DEF_OP(VStoreNonTemporalPair) {
+ 
+ DEF_OP(VLoadNonTemporal) {
+   const auto Op = IROp->C<IR::IROp_VLoadNonTemporal>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheckImm(GetReg(Op->Addr), Op->Offset, IR::OpSizeToSize(IROp->Size), false);
++  }
+   const auto OpSize = IROp->Size;
+ 
+   const auto Is256Bit = OpSize == IR::OpSize::i256Bit;
+diff --git a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+index 79598f8..3980620 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+@@ -101,6 +101,53 @@ DEF_OP(Break) {
+   }
+ }
+ 
++// #DB from JIT code: the frontend maps X86_TRAPNO_DB to the single-step exception at State.rip
++void Arm64JITCore::EmitDebugTrap(ARMEmitter::Register RIP) {
++  str(RIP.X(), STATE_PTR(CpuStateFrame, State.rip));
++
++  Core::CpuStateFrame::SynchronousFaultDataStruct State = {
++    .FaultToTopAndGeneratedException = 1,
++    .Signal = Core::FAULT_SIGTRAP,
++    .TrapNo = X86State::X86_TRAPNO_DB,
++    .si_code = 4, // TRAP_HWBKPT
++    .err_code = 0,
++  };
++
++  uint64_t Constant {};
++  memcpy(&Constant, &State, sizeof(State));
++
++  LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Constant);
++  str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, SynchronousFaultData));
++  ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.GuestSignal_SIGTRAP));
++  br(TMP1);
++}
++
++DEF_OP(DebugBreakpoint) {
++  const auto Op = IROp->C<IR::IROp_DebugBreakpoint>();
++  const auto RIP = GetReg(Op->RIP);
++  ARMEmitter::ForwardLabel Trap, Done;
++
++  // The resume flag of the context the thread continued with lets this instruction run once. No flag-setting compare:
++  // NZCV holds the guest's flags.
++  ldr(TMP1, STATE_PTR(CpuStateFrame, State.resume_flag_rip));
++  eor(ARMEmitter::Size::i64Bit, TMP1, TMP1, RIP);
++  (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &Trap);
++  movn(ARMEmitter::Size::i64Bit, TMP1, 0);
++  str(TMP1, STATE_PTR(CpuStateFrame, State.resume_flag_rip));
++  (void)b(&Done);
++
++  (void)Bind(&Trap);
++  ldr(TMP1, STATE_PTR(CpuStateFrame, State.dr6));
++  LoadConstant(ARMEmitter::Size::i64Bit, TMP2, Op->Mask);
++  orr(ARMEmitter::Size::i64Bit, TMP1, TMP1, TMP2);
++  str(TMP1, STATE_PTR(CpuStateFrame, State.dr6));
++  ResetStack();
++  EmitDebugTrap(RIP);
++
++  (void)Bind(&Done);
++}
++
++
+ DEF_OP(GetRoundingMode) {
+   auto Dst = GetReg(Node);
+   mrs(Dst, ARMEmitter::SystemRegister::FPCR);
+@@ -398,6 +445,9 @@ DEF_OP(Yield) {
+ 
+ DEF_OP(MonoBackpatcherWrite) {
+   auto Op = IROp->C<IR::IROp_MonoBackpatcherWrite>();
++  if (DebugWatchActive) {
++    EmitDebugWatchCheck(GetReg(Op->Addr), IR::OpSizeToSize(Op->Size), true);
++  }
+ 
+   mov(ARMEmitter::Size::i64Bit, TMP3, GetReg(Op->Addr));
+   mov(ARMEmitter::Size::i64Bit, TMP4, GetReg(Op->Value));
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 9b03225..0d3b266 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -3222,8 +3222,10 @@ void OpDispatchBuilder::STOSOp(OpcodeArgs) {
+ 
+   const auto Size = OpSizeFromSrc(Op);
+   const bool Repeat = (Op->Flags & (FEXCore::X86Tables::DecodeFlags::FLAG_REP_PREFIX | FEXCore::X86Tables::DecodeFlags::FLAG_REPNE_PREFIX)) != 0;
++  const bool PerElement = Repeat && RepeatPerElement();
++  Ref RepeatDone = PerElement ? RepeatElementBegin() : nullptr;
+ 
+-  if (!Repeat) {
++  if (!Repeat || PerElement) {
+     // Src is used only for a store of the same size so allow garbage
+     Ref Src = LoadGPRRegister(X86State::REG_RAX, Size, 0, true);
+ 
+@@ -3240,6 +3242,9 @@ void OpDispatchBuilder::STOSOp(OpcodeArgs) {
+     // Offset the pointer
+     Ref TailDest = LoadGPRRegister(X86State::REG_RDI);
+     StoreGPRRegister(X86State::REG_RDI, OffsetByDir(TailDest, IR::OpSizeToSize(Size)));
++    if (PerElement) {
++      RepeatElementEnd(Op, RepeatDone);
++    }
+   } else {
+     // FEX doesn't support partial faulting REP instructions.
+     // Converting this to a `MemSet` IR op optimizes this quite significantly in our codegen.
+@@ -3267,8 +3272,11 @@ void OpDispatchBuilder::MOVSOp(OpcodeArgs) {
+ 
+   // RA now can handle these to be here, to avoid DF accesses
+   const auto Size = OpSizeFromSrc(Op);
++  const bool Repeat = (Op->Flags & (FEXCore::X86Tables::DecodeFlags::FLAG_REP_PREFIX | FEXCore::X86Tables::DecodeFlags::FLAG_REPNE_PREFIX)) != 0;
++  const bool PerElement = Repeat && RepeatPerElement();
++  Ref RepeatDone = PerElement ? RepeatElementBegin() : nullptr;
+ 
+-  if (Op->Flags & (FEXCore::X86Tables::DecodeFlags::FLAG_REP_PREFIX | FEXCore::X86Tables::DecodeFlags::FLAG_REPNE_PREFIX)) {
++  if (Repeat && !PerElement) {
+     auto SrcAddr = LoadGPRRegister(X86State::REG_RSI);
+     auto DstAddr = LoadGPRRegister(X86State::REG_RDI);
+     auto Counter = LoadGPRRegister(X86State::REG_RCX);
+@@ -3318,6 +3326,9 @@ void OpDispatchBuilder::MOVSOp(OpcodeArgs) {
+ 
+     StoreGPRRegister(X86State::REG_RSI, RSI);
+     StoreGPRRegister(X86State::REG_RDI, RDI);
++    if (PerElement) {
++      RepeatElementEnd(Op, RepeatDone);
++    }
+   }
+ }
+ 
+@@ -3435,8 +3446,20 @@ void OpDispatchBuilder::CMPSOp(OpcodeArgs) {
+         NZCVDirty = false;
+         InnerJump = CondJumpNZCV(REPE ? CondClass::EQ : CondClass::NEQ);
+ 
+-        // Jump back to the start if we have more work to do
+-        SetTrueJumpTarget(InnerJump, LoopHeader);
++        // Jump back to the start if we have more work to do; with data breakpoints the next element is the next
++        // execution, with the flags of this compare (the loop computes them only after its last one)
++        if (RepeatPerElement()) {
++          auto Again = CreateNewCodeBlockAfter(GetCurrentBlock());
++          SetTrueJumpTarget(InnerJump, Again);
++          SetCurrentCodeBlock(Again);
++          StartNewBlock();
++          auto Src1 = LoadGPR(Core::CPUState::PF_AS_GREG);
++          auto Src2 = LoadGPR(Core::CPUState::AF_AS_GREG);
++          CalculateFlags_SUB(OpSizeFromSrc(Op), Src2, Src1);
++          RepeatElementExit(Op);
++        } else {
++          SetTrueJumpTarget(InnerJump, LoopHeader);
++        }
+       }
+ 
+       // Make sure to start a new block after ending this one
+@@ -3495,7 +3518,7 @@ void OpDispatchBuilder::LODSOp(OpcodeArgs) {
+     // Calculate flags early. because end of block
+     CalculateDeferredFlags();
+ 
+-    ForeachDirection([this, Size, AddrSize](int32_t PtrDir) {
++    ForeachDirection([this, Op, Size, AddrSize](int32_t PtrDir) {
+       // XXX: Theoretically LODS could be optimized to
+       // RSI += {-}(RCX * Size)
+       // RAX = [RSI - Size]
+@@ -3548,8 +3571,12 @@ void OpDispatchBuilder::LODSOp(OpcodeArgs) {
+           StoreGPRRegister(X86State::REG_RSI, TailDest_RSI, AddrSize);
+         }
+ 
+-        // Jump back to the start, we have more work to do
+-        Jump(LoopStart);
++        // Jump back to the start, we have more work to do; with data breakpoints the next element is the next execution
++        if (RepeatPerElement()) {
++          RepeatElementExit(Op);
++        } else {
++          Jump(LoopStart);
++        }
+       }
+       // Make sure to start a new block after ending this one
+       auto LoopEnd = CreateNewCodeBlockAfter(LoopTail);
+@@ -3646,8 +3673,16 @@ void OpDispatchBuilder::SCASOp(OpcodeArgs) {
+         CalculateDeferredFlags();
+         InternalCondJump = CondJumpNZCV(REPE ? CondClass::EQ : CondClass::NEQ);
+ 
+-        // Jump back to the start if we have more work to do
+-        SetTrueJumpTarget(InternalCondJump, LoopStart);
++        // Jump back to the start if we have more work to do; with data breakpoints the next element is the next execution
++        if (RepeatPerElement()) {
++          auto Again = CreateNewCodeBlockAfter(GetCurrentBlock());
++          SetTrueJumpTarget(InternalCondJump, Again);
++          SetCurrentCodeBlock(Again);
++          StartNewBlock();
++          RepeatElementExit(Op);
++        } else {
++          SetTrueJumpTarget(InternalCondJump, LoopStart);
++        }
+       }
+       // Make sure to start a new block after ending this one
+       auto LoopEnd = CreateNewCodeBlockAfter(LoopTail);
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index caf6d48..7f47974 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -12,6 +12,7 @@
+ #include <FEXCore/Config/Config.h>
+ #include <FEXCore/Core/Context.h>
+ #include <FEXCore/Core/X86Enums.h>
++#include <FEXCore/Debug/InternalThreadState.h>
+ #include <FEXCore/IR/IR.h>
+ 
+ #include <FEXCore/Utils/LogManager.h>
+@@ -198,6 +199,46 @@ public:
+     auto Cond = Set ? CondClass::TSTNZ : CondClass::TSTZ;
+     return _CondJump(Src, InlineConst, InvalidNode, InvalidNode, Cond, OpSize::iInvalid, false);
+   }
++  // Debug registers (X86State::DebugBreakpoints): an instruction breakpoint at this instruction, which starts a block
++  void DebugBreakpointCheck(const FEXCore::X86Tables::DecodedOp& Op, uint8_t Mask) {
++    _DebugBreakpoint(GetRelocatedPC(Op, -Op->InstSize), Mask);
++  }
++  // With data breakpoints a REP string instruction runs one element per execution (see RepeatElementBegin)
++  bool RepeatPerElement() const {
++    return Thread->DebugBreakpoints.NumWatch != 0;
++  }
++  // With data breakpoints a REP string instruction runs one element per execution, so that a hit traps after that
++  // element with RIP still at the instruction and RCX the count left, as on x86. Begin skips the body when RCX is 0
++  // and returns the block after the instruction; End decrements RCX and leaves to the same instruction while it is
++  // not 0, then continues in that block. RepeatElementExit is the leave for loops that decrement RCX themselves.
++  Ref RepeatElementBegin() {
++    Ref Counter = LoadGPRRegister(X86State::REG_RCX);
++    auto Jump = CondJump(Counter, CondClass::EQ);
++    auto Body = CreateNewCodeBlockAfter(GetCurrentBlock());
++    auto Done = CreateNewCodeBlockAfter(Body);
++    SetTrueJumpTarget(Jump, Done);
++    SetFalseJumpTarget(Jump, Body);
++    SetCurrentCodeBlock(Body);
++    StartNewBlock();
++    return Done;
++  }
++  void RepeatElementEnd(const FEXCore::X86Tables::DecodedOp& Op, Ref Done) {
++    Ref Counter = Sub(OpSize::i64Bit, LoadGPRRegister(X86State::REG_RCX), 1);
++    StoreGPRRegister(X86State::REG_RCX, Counter);
++    auto Jump = CondJump(Counter);
++    auto Again = CreateNewCodeBlockAfter(GetCurrentBlock());
++    SetTrueJumpTarget(Jump, Again);
++    SetFalseJumpTarget(Jump, Done);
++    SetCurrentCodeBlock(Again);
++    StartNewBlock();
++    RepeatElementExit(Op);
++    SetCurrentCodeBlock(Done);
++    StartNewBlock();
++  }
++  void RepeatElementExit(const FEXCore::X86Tables::DecodedOp& Op) {
++    ExitFunction(_InlineEntrypointOffset(GetGPROpSize(), Op->PC - Entry));
++  }
++
+   IRPair<IROp_ExitFunction> ExitFunction(Ref NewRIP, BranchHint Hint = BranchHint::None) {
+     FlushRegisterCache();
+     return _ExitFunction(GetOpSize(NewRIP), NewRIP, Hint, InvalidNode, InvalidNode);
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+index eee5023..3ea59b7 100644
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+@@ -109,4 +109,10 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartLargerCodeBuffer() {
+ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::StartMaximalCodeBuffer() {
+   return AllocateNew(MAX_CODE_SIZE);
+ }
++
++fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocatePrivateCodeBuffer() {
++  auto Buffer = fextl::make_shared<CodeBuffer>(GetLatest()->TotalAllocationSize(), NameJITBuffers);
++  OnCodeBufferAllocated(Buffer);
++  return Buffer;
++}
+ } // namespace FEXCore::CPU
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
+index be7de21..640b624 100644
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
+@@ -126,6 +126,10 @@ public:
+   // Subsequent calls to GetLatest will point to the returned buffer.
+   fextl::shared_ptr<CodeBuffer> StartMaximalCodeBuffer();
+ 
++  // Allocate a CodeBuffer that stays out of the sharing: GetLatest keeps returning the shared one, so no other
++  // thread compiles into it or runs its blocks. For a thread whose code carries its own debug breakpoints.
++  fextl::shared_ptr<CodeBuffer> AllocatePrivateCodeBuffer();
++
+   virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&) {};
+ 
+ private:
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index 1523415..712fb29 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -330,6 +330,14 @@
+       "Break BreakDefinition:$Reason": {
+         "HasSideEffects": true
+       },
++      "DebugBreakpoint GPR:$RIP, u8:$Mask": {
++        "HasSideEffects": true,
++        "Desc": ["An x86 instruction breakpoint at this instruction (DR0-DR3 enabled in DR7 with R/W = execute):",
++                 "sets the DR6 bits in Mask and raises #DB with RIP at the instruction, a fault before it runs.",
++                 "Only at a block start, where the guest state is all in CPUState. The resume flag of the context the",
++                 "thread continued with lets the instruction run once instead (CPUState::resume_flag_rip)."
++                ]
++      },
+       "CallbackReturn": {
+         "HasSideEffects": true
+       },
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index 63dc7a1..3413c57 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -90,6 +90,15 @@ public:
+   ///< to the iteration the loop reached (x86 resumes it there). HostGPRs are the host X0-X30. Returns true if it did.
+   FEX_DEFAULT_VISIBILITY virtual bool
+   RestoreStringOpProgressFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, const uint64_t* HostGPRs) = 0;
++
++  /**
++   * @brief Sets a thread's x86 debug registers DR0-DR3 and DR7, as a context operation hands them over
++   *
++   * DR6 is only ever produced by the emulator (the bits of a hit being delivered). The thread's breakpoints are
++   * rebuilt from the registers and its compiled code invalidated when they changed. The thread must not be running
++   * JIT code: its own native code, or another thread while it is suspended at a safe point.
++   */
++  FEX_DEFAULT_VISIBILITY virtual void SetDebugRegisters(FEXCore::Core::InternalThreadState* Thread, const uint64_t* DR, uint64_t DR7) = 0;
+   /**
+    * @brief Reconstructs a compacted EFLAGS from FEX's internal EFLAG representation.
+    *
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index 80514bf..5330b48 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -248,6 +248,17 @@ struct alignas(64) CPUState {
+   constexpr static uint32_t SEGMENT_ARRAY_INDEX_GDT = 0;
+   constexpr static uint32_t SEGMENT_ARRAY_INDEX_LDT = 1;
+   Core::CPUState::gdt_segment private_gdt[32] {};
++
++  // The hardware debug registers: DR0-DR3 linear addresses, DR6 status (B0-B3 set by a hit, sticky until
++  // software clears them), DR7 control. The JIT compiles a thread's breakpoints into its code (see
++  // X86State::DebugBreakpoints) and only reads DR6 and the trap mark at run time.
++  uint64_t dr[4] {};
++  uint64_t dr6 {};
++  uint64_t dr7 {};
++  // RF: a context loaded with the resume flag set lets the instruction it resumes at run once without taking its
++  // instruction breakpoint. x86 clears RF after that instruction; FEX keeps the RIP instead of the flag, so EFLAGS
++  // never carries a stale RF and threads without breakpoints pay nothing for it. ~0 when none.
++  uint64_t resume_flag_rip {~0ULL};
+ };
+ static_assert(std::is_trivially_copyable_v<CPUState>, "Needs to be trivial");
+ static_assert(std::is_standard_layout_v<CPUState>, "This needs to be standard layout");
+@@ -432,7 +443,13 @@ struct CpuStateFrame {
+ 
+ #ifdef _WIN32
+   // Set by the kernel on ARM64EC whenever the JIT should cooperatively suspend running guest code.
+-  uint32_t SuspendDoorbell {};
++  alignas(8) uint32_t SuspendDoorbell {};
++  // x86 debug events, next to the doorbell so that the check at every block start covers them with the same load:
++  // new debug registers queued for this thread (the Windows frontend keeps them), and a data breakpoint the previous
++  // instruction hit (raised as #DB at the block start, where the guest state is exact)
++  uint8_t DebugRegistersQueued {};
++  uint8_t DebugWatchHit {};
++  uint16_t DebugEventsPad {};
+ #endif
+ 
+   // Pointers that the JIT needs to load to remove relocations
+diff --git a/FEXCore/include/FEXCore/Core/DebugRegisters.h b/FEXCore/include/FEXCore/Core/DebugRegisters.h
+new file mode 100644
+index 0000000..9eb2c30
+--- /dev/null
++++ b/FEXCore/include/FEXCore/Core/DebugRegisters.h
+@@ -0,0 +1,143 @@
++// SPDX-License-Identifier: MIT
++#pragma once
++#include <cstdint>
++
++namespace FEXCore::X86State {
++// The x86 hardware debug registers (Intel SDM vol. 3 ch. 18). DR0-DR3 hold linear addresses; DR7 enables each one
++// (L and G bits, bits 0-7, the same thing for a user-mode program) and says what it watches: R/W field 0 is an
++// instruction breakpoint, 1 a write, 3 a read or write, 2 port I/O (never, it needs CR4.DE), LEN field 0, 1, 3, 2
++// for 1, 2, 4, 8 bytes aligned to that length. DR6 reports the breakpoints whose condition was met (B0-B3) and a
++// single step (BS); it is sticky, software clears it.
++constexpr uint64_t DR6_BREAKPOINT_MASK = 0xf;
++constexpr uint64_t DR6_BS = 1ULL << 14;
++constexpr uint64_t DR6_READ_AS_ONE = 0xffff0ff0; // bits 4-11 and 16-31 read as 1 (RTM clear), as Windows reports them
++// What Windows keeps of DR7, measured on Windows Server 2022 and 2025: the local enables L0-L3, LE, GE and the R/W and
++// LEN fields for a 64-bit program; a 32-bit one (WoW64) loses GE too. The global enables are dropped (a breakpoint
++// enabled with G0 never fires). The kernel keeps the registers of a thread only while DR7 has one of L0-L3, LE or GE
++// set, and reads DR7 back with bit 10 set then.
++constexpr uint64_t DR7_LEGAL_MASK = 0xffff0355;
++constexpr uint64_t DR7_LEGAL_MASK_WOW64 = 0xffff0155;
++constexpr uint64_t DR7_ACTIVE_MASK = 0x355;
++constexpr uint64_t DR7_LE = 0x100;
++constexpr uint64_t DR7_READ_AS_ONE = 1ULL << 10;
++
++// The debug registers as a Windows context reports them: all 0 unless DR7 keeps them (DR7_ACTIVE_MASK); otherwise
++// DR7 with bit 10 set and DR6 with the bits x86 reads as 1, plus the bits of a hit being reported (measured on Windows
++// Server 2022 and 2025: 0xffff0515 for 0xffff0115 written, 0x500 for LE alone, 0xffff0ff1 for a B0 hit, 0xffff0ff0
++// from GetThreadContext inside the handler).
++struct ContextDebugRegisters {
++  uint64_t DR[4];
++  uint64_t DR6;
++  uint64_t DR7;
++};
++
++inline ContextDebugRegisters DebugRegistersForContext(const uint64_t* DR, uint64_t DR6, uint64_t DR7) {
++  if (!(DR7 & DR7_ACTIVE_MASK)) {
++    return {};
++  }
++  return {{DR[0], DR[1], DR[2], DR[3]}, DR6_READ_AS_ONE | DR6, DR7 | DR7_READ_AS_ONE};
++}
++
++// WoW64 keeps a 32-bit thread's registers through that same kernel: an address set with nothing enabled gets LE so
++// that the kernel keeps it, and DR7 reads back through the 32-bit mask, without bit 10 (measured: Dr1 alone reads
++// back with DR7 0x100, Dr0 with DR7 1 reads DR7 1, all ones read 0xffff0155).
++inline uint64_t WowDebugRegisterDR7(const uint64_t* DR, uint64_t DR7) {
++  DR7 &= DR7_LEGAL_MASK_WOW64;
++  if (!(DR7 & DR7_ACTIVE_MASK) && (DR[0] | DR[1] | DR[2] | DR[3])) {
++    DR7 |= DR7_LE;
++  }
++  return DR7;
++}
++
++inline ContextDebugRegisters DebugRegistersForWowContext(const uint64_t* DR, uint64_t DR6, uint64_t DR7) {
++  auto Regs = DebugRegistersForContext(DR, DR6, DR7);
++  Regs.DR7 &= DR7_LEGAL_MASK_WOW64;
++  return Regs;
++}
++
++// A thread's enabled breakpoints in the form the JIT compiles them into its code: instruction breakpoints by
++// address (several registers on one address share an entry and set all their DR6 bits), data breakpoints as
++// byte ranges. Rebuilt from DR0-DR3 and DR7 whenever they change; a change invalidates the thread's compiled code.
++struct DebugBreakpoints {
++  struct Exec {
++    uint64_t Address;
++    uint8_t Mask; // DR6 bits to set when it hits
++    bool operator==(const Exec&) const = default;
++  };
++  struct Watch {
++    uint64_t Start;
++    uint8_t Length;
++    bool WriteOnly; // R/W = 1: only writes; R/W = 3: any access
++    uint8_t Bit;    // DR6 bit
++    bool operator==(const Watch&) const = default;
++  };
++  Exec Execs[4] {};
++  Watch Watches[4] {};
++  uint8_t NumExec {};
++  uint8_t NumWatch {};
++
++  bool Active() const {
++    return NumExec || NumWatch;
++  }
++
++  // The DR6 bits of the instruction breakpoints at this address, 0 for none
++  uint8_t ExecMaskAt(uint64_t Address) const {
++    for (uint32_t i = 0; i < NumExec; ++i) {
++      if (Execs[i].Address == Address) {
++        return Execs[i].Mask;
++      }
++    }
++    return 0;
++  }
++
++  bool operator==(const DebugBreakpoints& Other) const {
++    if (NumExec != Other.NumExec || NumWatch != Other.NumWatch) {
++      return false;
++    }
++    for (uint32_t i = 0; i < NumExec; ++i) {
++      if (!(Execs[i] == Other.Execs[i])) {
++        return false;
++      }
++    }
++    for (uint32_t i = 0; i < NumWatch; ++i) {
++      if (!(Watches[i] == Other.Watches[i])) {
++        return false;
++      }
++    }
++    return true;
++  }
++
++  static DebugBreakpoints FromRegisters(const uint64_t* DR, uint64_t DR7) {
++    DebugBreakpoints Result {};
++    for (uint32_t i = 0; i < 4; ++i) {
++      if (!((DR7 >> (2 * i)) & 1)) {
++        continue; // only the local enable bit, as Windows
++      }
++      const uint32_t RW = (DR7 >> (16 + 4 * i)) & 3;
++      const uint32_t LEN = (DR7 >> (18 + 4 * i)) & 3;
++      if (RW == 0) {
++        // An instruction breakpoint. The SDM leaves LEN other than 0 undefined; on an AMD EPYC under Windows such a
++        // breakpoint never fires, so it counts as disabled here.
++        if (LEN != 0) {
++          continue;
++        }
++        bool Merged = false;
++        for (uint32_t j = 0; j < Result.NumExec; ++j) {
++          if (Result.Execs[j].Address == DR[i]) {
++            Result.Execs[j].Mask |= 1 << i;
++            Merged = true;
++          }
++        }
++        if (!Merged) {
++          Result.Execs[Result.NumExec++] = {DR[i], static_cast<uint8_t>(1 << i)};
++        }
++      } else if (RW == 1 || RW == 3) {
++        const uint8_t Length = LEN == 0 ? 1 : LEN == 1 ? 2 : LEN == 3 ? 4 : 8;
++        // The processor ignores the address bits below the length: the range is aligned to it
++        Result.Watches[Result.NumWatch++] = {DR[i] & ~static_cast<uint64_t>(Length - 1), Length, RW == 1, static_cast<uint8_t>(i)};
++      }
++    }
++    return Result;
++  }
++};
++} // namespace FEXCore::X86State
+diff --git a/FEXCore/include/FEXCore/Debug/InternalThreadState.h b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+index 42feabb..20e049a 100644
+--- a/FEXCore/include/FEXCore/Debug/InternalThreadState.h
++++ b/FEXCore/include/FEXCore/Debug/InternalThreadState.h
+@@ -2,6 +2,7 @@
+ #pragma once
+ 
+ #include <FEXCore/Core/CoreState.h>
++#include <FEXCore/Core/DebugRegisters.h>
+ #include <FEXCore/Utils/AllocatorHooks.h>
+ #include <FEXCore/Utils/TypeDefines.h>
+ #include <FEXCore/Utils/LongJump.h>
+@@ -106,6 +107,9 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
+ 
+   UnalignedExclusiveStore ExclusiveStore;
+ 
++  // The breakpoints compiled into this thread's code, from its DR0-DR3 and DR7 (ContextImpl::SetDebugRegisters)
++  FEXCore::X86State::DebugBreakpoints DebugBreakpoints {};
++
+   ///< Data pointer for exclusive use by the frontend
+   void* FrontendPtr;
+ 
+diff --git a/Source/Windows/ARM64EC/BTInterface.h b/Source/Windows/ARM64EC/BTInterface.h
+index 828096c..3080f12 100644
+--- a/Source/Windows/ARM64EC/BTInterface.h
++++ b/Source/Windows/ARM64EC/BTInterface.h
+@@ -24,6 +24,8 @@ BOOLEAN STDMETHODCALLTYPE BTCpu64IsProcessorFeaturePresent(UINT Feature);
+ void STDMETHODCALLTYPE UpdateProcessorInformation(SYSTEM_CPU_INFORMATION* Info);
+ // Extensions used by Wine's ntdll, not in the Windows interface
+ void STDMETHODCALLTYPE GetX87State(XMM_SAVE_AREA32* FltSave);
++BOOL GetX64DebugRegisters(HANDLE Thread, CONTEXT* Context);
++BOOL SetX64DebugRegisters(HANDLE Thread, const CONTEXT* Context);
+ BOOL STDMETHODCALLTYPE GetX64Mxcsr(UINT32* Mxcsr);
+ BOOL STDMETHODCALLTYPE SetX64Mxcsr(UINT32 Mxcsr);
+ }
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 0842404..5a25ab8 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -11,6 +11,9 @@ $end_info$
+ #include <FEXCore/Core/SignalDelegator.h>
+ #include <FEXCore/Core/Context.h>
+ #include <FEXCore/Core/CoreState.h>
++#include <FEXCore/Core/DebugRegisters.h>
++
++#include <atomic>
+ #include <FEXCore/Core/DiskCacheFileMapper.h>
+ #include <FEXCore/Debug/InternalThreadState.h>
+ #include <FEXCore/HLE/SyscallHandler.h>
+@@ -139,6 +142,10 @@ struct ThreadCPUArea {
+ 
+ struct FrontendThreadData {
+   bool InLockedRWXRead {};
++  // x86 debug registers another thread set for this one (SetX64DebugRegisters), applied by this thread before it
++  // runs guest code again (CpuStateFrame::DebugRegistersQueued). Guarded by ThreadCreationMutex.
++  uint64_t PendingDR[4] {};
++  uint64_t PendingDR7 {};
+ };
+ 
+ namespace {
+@@ -169,6 +176,22 @@ FrontendThreadData* GetFrontendThreadData(FEXCore::Core::InternalThreadState* Th
+   return static_cast<FrontendThreadData*>(Thread->FrontendPtr);
+ }
+ 
++class ScopedCallbackDisable {
++private:
++  bool Prev;
++
++public:
++  ScopedCallbackDisable() {
++    const auto CPUArea = GetCPUArea();
++    Prev = CPUArea.Area->InSyscallCallback;
++    CPUArea.Area->InSyscallCallback = true;
++  }
++
++  ~ScopedCallbackDisable() {
++    GetCPUArea().Area->InSyscallCallback = Prev;
++  }
++};
++
+ bool IsEmulatorStackAddress(const ThreadCPUArea CPUArea, uint64_t Address) {
+   return Address <= CPUArea.EmulatorStackBase() && Address >= CPUArea.EmulatorStackLimit();
+ }
+@@ -401,10 +424,64 @@ static bool HasTag(const CONTEXT& Context) {
+ 
+ } // namespace X64StateExtension
+ 
++// The x86 debug registers travel in the ARM64 context's breakpoint registers, which nothing else uses on this side:
++// Bvr[0-3] DR0-DR3, Bvr[4] DR6, Bvr[5] DR7, Bcr[7] a tag. ntdll's conversion (dlls/ntdll/unwind.h) maps them to the
++// x64 context's Dr fields under CONTEXT_DEBUG_REGISTERS and back. They read as Windows reports them
++// (DebugRegistersForContext): DR6 with the bits of a hit being delivered, all 0 while DR7 enables nothing.
++namespace X64DebugRegisters {
++constexpr uint32_t Tag = 0x52443436; // "64DR"
++
++static void Pack(ARM64_NT_CONTEXT& Context, const FEXCore::Core::CPUState& State) {
++  const auto Regs = FEXCore::X86State::DebugRegistersForContext(State.dr, State.dr6, State.dr7);
++  Context.ContextFlags |= CONTEXT_ARM64_DEBUG_REGISTERS;
++  for (uint32_t i = 0; i < 4; ++i) {
++    Context.Bvr[i] = Regs.DR[i];
++  }
++  Context.Bvr[4] = Regs.DR6;
++  Context.Bvr[5] = Regs.DR7;
++  Context.Bcr[7] = Tag;
++}
++} // namespace X64DebugRegisters
++
++// Gives the current thread new debug registers. Recompiling for them allocates code memory, which must not come back
++// into the emulator through ntdll's memory notifications while it holds its code cache locks. Outside a context load
++// a resume flag only still counts for the instruction the thread is about to run (x86 clears RF after it).
++static void ApplyDebugRegisters(FEXCore::Core::InternalThreadState* Thread, const uint64_t* DR, uint64_t DR7, bool ContextLoad) {
++  ScopedCallbackDisable Guard;
++  auto& State = Thread->CurrentFrame->State;
++  if (!ContextLoad && State.resume_flag_rip != State.rip) {
++    State.resume_flag_rip = ~0ULL;
++  }
++  CTX->SetDebugRegisters(Thread, DR, DR7);
++}
++
++// Debug registers another thread queued for this one, applied by this thread (at a block start or simulation entry)
++static void ConsumePendingDebugRegisters(FEXCore::Core::InternalThreadState* Thread, bool ContextLoad) {
++  auto& Pending = Thread->CurrentFrame->DebugRegistersQueued;
++  if (!std::atomic_ref(Pending).load(std::memory_order_acquire)) {
++    return;
++  }
++  uint64_t DR[4];
++  uint64_t DR7;
++  {
++    std::scoped_lock Lock(ThreadCreationMutex);
++    const auto* Data = GetFrontendThreadData(Thread);
++    memcpy(DR, Data->PendingDR, sizeof(DR));
++    DR7 = Data->PendingDR7;
++    std::atomic_ref(Pending).store(uint8_t {0}, std::memory_order_relaxed);
++  }
++  ApplyDebugRegisters(Thread, DR, DR7, ContextLoad);
++}
++
+ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, CONTEXT& Context) {
+   auto& State = Thread->CurrentFrame->State;
+   const bool Extended = X64StateExtension::HasTag(Context);
+ 
++  if ((Context.ContextFlags & CONTEXT_DEBUG_REGISTERS) == CONTEXT_DEBUG_REGISTERS) {
++    // DR6 is not taken from a context, as on Windows
++    ApplyDebugRegisters(Thread, &Context.Dr0, Context.Dr7, true);
++  }
++
+   if ((Context.ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER) {
+     // General register state
+     State.gregs[FEXCore::X86State::REG_RAX] = Context.Rax;
+@@ -429,6 +506,9 @@ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, C
+     State.gregs[FEXCore::X86State::REG_RSP] = Context.Rsp;
+     State.gregs[FEXCore::X86State::REG_RBP] = Context.Rbp;
+     CTX->SetFlagsFromCompactedEFLAGS(Thread, Context.EFlags);
++    // RF lets the instruction the thread resumes at run once without taking its instruction breakpoint
++    State.resume_flag_rip = State.flags[FEXCore::X86State::RFLAG_RF_LOC] ? State.rip : ~0ULL;
++    State.flags[FEXCore::X86State::RFLAG_RF_LOC] = 0;
+   }
+ 
+   if ((Context.ContextFlags & CONTEXT_SEGMENTS) == CONTEXT_SEGMENTS) {
+@@ -596,6 +676,8 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
+   ECContext.Fpcr = GuestFPCR;
+   ECContext.Fpsr = FPSR;
+ 
++  X64DebugRegisters::Pack(ECContext, State);
++
+   return ECContext;
+ }
+ 
+@@ -610,6 +692,11 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
+   ARM64_NT_CONTEXT GuestContext = StoreStateToPackedECContext(Thread, Context.Fpcr, Context.Fpsr);
+   LogMan::Msg::DFmt("pc: {:X} rip: {:X}", Context.Pc, GuestContext.Pc);
+ 
++  // A debug trap reported its DR6 bits in that context and the thread's DR6 reads 0 from here on, as on Windows. A
++  // data breakpoint matched by an instruction that then faulted is not reported: the instruction restarts.
++  Thread->CurrentFrame->State.dr6 = 0;
++  Thread->CurrentFrame->DebugWatchHit = 0;
++
+   // x64 Windows runs exception handlers with TF and DF clear (a handler's string instructions go forwards) and
+   // restores the interrupted flags from the context, which carries all of them (X64StateExtension).
+   uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+@@ -618,8 +705,13 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
+ 
+   BOOL FirstChance = TRUE;
+   const bool HostFault = !Fault.FaultToTopAndGeneratedException;
++  const bool IntoTrap = !HostFault && Fault.TrapNo == FEXCore::X86State::X86_TRAPNO_OF;
+   EXCEPTION_RECORD GuestRec = FEX::Windows::HandleGuestException(Fault, Rec, GuestContext.Pc, GuestContext.X8, GuestContext.X0, FirstChance,
+                                                                   FEX::Windows::X87PendingExceptions(Thread->CurrentFrame->State));
++  if (FEX::Windows::ReportsResumeFlag(GuestRec.ExceptionCode, IntoTrap)) {
++    // The EFLAGS image of a fault has RF set (X14 holds EFLAGS in its upper half, X64StateExtension)
++    GuestContext.X14 |= static_cast<uint64_t>(1U << FEXCore::X86State::RFLAG_RF_LOC) << 32;
++  }
+   if (const uint32_t Flags = HostFault ? FEX::Windows::MXCSRFlagsForFloatException(GuestRec.ExceptionCode) : 0) {
+     // An unmasked SSE exception trapped on the host (the FPCR trap enables follow the guest's MXCSR masks in JIT
+     // code). Windows x64 reports #XM with the MXCSR, status flag included, in ExceptionInformation[1]; the flag
+@@ -708,6 +800,7 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
+     Context->EFlags = (Context->EFlags & ECValidEFlagsMask) | (StateEFlags & ~ECValidEFlagsMask);
+   }
+   Exception::LoadStateFromECContext(Thread, *Context);
++  Exception::ConsumePendingDebugRegisters(Thread, true);
+ }
+ 
+ NTSTATUS ProcessInit() {
+@@ -790,22 +883,6 @@ NTSTATUS ProcessInit() {
+ 
+ void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {}
+ 
+-class ScopedCallbackDisable {
+-private:
+-  bool Prev;
+-
+-public:
+-  ScopedCallbackDisable() {
+-    const auto CPUArea = GetCPUArea();
+-    Prev = CPUArea.Area->InSyscallCallback;
+-    CPUArea.Area->InSyscallCallback = true;
+-  }
+-
+-  ~ScopedCallbackDisable() {
+-    GetCPUArea().Area->InSyscallCallback = Prev;
+-  }
+-};
+-
+ // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
+ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
+   auto Thread = CPUArea.ThreadState();
+@@ -881,11 +958,28 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+   static constexpr uint32_t SuspendTrapMagic {0xD4395FC0}; // brk #0xCAFE
+   if (Exception->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && *reinterpret_cast<uint32_t*>(NativeContext->Pc) == SuspendTrapMagic) {
+     Exception::ReconstructThreadState(Thread, *NativeContext);
+-    *NativeContext = Exception::StoreStateToPackedECContext(Thread, NativeContext->Fpcr, NativeContext->Fpsr);
+-    LogMan::Msg::DFmt("Suspending: RIP: {:X} SP: {:X}", NativeContext->Pc, NativeContext->Sp);
+-    CPUArea.Area->InSimulation = 0;
+-    *CPUArea.Area->SuspendDoorbell = 0;
+-    return true;
++    // The same check at every block start stops for debug registers another thread queued for this one, and for a
++    // data breakpoint the previous instruction hit: #DB now, a trap with RIP at this instruction, which is raised as a
++    // guest exception below (a suspend request waits for the next block start)
++    Exception::ConsumePendingDebugRegisters(Thread, false);
++    if (Thread->CurrentFrame->DebugWatchHit) {
++      Thread->CurrentFrame->DebugWatchHit = 0;
++      Exception->ExceptionCode = EXCEPTION_SINGLE_STEP;
++      Exception->ExceptionFlags = 0;
++      Exception->NumberParameters = 0;
++    } else if (!*CPUArea.Area->SuspendDoorbell) {
++      // Nothing to suspend for: continue at this RIP, compiled again with the new breakpoints
++      NativeContext->Pc = CPUArea.DispatcherLoopTopEnterECFillSRA();
++      NativeContext->Sp = CPUArea.EmulatorStackBase();
++      NativeContext->X11 = 0;                                        // ENTRY_FILL_SRA_SINGLE_INST_REG: no single step
++      NativeContext->X17 = reinterpret_cast<uint64_t>(CPUArea.Area); // EC_ENTRY_CPUAREA_REG
++      return true;
++    } else {      *NativeContext = Exception::StoreStateToPackedECContext(Thread, NativeContext->Fpcr, NativeContext->Fpsr);
++      LogMan::Msg::DFmt("Suspending: RIP: {:X} SP: {:X}", NativeContext->Pc, NativeContext->Sp);
++      CPUArea.Area->InSimulation = 0;
++      *CPUArea.Area->SuspendDoorbell = 0;
++      return true;
++    }
+   }
+ 
+   // Guest divide errors (EmitDivideTraps): the JIT stopped at a brk before the DIV/IDIV wrote anything, so the
+@@ -1263,6 +1357,78 @@ BOOL SetX64Mxcsr(UINT32 Mxcsr) {
+ // exception or longjmps. Fills the x87 part of an FXSAVE image (control, status and abridged tag word, the registers
+ // in ST(i) order); MXCSR and the XMM registers are left to the caller. The JIT is not running on this thread here, so
+ // the thread state holds the current values.
++// The x86 debug registers of a thread, for ntdll's x64 context operations (NtGetContextThread, NtSetContextThread,
++// NtContinue). They are the emulator's: the JIT compiles a thread's breakpoints into its code. FALSE for a thread the
++// emulator does not know yet (created suspended and not started), whose context only the server holds.
++static std::optional<DWORD> ThreadIdFromHandle(HANDLE Thread) {
++  if (Thread == GetCurrentThread()) {
++    return GetCurrentThreadId();
++  }
++  THREAD_BASIC_INFORMATION Info;
++  if (NtQueryInformationThread(Thread, ThreadBasicInformation, &Info, sizeof(Info), nullptr)) {
++    return std::nullopt;
++  }
++  return static_cast<DWORD>(reinterpret_cast<uintptr_t>(Info.ClientId.UniqueThread));
++}
++
++BOOL GetX64DebugRegisters(HANDLE Thread, CONTEXT* Context) {
++  const auto TID = ThreadIdFromHandle(Thread);
++  if (!TID) {
++    return FALSE;
++  }
++  std::scoped_lock Lock(ThreadCreationMutex);
++  const auto It = Threads.find(*TID);
++  if (It == Threads.end()) {
++    return FALSE;
++  }
++  auto* Target = It->second;
++  const auto& State = Target->CurrentFrame->State;
++  const uint64_t* DR = State.dr;
++  uint64_t DR7 = State.dr7;
++  if (std::atomic_ref(Target->CurrentFrame->DebugRegistersQueued).load(std::memory_order_acquire)) {
++    const auto* Data = GetFrontendThreadData(Target);
++    DR = Data->PendingDR;
++    DR7 = Data->PendingDR7;
++  }
++  const auto Regs = FEXCore::X86State::DebugRegistersForContext(DR, 0, DR7);
++  Context->Dr0 = Regs.DR[0];
++  Context->Dr1 = Regs.DR[1];
++  Context->Dr2 = Regs.DR[2];
++  Context->Dr3 = Regs.DR[3];
++  Context->Dr6 = Regs.DR6;
++  Context->Dr7 = Regs.DR7;
++  return TRUE;
++}
++
++// The current thread takes them at once. Another thread takes them itself before it runs guest code again: at its
++// next block start if it is in the JIT, else when it returns to guest code; DR6 is not taken from a context.
++BOOL SetX64DebugRegisters(HANDLE Thread, const CONTEXT* Context) {
++  const uint64_t DR[4] = {Context->Dr0, Context->Dr1, Context->Dr2, Context->Dr3};
++  const auto TID = ThreadIdFromHandle(Thread);
++  if (!TID) {
++    return FALSE;
++  }
++  if (*TID == GetCurrentThreadId()) {
++    auto* Self = GetCPUArea().ThreadState();
++    if (!Self) {
++      return FALSE;
++    }
++    Exception::ApplyDebugRegisters(Self, DR, Context->Dr7, false);
++    return TRUE;
++  }
++  std::scoped_lock Lock(ThreadCreationMutex);
++  const auto It = Threads.find(*TID);
++  if (It == Threads.end()) {
++    return FALSE;
++  }
++  auto* Target = It->second;
++  auto* Data = GetFrontendThreadData(Target);
++  memcpy(Data->PendingDR, DR, sizeof(DR));
++  Data->PendingDR7 = Context->Dr7 & FEXCore::X86State::DR7_LEGAL_MASK;
++  std::atomic_ref(Target->CurrentFrame->DebugRegistersQueued).store(uint8_t {1}, std::memory_order_release);
++  return TRUE;
++}
++
+ void GetX87State(XMM_SAVE_AREA32* FltSave) {
+   auto* Thread = GetCPUArea().ThreadState();
+   if (!Thread) {
+diff --git a/Source/Windows/ARM64EC/libarm64ecfex.def b/Source/Windows/ARM64EC/libarm64ecfex.def
+index 97086b5..f72af4d 100644
+--- a/Source/Windows/ARM64EC/libarm64ecfex.def
++++ b/Source/Windows/ARM64EC/libarm64ecfex.def
+@@ -22,5 +22,7 @@ EXPORTS
+   ThreadTerm
+   UpdateProcessorInformation
+   GetX87State
++  GetX64DebugRegisters
++  SetX64DebugRegisters
+   GetX64Mxcsr
+   SetX64Mxcsr
+diff --git a/Source/Windows/Common/Exception.h b/Source/Windows/Common/Exception.h
+index c913d8b..9f38456 100644
+--- a/Source/Windows/Common/Exception.h
++++ b/Source/Windows/Common/Exception.h
+@@ -70,6 +70,21 @@ static inline uint32_t X87PendingExceptions(const FEXCore::Core::CPUState& State
+   return Pending;
+ }
+ 
++// x86 saves EFLAGS with RF set for a fault, so that continuing at the faulting instruction does not take its instruction
++// breakpoint again, and Windows hands that image to the handler. Traps (int3 and the other software interrupts, a single
++// step, a data breakpoint, INTO) and an instruction breakpoint leave RF clear. Measured on Windows Server 2022 and
++// 2025: RF in the contexts of ud2, divide errors, access violations, DEP, hlt and in, not for int3 or a trap-flag step.
++static inline bool ReportsResumeFlag(DWORD Code, bool IntoTrap) {
++  switch (static_cast<NTSTATUS>(Code)) {
++  case EXCEPTION_BREAKPOINT:
++  case EXCEPTION_SINGLE_STEP:
++  case STATUS_STACK_BUFFER_OVERRUN:
++  case STATUS_ASSERTION_FAILURE: return false;
++  case EXCEPTION_INT_OVERFLOW: return !IntoTrap;
++  default: return true;
++  }
++}
++
+ template<typename TReg>
+ static inline EXCEPTION_RECORD HandleGuestException(FEXCore::Core::CpuStateFrame::SynchronousFaultDataStruct& Fault,
+                                                     const EXCEPTION_RECORD& Src, TReg& Rip, TReg Rax, TReg Cx, BOOL& FirstChance,
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index e1934fd..ee7bd71 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -13,6 +13,7 @@ $end_info$
+ #include <FEXCore/Core/SignalDelegator.h>
+ #include <FEXCore/Core/Context.h>
+ #include <FEXCore/Core/CoreState.h>
++#include <FEXCore/Core/DebugRegisters.h>
+ #include <FEXCore/Core/DiskCacheFileMapper.h>
+ #include <FEXCore/Debug/InternalThreadState.h>
+ #include <FEXCore/HLE/SyscallHandler.h>
+@@ -117,6 +118,10 @@ WOW64_CONTEXT* GetWow64Context() {
+ struct FrontendThreadData {
+   bool InLockedRWXRead {};
+   CHPE_V2_CPU_AREA_INFO CpuArea {};
++  // x86 debug registers the 32-bit context brought, taken by the thread at its next block start
++  // (CpuStateFrame::DebugRegistersQueued, HandleSuspendInterrupt)
++  uint64_t PendingDR[4] {};
++  uint64_t PendingDR7 {};
+ 
+   FrontendThreadData(const TLS& TLS) {
+     CpuArea.SuspendDoorbell = reinterpret_cast<ULONG*>(&TLS.ThreadState()->CurrentFrame->SuspendDoorbell);
+@@ -196,6 +201,48 @@ void HandleImageUnmap(uint64_t Address, uint64_t Size) {
+ } // namespace
+ 
+ namespace Context {
++// The debug registers a thread will run with: queued ones if any, else its own
++static void EffectiveDebugRegisters(FEXCore::Core::InternalThreadState* Thread, const uint64_t*& DR, uint64_t& DR7) {
++  const auto& State = Thread->CurrentFrame->State;
++  if (Thread->CurrentFrame->DebugRegistersQueued) {
++    const auto* Data = GetFrontendThreadData(Thread);
++    DR = Data->PendingDR;
++    DR7 = Data->PendingDR7;
++  } else {
++    DR = State.dr;
++    DR7 = State.dr7;
++  }
++}
++
++static void QueueDebugRegisters(FEXCore::Core::InternalThreadState* Thread, const WOW64_CONTEXT* Context) {
++  const uint64_t DR[4] = {Context->Dr0, Context->Dr1, Context->Dr2, Context->Dr3};
++  const uint64_t DR7 = FEXCore::X86State::WowDebugRegisterDR7(DR, Context->Dr7);
++  const uint64_t* CurrentDR;
++  uint64_t CurrentDR7;
++  EffectiveDebugRegisters(Thread, CurrentDR, CurrentDR7);
++  if (DR7 == CurrentDR7 && !memcmp(DR, CurrentDR, sizeof(DR))) {
++    return;
++  }
++  auto* Data = GetFrontendThreadData(Thread);
++  memcpy(Data->PendingDR, DR, sizeof(DR));
++  Data->PendingDR7 = DR7;
++  Thread->CurrentFrame->DebugRegistersQueued = 1;
++}
++
++// At a block start (the trap of the doorbell check): recompiling for new breakpoints is safe here
++static void ConsumePendingDebugRegisters(FEXCore::Core::InternalThreadState* Thread) {
++  if (!Thread->CurrentFrame->DebugRegistersQueued) {
++    return;
++  }
++  const auto* Data = GetFrontendThreadData(Thread);
++  auto& State = Thread->CurrentFrame->State;
++  if (State.resume_flag_rip != State.rip) {
++    State.resume_flag_rip = ~0ULL;
++  }
++  Thread->CurrentFrame->DebugRegistersQueued = 0;
++  CTX->SetDebugRegisters(Thread, Data->PendingDR, Data->PendingDR7);
++}
++
+ void LoadStateFromWowContext(FEXCore::Core::InternalThreadState* Thread) {
+   auto& State = Thread->CurrentFrame->State;
+   WOW64_CONTEXT* Context = GetWow64Context();
+@@ -213,6 +260,14 @@ void LoadStateFromWowContext(FEXCore::Core::InternalThreadState* Thread) {
+ 
+   State.rip = Context->Eip;
+   CTX->SetFlagsFromCompactedEFLAGS(Thread, Context->EFlags);
++  // RF lets the instruction the thread resumes at run once without taking its instruction breakpoint
++  State.resume_flag_rip = State.flags[FEXCore::X86State::RFLAG_RF_LOC] ? State.rip : ~0ULL;
++  State.flags[FEXCore::X86State::RFLAG_RF_LOC] = 0;
++
++  // The debug registers DR0-DR3 and DR7 as the 32-bit context holds them (DR6 is only ever the emulator's). This runs
++  // after a system call, with the block that made it to return to, where recompiling for them is not safe: the thread
++  // takes them at its next block start instead.
++  QueueDebugRegisters(Thread, Context);
+ 
+   State.es_idx = Context->SegEs & 0xffff;
+   State.cs_idx = Context->SegCs & 0xffff;
+@@ -271,6 +326,19 @@ void StoreWowContextFromState(WOW64_CONTEXT* Context, uint64_t FPSR) {
+   Context->Eip = State.rip;
+   Context->EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+ 
++  // As WoW64 reports them (DebugRegistersForWowContext): DR6 with the bits of a hit being delivered, all 0 while DR7
++  // keeps nothing. Queued ones are the thread's already.
++  const uint64_t* DR;
++  uint64_t DR7;
++  EffectiveDebugRegisters(Thread, DR, DR7);
++  const auto Regs = FEXCore::X86State::DebugRegistersForWowContext(DR, State.dr6, DR7);
++  Context->Dr0 = Regs.DR[0];
++  Context->Dr1 = Regs.DR[1];
++  Context->Dr2 = Regs.DR[2];
++  Context->Dr3 = Regs.DR[3];
++  Context->Dr6 = static_cast<uint32_t>(Regs.DR6);
++  Context->Dr7 = static_cast<uint32_t>(Regs.DR7);
++
+   Context->SegEs = State.es_idx;
+   Context->SegCs = State.cs_idx;
+   Context->SegSs = State.ss_idx;
+@@ -374,7 +442,7 @@ void UnlockJITContext() {
+   }
+ }
+ 
+-bool HandleSuspendInterrupt(CONTEXT* Context) {
++bool HandleSuspendInterrupt(CONTEXT* Context, EXCEPTION_RECORD* Exception) {
+   static constexpr uint32_t SuspendTrapMagic {0xD4395FC0}; // brk #0xCAFE
+   if (*reinterpret_cast<uint32_t*>(Context->Pc) != SuspendTrapMagic) {
+     return false;
+@@ -382,6 +450,18 @@ bool HandleSuspendInterrupt(CONTEXT* Context) {
+ 
+   // Since interrupts only happen at the start of blocks, the reconstructed state should be entirely accurate
+   ReconstructThreadState(Context);
++  // The same check stops for debug registers the 32-bit context brought (QueueDebugRegisters), and for a data
++  // breakpoint the previous instruction hit: #DB, a trap with EIP at this instruction, raised as a guest exception
++  // by the caller
++  auto* Thread = GetTLS().ThreadState();
++  ConsumePendingDebugRegisters(Thread);
++  if (Thread->CurrentFrame->DebugWatchHit) {
++    Thread->CurrentFrame->DebugWatchHit = 0;
++    Exception->ExceptionCode = EXCEPTION_SINGLE_STEP;
++    Exception->ExceptionFlags = 0;
++    Exception->NumberParameters = 0;
++    return false;
++  }
+   StoreWowContextFromState(GetWow64Context(), Context->Fpsr);
+ 
+   // Yield to the suspender
+@@ -784,7 +864,7 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+     return false;
+   }
+ 
+-  if (Exception->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && Context::HandleSuspendInterrupt(Context)) {
++  if (Exception->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && Context::HandleSuspendInterrupt(Context, Exception)) {
+     LogMan::Msg::DFmt("Resumed from suspend");
+     return true;
+   }
+@@ -802,13 +882,21 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+ 
+   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
+   const bool HostFault = !Fault.FaultToTopAndGeneratedException;
++  const bool IntoTrap = !HostFault && Fault.TrapNo == FEXCore::X86State::X86_TRAPNO_OF;
+   BOOL FirstChance = TRUE;
+   EXCEPTION_RECORD GuestException =
+     FEX::Windows::HandleGuestException(Fault, *Exception, WowContext->Eip, WowContext->Eax, WowContext->Ecx, FirstChance,
+                                        FEX::Windows::X87PendingExceptions(Thread->CurrentFrame->State));
++  if (FEX::Windows::ReportsResumeFlag(GuestException.ExceptionCode, IntoTrap)) {
++    WowContext->EFlags |= 1U << FEXCore::X86State::RFLAG_RF_LOC; // the EFLAGS image of a fault has RF set
++  }
+   if (GuestException.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+     WowContext->EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
+   }
++  // A debug trap reported its DR6 bits in that context and the thread's DR6 reads 0 from here on, as on Windows. A
++  // data breakpoint matched by an instruction that then faulted is not reported: the instruction restarts.
++  Thread->CurrentFrame->State.dr6 = 0;
++  Thread->CurrentFrame->DebugWatchHit = 0;
+   if (const uint32_t Flags = HostFault ? FEX::Windows::MXCSRFlagsForFloatException(GuestException.ExceptionCode) : 0) {
+     // An unmasked SSE exception trapped on the host (the trap enables follow the guest's MXCSR masks in JIT code). x86
+     // sets the flag in MXCSR, and 32-bit Windows reports every SIMD floating-point exception as
