@@ -5,9 +5,10 @@
  * FNSAVE re-initialisation and FRSTOR/FLDENV round trips; precision and rounding control; masked exception
  * flags (IE, DE, ZE, OE, UE, PE) and stack fault (SF, C1); FPREM/FPREM1 quotient bits; FCOM/FUCOM/FCOMI;
  * FIST out of range; FRNDINT per RC; MMX aliasing (TOP 0, tags valid, exponent 0xFFFF, EMMS);
- * MXCSR control/status (round trip, sticky flags, DAZ, FTZ, RC).
+ * MXCSR control/status (round trip, sticky flags, DAZ, FTZ, RC); the CRT's _controlfp against MXCSR.
  * Build: x86_64-w64-mingw32-clang -O2 x87test.c -o x87test.exe */
 #include "fid.h"
+#include <float.h>
 
 typedef struct f80 { uint8_t b[10]; } f80;
 typedef struct env28 { uint16_t fcw, r0, fsw, r1, ftw, r2; uint32_t fip; uint16_t fcs, fop; uint32_t fdp; uint16_t fds, r3; } env28;
@@ -494,6 +495,84 @@ static void group_mxcsr(void)
     setcsr(0x1f80);
 }
 
+/* ---------------------------------------------------------------- CRT control word functions */
+
+/* _controlfp changes the thread's MXCSR the same way LDMXCSR does, and reads back what LDMXCSR set: on ARM64EC the
+ * CRT is native code, so this is where the emulator's MXCSR meets the native one. */
+static volatile LONG g_crt_hits;
+static volatile DWORD g_crt_code;
+
+static LONG CALLBACK crt_veh(EXCEPTION_POINTERS *ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != STATUS_FLOAT_DIVIDE_BY_ZERO && code != STATUS_FLOAT_MULTIPLE_TRAPS) return EXCEPTION_CONTINUE_SEARCH;
+    g_crt_hits++;
+    g_crt_code = code;
+    /* mask ZE and run the division again */
+    ep->ContextRecord->MxCsr |= 0x200;
+    ep->ContextRecord->FltSave.MxCsr |= 0x200;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static void group_crt(void)
+{
+    static volatile float one = 1.0f, three = 3.0f, zero = 0.0f;
+    unsigned int cw = _controlfp(0, 0), got;
+    uint32_t csr;
+    uint16_t fcw;
+    float r;
+    void *veh;
+
+    fid_info("crt.start", "_controlfp %#x mxcsr %#x", cw, getcsr());
+
+    /* rounding mode set by the CRT: MXCSR.RC and the SSE arithmetic follow */
+    _controlfp(_RC_DOWN, _MCW_RC);
+    csr = getcsr();
+    __asm__ volatile("fnstcw %0" : "=m"(fcw));
+    r = one;
+    __asm__ volatile("divss %1, %0" : "+x"(r) : "m"(three));
+    _controlfp(_RC_NEAR, _MCW_RC);
+    fid_check((csr & 0x6000) == 0x2000, "crt.rc.mxcsr", "MXCSR %#x after _controlfp(_RC_DOWN) (want RC 01)", csr);
+    fid_check(*(uint32_t *)&r == 0x3eaaaaaa, "crt.rc.arith", "1/3 = %08x (round down 3eaaaaaa)", *(uint32_t *)&r);
+    fid_info("crt.rc.fcw", "x87 control word %#x after _controlfp(_RC_DOWN)", fcw);
+    fid_check((getcsr() & 0x6000) == 0, "crt.rc.restore", "MXCSR %#x after _controlfp(_RC_NEAR)", getcsr());
+
+    /* the CRT reads back a rounding mode set with LDMXCSR */
+    setcsr(0x3f80);
+    got = _controlfp(0, 0);
+    setcsr(0x1f80);
+    fid_check((got & _MCW_RC) == _RC_DOWN, "crt.rc.readback", "_controlfp %#x after ldmxcsr 0x3f80 (want _RC_DOWN)", got);
+
+    /* an exception unmasked by the CRT traps */
+    veh = AddVectoredExceptionHandler(1, crt_veh);
+    g_crt_hits = 0;
+    _controlfp(cw & ~_EM_ZERODIVIDE, _MCW_EM);
+    csr = getcsr();
+    r = one;
+    __asm__ volatile("divss %1, %0" : "+x"(r) : "m"(zero));
+    _controlfp(cw, _MCW_EM);
+    RemoveVectoredExceptionHandler(veh);
+    setcsr(getcsr() & ~0x3f);
+    fid_check(!(csr & 0x200), "crt.em.mxcsr", "MXCSR %#x after unmasking ZE with _controlfp", csr);
+    fid_check(g_crt_hits == 1, "crt.em.trap", "1/0 with ZE unmasked by _controlfp: %ld exceptions (code %#lx)", g_crt_hits,
+              g_crt_code);
+    fid_check((getcsr() & 0x1f80) == 0x1f80, "crt.em.restore", "MXCSR %#x after masking again", getcsr());
+
+    /* the CRT reads back masks set with LDMXCSR */
+    setcsr(0x1d80);
+    got = _controlfp(0, 0);
+    setcsr(0x1f80);
+    fid_check(!(got & _EM_ZERODIVIDE), "crt.em.readback", "_controlfp %#x after ldmxcsr 0x1d80 (want ZE unmasked)", got);
+
+    /* denormal control: _DN_FLUSH sets FTZ and DAZ */
+    _controlfp(_DN_FLUSH, _MCW_DN);
+    csr = getcsr();
+    _controlfp(_DN_SAVE, _MCW_DN);
+    fid_check((csr & 0x8040) == 0x8040, "crt.dn.mxcsr", "MXCSR %#x after _controlfp(_DN_FLUSH) (want FTZ|DAZ)", csr);
+    fid_check(!(getcsr() & 0x8040), "crt.dn.restore", "MXCSR %#x after _controlfp(_DN_SAVE)", getcsr());
+    setcsr(0x1f80);
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -508,5 +587,6 @@ int main(int argc, char **argv)
     group_mmx();
     group_pointers();
     group_mxcsr();
+    group_crt();
     return fid_summary();
 }

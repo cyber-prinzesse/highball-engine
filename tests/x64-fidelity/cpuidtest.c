@@ -242,6 +242,7 @@ static void group_xsave(int avx, uint64_t xcr0, unsigned max_basic, unsigned max
     /* standard-form XSAVE then XRSTOR */
     make_fp(&in, 1, avx, rfbm);
     memset(area, 0, sizeof(area));
+    out.avx = in.avx;
     fp_roundtrip(&in, area, &out, 0);
     check_legacy("xsave.area", area, &in, 1);
     bv = *(uint64_t *)(area + 512);
@@ -258,13 +259,16 @@ static void group_xsave(int avx, uint64_t xcr0, unsigned max_basic, unsigned max
     if (avx)
     {
         *(uint64_t *)(area + 512) = rfbm & ~4ull;
-        fp_roundtrip(&in, area, &out, 4);
+        out.avx = in.avx;
+        out.avx = in.avx;
+    fp_roundtrip(&in, area, &out, 4);
         check_ymmh("xrstor.init.avx", out.ymm[0] + 16, 32, &in, 1);
         ok = 1;
         for (i = 0; i < 16; i++) if (memcmp(out.ymm[i], in.ymm[i], 16)) ok = 0;
         fid_check(ok, "xrstor.init.avx.xmm", "xmm changed when only the AVX component was initialised");
     }
     *(uint64_t *)(area + 512) = rfbm & ~1ull;
+    out.avx = in.avx;
     fp_roundtrip(&in, area, &out, 4);
     {
         uint16_t fcw = *(uint16_t *)out.fx, fsw = *(uint16_t *)(out.fx + 2);
@@ -275,6 +279,7 @@ static void group_xsave(int avx, uint64_t xcr0, unsigned max_basic, unsigned max
                   fcw, fsw, out.fx[4]);
     }
     *(uint64_t *)(area + 512) = rfbm & ~2ull;
+    out.avx = in.avx;
     fp_roundtrip(&in, area, &out, 4);
     {
         uint8_t zero[16] = { 0 };
@@ -290,6 +295,7 @@ static void group_xsave(int avx, uint64_t xcr0, unsigned max_basic, unsigned max
     make_fp(&in, 2, avx, 2);
     memset(area, 0xcc, sizeof(area));
     memset(area + 512, 0, 64);      /* XSAVE writes only XSTATE_BV; XRSTOR #GPs on a bad XCOMP_BV/reserved header */
+    out.avx = in.avx;
     fp_roundtrip(&in, area, &out, 0);
     {
         int x87_untouched = area[0] == 0xcc && area[1] == 0xcc && area[2] == 0xcc && area[32] == 0xcc;
@@ -304,6 +310,7 @@ static void group_xsave(int avx, uint64_t xcr0, unsigned max_basic, unsigned max
     /* FXSAVE / FXRSTOR: x87 + SSE, upper YMM untouched by FXRSTOR */
     make_fp(&in, 3, avx, rfbm);
     memset(area, 0, sizeof(area));
+    out.avx = in.avx;
     fp_roundtrip(&in, area, &out, 1);
     check_legacy("fxsave.area", area, &in, 1);
     check_legacy("fxsave.restored", out.fx, &in, 1);
@@ -318,7 +325,8 @@ static void group_xsave(int avx, uint64_t xcr0, unsigned max_basic, unsigned max
     {
         make_fp(&in, 4, avx, rfbm);
         memset(area, 0, sizeof(area));
-        fp_roundtrip(&in, area, &out, 2);
+        out.avx = in.avx;
+    fp_roundtrip(&in, area, &out, 2);
         check_legacy("xsaveopt.area", area, &in, 1);
         if (avx) check_ymmh("xsaveopt.area.ymmh", area + 576, 16, &in, 0);
         check_legacy("xsaveopt.restored", out.fx, &in, 1);
@@ -328,7 +336,8 @@ static void group_xsave(int avx, uint64_t xcr0, unsigned max_basic, unsigned max
         uint64_t xcomp;
         make_fp(&in, 5, avx, rfbm);
         memset(area, 0, sizeof(area));
-        fp_roundtrip(&in, area, &out, 3);
+        out.avx = in.avx;
+    fp_roundtrip(&in, area, &out, 3);
         xcomp = *(uint64_t *)(area + 520);
         bv = *(uint64_t *)(area + 512);
         fid_check(xcomp == ((1ull << 63) | (rfbm & xcr0)), "xsavec.xcomp_bv", "XCOMP_BV %#llx want %#llx",

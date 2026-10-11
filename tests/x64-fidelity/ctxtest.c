@@ -5,6 +5,8 @@
  *            continues at the next instruction without touching anything else
  *   modify   the handler rewrites GPRs, flags, MXCSR, x87 control word, XMM and YMM state and continues
  *   repmovs  std; rep movsb faulting into an uncommitted page, resumed after committing it
+ *   strresume rep movs/stos in both directions, overlapping or not, faulting part way through and resumed: the
+ *            iterations already done in the handler's context and the memory after the resumed instruction
  *   nested   an int3 inside the handler of a read fault
  *   repeat   1000 faults of three kinds with changing patterns
  *   seh      frame-based handler + RtlUnwindEx restoring nonvolatile GPRs and XMM6-15
@@ -635,7 +637,12 @@ static void group_repmovs(void)
     fid_check(g_seen.valid, "repmovs.raised", "no fault on the uncommitted page");
     if (g_seen.valid)
     {
-        check_record("repmovs", &g_seen.rec, EXCEPTION_ACCESS_VIOLATION, stub_repmovs, 2, 1, (ULONG_PTR)dst + 0xfff);
+        /* x86 reports dst + 0xfff, the first byte written in the page; an emulator copying 32-byte blocks reports
+         * an address of the faulting block in the same page (strresume) */
+        const ULONG_PTR want_addr = (ULONG_PTR)dst + 0xfff, got_addr = g_seen.rec.ExceptionInformation[1];
+        check_record("repmovs", &g_seen.rec, EXCEPTION_ACCESS_VIOLATION, stub_repmovs, 2, 1,
+                     (got_addr & ~0xfffull) == (want_addr & ~0xfffull) ? got_addr : want_addr);
+        fid_info("repmovs.rec.address", "%+lld (x86 %+lld)", (long long)(got_addr - (ULONG_PTR)dst), (long long)0xfff);
         fid_info("repmovs.ctx", "rcx %#llx rsi %+lld rdi %+lld EFlags %#lx", (unsigned long long)g_seen.ctx.Rcx,
                  (long long)(g_seen.ctx.Rsi - (uintptr_t)src), (long long)(g_seen.ctx.Rdi - (uintptr_t)dst), g_seen.ctx.EFlags);
         fid_check(g_seen.ctx.EFlags & DF, "repmovs.ctx.df", "EFlags %#lx: DF missing in the handler's context", g_seen.ctx.EFlags);
@@ -650,6 +657,142 @@ static void group_repmovs(void)
     check_after("repmovs", &g_after, &want, g_before.gpr[4], ALL_BUT_RSP, 1, 5, 0xe0, st_of(&g_before, st));
     VirtualFree(dst, 0, MEM_RELEASE);
     VirtualFree(src, 0, MEM_RELEASE);
+}
+
+/* rep movs/stos running into an uncommitted page part way through; the handler commits it and continues. x86
+ * faults at the iteration that touches the page, with rcx/rsi/rdi counting the iterations already done, and the
+ * continued instruction finishes them, so the memory ends up as a byte by byte execution leaves it, also when source
+ * and destination overlap (memmove). An emulator that copies 32-byte blocks may report the start of the faulting
+ * block, which the continued instruction redoes (harmless: the block path only runs when |dst - src| >= 32); restarting
+ * from the first iteration is not harmless, an overlapping copy then reads source bytes it already overwrote.
+ * The fault address must be in the page x86 reports (the exact byte is INFO). */
+extern void string_op(uint64_t *regs, int op);
+extern char str_movsb[], str_movsq[], str_stosb[], str_stosq[], str_done[];
+
+typedef struct strcase
+{
+    const char *id;
+    int op, df;                   /* op: 0 rep movsb, 1 rep movsq, 2 rep stosb, 3 rep stosq */
+    uint32_t src, dst;            /* offsets of the first element in a 3-page region: page 1 is uncommitted */
+    uint32_t count;
+} strcase;
+
+static const strcase str_cases[] =
+{
+    { "strresume.movsb.fwd.overlap1",  0, 0, 0x0800, 0x07ff, 0x1000 },   /* dst = src - 1 */
+    { "strresume.movsb.fwd.overlap64", 0, 0, 0x080b, 0x07cb, 0x1000 },   /* dst = src - 64, not block aligned */
+    { "strresume.movsb.fwd.apart",     0, 0, 0x080b, 0x2003, 0x0f00 },   /* no overlap, faults on the read */
+    { "strresume.movsb.fwd.write",     0, 0, 0x2003, 0x080b, 0x0f00 },   /* no overlap, faults on the write */
+    { "strresume.movsb.bwd.overlap1",  0, 1, 0x27ff, 0x2800, 0x1000 },   /* std, dst = src + 1 */
+    { "strresume.movsb.bwd.overlap64", 0, 1, 0x27f4, 0x2834, 0x1000 },   /* std, dst = src + 64 */
+    { "strresume.movsq.fwd.overlap40", 1, 0, 0x0804, 0x07dc, 0x0200 },   /* qwords, dst = src - 40 */
+    { "strresume.movsq.bwd.overlap40", 1, 1, 0x27f4, 0x281c, 0x0200 },   /* std, qwords, dst = src + 40 */
+    { "strresume.stosb.fwd",           2, 0, 0,      0x080b, 0x1000 },
+    { "strresume.stosq.bwd",           3, 1, 0,      0x27f0, 0x0200 },
+};
+
+static int in_hole(uint64_t off) { return off >= 0x1000 && off < 0x2000; }
+
+static void strresume_case(const strcase *c)
+{
+    static const unsigned sizes[4] = { 1, 8, 1, 8 };
+    char *const stubs[4] = { str_movsb, str_movsq, str_stosb, str_stosq };
+    const unsigned size = sizes[c->op];
+    const int movs = c->op < 2, step = c->df ? -(int)size : (int)size;
+    const uint64_t fill = 0x5a5a5a5a5a5a5a5aull;
+    uint8_t *base = VirtualAlloc(NULL, 0x3000, MEM_RESERVE, PAGE_NOACCESS);
+    uint8_t *model = calloc(1, 0x3000);
+    uint64_t regs[5], i, exact = c->count, exact_off = 0, done;
+    ULONG_PTR exact_rw = 0;
+    char name[128];
+    size_t bad = 0, k;
+
+    VirtualAlloc(base, 0x1000, MEM_COMMIT, PAGE_READWRITE);
+    VirtualAlloc(base + 0x2000, 0x1000, MEM_COMMIT, PAGE_READWRITE);
+    for (k = 0; k < 0x3000; k++)
+        if (!in_hole(k)) base[k] = model[k] = (uint8_t)(k * 13 + 7);
+
+    /* the model: one element at a time, read then write, with the page committed (zeros) when it is first touched;
+     * the first iteration touching it is where x86 faults, the lowest byte of that access in the page is the address */
+    for (i = 0; i < c->count; i++)
+    {
+        uint64_t s = c->src + (int64_t)i * step, d = c->dst + (int64_t)i * step;
+        unsigned b;
+        if (exact == c->count)
+        {
+            for (b = 0; movs && b < size && exact == c->count; b++)
+                if (in_hole(s + b)) { exact = i; exact_off = s + b; exact_rw = 0; }
+            for (b = 0; b < size && exact == c->count; b++)
+                if (in_hole(d + b)) { exact = i; exact_off = d + b; exact_rw = 1; }
+        }
+        if (movs) memmove(model + d, model + s, size);
+        else memcpy(model + d, &fill, size);
+    }
+
+    g_commit_lo = base + 0x1000;
+    g_commit_hi = base + 0x2000;
+    g_mode = MODE_COMMIT;
+    g_resume_rip = str_done;      /* a fault anywhere else ends the instruction there */
+    g_calls = 0;
+    g_seen.valid = 0;
+    init_clobber();
+    regs[0] = c->count;
+    regs[1] = (uintptr_t)base + c->src;
+    regs[2] = (uintptr_t)base + c->dst;
+    regs[3] = fill;
+    regs[4] = c->df;
+    g_armed = 1;
+    string_op(regs, c->op);
+    g_armed = 0;
+
+    for (k = 0; k < 0x3000; k++) bad += base[k] != model[k];
+    sprintf(name, "%s.data", c->id);
+    fid_check(!bad, name, "%zu bytes differ from a byte by byte execution", bad);
+    sprintf(name, "%s.final", c->id);
+    fid_check(regs[0] == 0 && regs[2] == (uintptr_t)base + c->dst + (int64_t)c->count * step &&
+              regs[1] == (movs ? (uintptr_t)base + c->src + (int64_t)c->count * step : (uintptr_t)base + c->src),
+              name, "rcx %#llx rsi %+lld rdi %+lld", (unsigned long long)regs[0],
+              (long long)(regs[1] - (uintptr_t)base), (long long)(regs[2] - (uintptr_t)base));
+    sprintf(name, "%s.raised", c->id);
+    fid_check(g_seen.valid, name, "no fault on the uncommitted page");
+    if (g_seen.valid)
+    {
+        const CONTEXT *x = &g_seen.ctx;
+        const EXCEPTION_RECORD *r = &g_seen.rec;
+        int64_t dsi = (int64_t)(x->Rsi - ((uintptr_t)base + c->src)), ddi = (int64_t)(x->Rdi - ((uintptr_t)base + c->dst));
+        done = c->count - x->Rcx;
+        sprintf(name, "%s.rip", c->id);
+        CHECK_EQ64(name, x->Rip, (uintptr_t)stubs[c->op]);
+        sprintf(name, "%s.regs", c->id);
+        fid_check(x->Rcx <= c->count && ddi == (int64_t)done * step && (movs ? dsi == ddi : dsi == 0), name,
+                  "rcx %#llx rsi %+lld rdi %+lld do not describe the same iteration", (unsigned long long)x->Rcx,
+                  (long long)dsi, (long long)ddi);
+        sprintf(name, "%s.progress", c->id);
+        fid_check(done <= exact && (exact - done) * size < 32, name, "the context resumes at iteration %llu, x86 faults at %llu",
+                  (unsigned long long)done, (unsigned long long)exact);
+        sprintf(name, "%s.rec", c->id);
+        fid_check(r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters == 2 &&
+                  r->ExceptionInformation[0] == exact_rw &&
+                  (r->ExceptionInformation[1] & ~0xfffull) == (((uintptr_t)base + exact_off) & ~0xfffull),
+                  name, "code %#lx n %lu [0] %#llx [1] %+lld, want access violation, %llu, page of %+lld", r->ExceptionCode,
+                  r->NumberParameters, (unsigned long long)r->ExceptionInformation[0],
+                  (long long)(r->ExceptionInformation[1] - (uintptr_t)base), (unsigned long long)exact_rw, (long long)exact_off);
+        sprintf(name, "%s.ctx.df", c->id);
+        fid_check(!!(x->EFlags & DF) == c->df, name, "EFlags %#lx", x->EFlags);
+        sprintf(name, "%s.fault", c->id);
+        fid_info(name, "iteration %llu (x86 %llu) address %+lld (x86 %+lld) rcx %#llx", (unsigned long long)done,
+                 (unsigned long long)exact, (long long)(r->ExceptionInformation[1] - (uintptr_t)base), (long long)exact_off,
+                 (unsigned long long)x->Rcx);
+        check_entry(c->id, &g_seen);
+    }
+    VirtualFree(base, 0, MEM_RELEASE);
+    free(model);
+}
+
+static void group_strresume(void)
+{
+    size_t i;
+    for (i = 0; i < sizeof(str_cases) / sizeof(str_cases[0]); i++) strresume_case(&str_cases[i]);
 }
 
 static void group_nested(void)
@@ -715,6 +858,9 @@ static DECLSPEC_ALIGN(16) CONTEXT g_seh_ctx, g_seh_unwind_ctx;
 static void *g_seh_frame;
 static ULONG64 g_seh_controlpc;
 
+uint8_t g_seh_raise;
+void *g_pRaiseException;
+
 EXCEPTION_DISPOSITION seh_outer_handler(EXCEPTION_RECORD *rec, void *frame, CONTEXT *ctx, DISPATCHER_CONTEXT *disp)
 {
     if (rec->ExceptionFlags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND)) return ExceptionContinueSearch;
@@ -727,33 +873,67 @@ EXCEPTION_DISPOSITION seh_outer_handler(EXCEPTION_RECORD *rec, void *frame, CONT
     return ExceptionContinueSearch;
 }
 
-static void group_seh(void)
+/* raise 0: seh_inner faults (ud2); raise 1: it calls RaiseException, as a C++ throw does */
+static void seh_case(const char *id, int raise)
 {
     uint64_t nonvol_want[16];
     unsigned i;
-    char why[300];
-    make_pattern(&g_outer, 60, 0x046, 0x1f80, 0x027f);
+    char name[128];
+    /* the x87 control word mingw-w64 programs run with (64-bit precision), flush-to-zero and DAZ in MXCSR */
+    make_pattern(&g_outer, 60, 0x046, 0x9fc0, 0x037f);
     make_pattern(&g_inner, 61, 0x046, 0x1f80, 0x027f);
     g_seh_called = 0;
+    g_seh_raise = raise;
     memset(&g_after, 0, sizeof(g_after));
     seh_outer();
-    fid_check(g_seh_called == 1, "seh.handler", "language handler called %d times", g_seh_called);
+    sprintf(name, "%s.handler", id);
+    fid_check(g_seh_called == 1, name, "language handler called %d times", g_seh_called);
     if (!g_seh_called) return;
-    CHECK_EQ64("seh.rec.code", g_seh_rec.ExceptionCode, EXCEPTION_ILLEGAL_INSTRUCTION);
-    CHECK_EQ64("seh.ctx.rip", g_seh_ctx.Rip, (uintptr_t)seh_inner_fault);
-    CHECK_EQ64("seh.frame", (uintptr_t)g_seh_frame, g_saved_rsp);
-    fid_info("seh.controlpc", "%+lld relative to seh_outer_catch", (long long)(g_seh_controlpc - (uintptr_t)seh_outer_catch));
-    /* the handler's context holds the inner values (live at the fault) */
-    fid_check(cmp_gprs(&g_seh_ctx.Rax, g_inner.gpr, NONVOL_GPRS), "seh.ctx.gpr", "%s", g_why);
+    sprintf(name, "%s.rec.code", id);
+    CHECK_EQ64(name, g_seh_rec.ExceptionCode, raise ? 0xe0000001 : EXCEPTION_ILLEGAL_INSTRUCTION);
+    if (!raise)
+    {
+        sprintf(name, "%s.ctx.rip", id);
+        CHECK_EQ64(name, g_seh_ctx.Rip, (uintptr_t)seh_inner_fault);
+    }
+    sprintf(name, "%s.frame", id);
+    CHECK_EQ64(name, (uintptr_t)g_seh_frame, g_saved_rsp);
+    sprintf(name, "%s.controlpc", id);
+    fid_info(name, "%+lld relative to seh_outer_catch", (long long)(g_seh_controlpc - (uintptr_t)seh_outer_catch));
+    /* the handler's context holds the inner values (live at the fault or the call) */
+    sprintf(name, "%s.ctx.gpr", id);
+    fid_check(cmp_gprs(&g_seh_ctx.Rax, g_inner.gpr, NONVOL_GPRS), name, "%s", g_why);
+    sprintf(name, "%s.ctx.xmm", id);
     fid_check(cmp_vec((const uint8_t *)&g_seh_ctx.FltSave.XmmRegisters[6], g_inner.ymm[6], 10, 16, 32, 16, "xmm6+"),
-              "seh.ctx.xmm", "%s", g_why);
+              name, "%s", g_why);
+    sprintf(name, "%s.ctx.fcw", id);
+    fid_check(g_seh_ctx.FltSave.ControlWord == g_outer.fcw, name, "ControlWord %#x want %#x", g_seh_ctx.FltSave.ControlWord,
+              g_outer.fcw);
+    sprintf(name, "%s.ctx.mxcsr", id);
+    fid_check((g_seh_ctx.MxCsr & 0xffc0) == (g_outer.mxcsr & 0xffc0), name, "MxCsr %#lx want %#x", g_seh_ctx.MxCsr,
+              g_outer.mxcsr);
     /* after RtlUnwindEx to seh_outer_catch: outer values, restored from seh_inner's prologue saves */
     for (i = 0; i < 16; i++) nonvol_want[i] = g_outer.gpr[i];
-    fid_check(cmp_gprs(g_after.gpr, nonvol_want, NONVOL_GPRS), "seh.after.gpr", "%s", g_why);
-    strcpy(why, "");
-    fid_check(cmp_vec(g_after.ymm[6], g_outer.ymm[6], 10, 32, 32, 16, "xmm6+"), "seh.after.xmm", "%s", g_why);
-    CHECK_EQ64("seh.after.rsp", g_after.gpr[4], g_saved_rsp);
-    CHECK_EQ64("seh.after.rax", g_after.gpr[0], 0);
+    sprintf(name, "%s.after.gpr", id);
+    fid_check(cmp_gprs(g_after.gpr, nonvol_want, NONVOL_GPRS), name, "%s", g_why);
+    sprintf(name, "%s.after.xmm", id);
+    fid_check(cmp_vec(g_after.ymm[6], g_outer.ymm[6], 10, 32, 32, 16, "xmm6+"), name, "%s", g_why);
+    sprintf(name, "%s.after.rsp", id);
+    CHECK_EQ64(name, g_after.gpr[4], g_saved_rsp);
+    sprintf(name, "%s.after.rax", id);
+    CHECK_EQ64(name, g_after.gpr[0], 0);
+    /* the x87 control word and the MXCSR control bits are nonvolatile: the unwind must not change them */
+    sprintf(name, "%s.after.fcw", id);
+    fid_check(g_after.fcw == g_outer.fcw, name, "fcw %#x want %#x", g_after.fcw, g_outer.fcw);
+    sprintf(name, "%s.after.mxcsr", id);
+    fid_check((g_after.mxcsr & 0xffc0) == (g_outer.mxcsr & 0xffc0), name, "mxcsr %#x want %#x", g_after.mxcsr,
+              g_outer.mxcsr);
+}
+
+static void group_seh(void)
+{
+    seh_case("seh", 0);
+    seh_case("sehraise", 1);
 }
 
 /* ---------------------------------------------------------------- RtlCaptureContext / RtlRestoreContext */
@@ -994,6 +1174,7 @@ int main(int argc, char **argv)
     pRtlUnwindEx = (void *)GetProcAddress(ntdll, "RtlUnwindEx");
     g_pRtlCaptureContext = (void *)GetProcAddress(ntdll, "RtlCaptureContext");
     g_pRtlRestoreContext = (void *)GetProcAddress(ntdll, "RtlRestoreContext");
+    g_pRaiseException = (void *)GetProcAddress(k32, "RaiseException");
 
     __cpuid(regs, 1);
     if ((regs[2] & (1 << 28)) && (regs[2] & (1 << 27)))
@@ -1012,6 +1193,7 @@ int main(int argc, char **argv)
     if (want_group(groups, "exc")) group_exc();
     if (want_group(groups, "modify")) group_modify();
     if (want_group(groups, "repmovs")) group_repmovs();
+    if (want_group(groups, "strresume")) group_strresume();
     if (want_group(groups, "nested")) group_nested();
     if (want_group(groups, "repeat")) group_repeat(count);
     if (want_group(groups, "seh")) group_seh();

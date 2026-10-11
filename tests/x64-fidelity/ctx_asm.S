@@ -367,7 +367,8 @@ read_rflags:
  * seh_outer(): sets every nonvolatile register to g_outer (gpr/ymm layout of struct regstate),
  * calls seh_inner(), which saves them in its prologue (unwind codes), loads g_inner and faults.
  * seh_outer's language handler (C) unwinds to seh_outer_catch, which stores what it finds in g_after.
- * Windows restores the outer values from seh_inner's prologue saves. */
+ * Windows restores the outer values from seh_inner's prologue saves. seh_outer also sets the x87 control word and
+ * MXCSR from g_outer, which nothing in between changes. */
     .globl  seh_outer
     .def    seh_outer; .scl 2; .type 32; .endef
     .seh_proc seh_outer
@@ -393,6 +394,8 @@ seh_outer:
     movdqu  g_outer+RS_YMM+0x1a0(%rip), %xmm13
     movdqu  g_outer+RS_YMM+0x1c0(%rip), %xmm14
     movdqu  g_outer+RS_YMM+0x1e0(%rip), %xmm15
+    fldcw   g_outer+RS_FCW(%rip)        /* both nonvolatile in the x64 ABI: the unwind must keep them */
+    ldmxcsr g_outer+RS_MXCSR(%rip)
     callq   seh_inner
     nop
     .globl  seh_outer_catch
@@ -426,10 +429,30 @@ seh_inner:
     movdqu  g_inner+RS_YMM+0x1a0(%rip), %xmm13
     movdqu  g_inner+RS_YMM+0x1c0(%rip), %xmm14
     movdqu  g_inner+RS_YMM+0x1e0(%rip), %xmm15
+    cmpb    $0, g_seh_raise(%rip)
+    je      1f
+    callq   seh_raise_helper            /* RaiseException, as a C++ throw does */
+1:
     .globl  seh_inner_fault
 seh_inner_fault:
     ud2
     RESTORE_NONVOL
+    ret
+    .seh_endproc
+
+/* RaiseException(0xe0000001, 0, 0, NULL) in a frame of its own (the caller's home space holds its xmm saves) */
+    .def    seh_raise_helper; .scl 2; .type 32; .endef
+    .seh_proc seh_raise_helper
+seh_raise_helper:
+    subq    $0x28, %rsp
+    .seh_stackalloc 0x28
+    .seh_endprologue
+    movl    $0xe0000001, %ecx
+    xorl    %edx, %edx
+    xorl    %r8d, %r8d
+    xorl    %r9d, %r9d
+    callq   *g_pRaiseException(%rip)
+    addq    $0x28, %rsp
     ret
     .seh_endproc
 
@@ -577,5 +600,57 @@ stress_thread:
     CLEAN_ENV
     RESTORE_NONVOL
     xorl    %eax, %eax
+    ret
+    .seh_endproc
+
+/* void string_op(uint64_t *regs, int op): regs = { rcx, rsi, rdi, rax, df }; runs one string instruction with them
+ * (op 0 rep movsb, 1 rep movsq, 2 rep stosb, 3 rep stosq) and stores rcx, rsi, rdi back. A vectored handler that
+ * commits the faulting page continues the instruction where it stopped. */
+    .globl  string_op
+    .def    string_op; .scl 2; .type 32; .endef
+    .seh_proc string_op
+string_op:
+    pushq   %rsi
+    .seh_pushreg %rsi
+    pushq   %rdi
+    .seh_pushreg %rdi
+    .seh_endprologue
+    movq    %rcx, %r8
+    movl    %edx, %r9d
+    movq    0(%r8), %rcx
+    movq    8(%r8), %rsi
+    movq    16(%r8), %rdi
+    movq    24(%r8), %rax
+    cmpq    $0, 32(%r8)
+    je      1f
+    std
+1:  cmpl    $1, %r9d
+    je      2f
+    cmpl    $2, %r9d
+    je      3f
+    cmpl    $3, %r9d
+    je      4f
+    .globl  str_movsb
+str_movsb: rep movsb
+    jmp     5f
+    .globl  str_movsq
+2:
+str_movsq: rep movsq
+    jmp     5f
+    .globl  str_stosb
+3:
+str_stosb: rep stosb
+    jmp     5f
+    .globl  str_stosq
+4:
+str_stosq: rep stosq
+    .globl  str_done
+str_done:
+5:  cld
+    movq    %rcx, 0(%r8)
+    movq    %rsi, 8(%r8)
+    movq    %rdi, 16(%r8)
+    popq    %rdi
+    popq    %rsi
     ret
     .seh_endproc
