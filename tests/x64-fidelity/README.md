@@ -1,6 +1,6 @@
 # x86-64 fidelity tests
 
-Seven standalone Windows x64 programs that check what an x86-64 program can observe about the CPU and the
+Eight standalone Windows x64 programs that check what an x86-64 program can observe about the CPU and the
 Windows exception and memory model. They are the regression tests for the arm64 engine line (Wine ARM64EC +
 FEX), and run unchanged on real x86-64 Windows, which is the reference: a check that fails on real Windows is
 a wrong check, not a finding.
@@ -14,6 +14,7 @@ a wrong check, not a finding.
 | `memtest` | VirtualQuery/VirtualProtect/VirtualFree at 4 KB granularity, every protection, PAGE_GUARD, page-split accesses, generated and self-modifying code (documented flush path, RWX without a flush, inline, WriteProcessMemory, another thread), write watch, stack growth |
 | `kattest` | known-answer tests for CRC32 (SSE4.2), AES-NI, PCLMULQDQ, SHA-NI (full SHA-1 and SHA-256 blocks), VAES and VPCLMULQDQ against portable C, for every one of them CPUID advertises |
 | `tsctest` | fenced RDTSC monotonic, happens-before across threads and while migrating, RDTSCP, CPUID's TSC frequency against the measured rate |
+| `drtest` | the hardware debug registers DR0-DR3, DR6 and DR7 through Get/SetThreadContext, exception contexts and NtContinue: round trips, instruction breakpoints (fault before the instruction, Dr6 B bits, RF on resume, per thread, set on a suspended thread), data breakpoints (write and read/write, every length, ranges, string instructions), what the kernel does with RF and Dr6 recorded |
 
 Output: one line per check, `PASS <id>`, `FAIL <id>: <detail>` or `INFO <id>: <value>`, then
 `SUMMARY <test> pass=N fail=M`; the exit code is the number of failures.
