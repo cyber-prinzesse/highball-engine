@@ -17,4 +17,5 @@ $CC -o "$OUT/kattest.exe"   "$HERE/kattest.c"
 $CC -o "$OUT/drtest.exe"    "$HERE/drtest.c"
 # x87test also as a 32-bit program: the x87 matters most to 32-bit games, which run through WoW64
 "$BIN/i686-w64-mingw32-clang" -O2 -Wall -Wno-unused-function -Wno-unused-variable -o "$OUT/x87test32.exe" "$HERE/x87test.c"
+"$BIN/i686-w64-mingw32-clang" -O2 -Wall -Wno-unused-function -Wno-unused-variable -o "$OUT/drtest32.exe" "$HERE/drtest.c"
 ls -l "$OUT"

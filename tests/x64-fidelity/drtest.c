@@ -18,11 +18,22 @@
 #define RF 0x10000
 #define TF 0x100
 
+/* the same program as a 32-bit one (drtest32.exe, through WoW64 on x86-64 Windows and on the arm64 engine) */
+#ifdef _WIN64
+#define CTX_IP(c) ((c)->Rip)
+#define CTX_CX(c) ((c)->Rcx)
+#else
+#define CTX_IP(c) ((c)->Eip)
+#define CTX_CX(c) ((c)->Ecx)
+#endif
+
 enum { MODE_RF = 0, MODE_PLAIN, MODE_DR7_ZERO, MODE_MOVE_DR0, MODE_KEEP_DR6, MODE_RECORD_ONLY };
 
+static volatile uint8_t *g_fix_page;
 static struct
 {
-    int hits, cap_reached;
+    int hits, cap_reached, av_hits;
+    uint64_t av_eflags;
     DWORD code, flags, params;
     uint64_t addr, rip, rcx, dr0, dr1, dr6, dr7, eflags, first_dr6, tid;
     uint64_t entry_dr6;    /* what GetThreadContext says inside the handler */
@@ -54,6 +65,14 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS *ep)
     CONTEXT *c = ep->ContextRecord;
     CONTEXT live;
 
+    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && g_fix_page)
+    {
+        DWORD old;
+        g.av_hits++;
+        g.av_eflags = c->EFlags;
+        VirtualProtect((void *)g_fix_page, 4096, PAGE_READWRITE, &old);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (r->ExceptionCode != EXCEPTION_SINGLE_STEP && r->ExceptionCode != EXCEPTION_BREAKPOINT)
         return EXCEPTION_CONTINUE_SEARCH;
     if (!g.hits) g.first_dr6 = c->Dr6;
@@ -62,8 +81,8 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS *ep)
     g.flags = c->ContextFlags;
     g.params = r->NumberParameters;
     g.addr = (uint64_t)r->ExceptionAddress;
-    g.rip = c->Rip;
-    g.rcx = c->Rcx;
+    g.rip = CTX_IP(c);
+    g.rcx = CTX_CX(c);
     g.dr0 = c->Dr0;
     g.dr1 = c->Dr1;
     g.dr6 = c->Dr6;
@@ -73,7 +92,7 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS *ep)
     get_dr(GetCurrentThread(), &live);
     g.entry_dr6 = live.Dr6;
 
-    if (r->ExceptionCode == EXCEPTION_BREAKPOINT) { c->Rip++; return EXCEPTION_CONTINUE_EXECUTION; }
+    if (r->ExceptionCode == EXCEPTION_BREAKPOINT) { CTX_IP(c)++; return EXCEPTION_CONTINUE_EXECUTION; }
     if (c->EFlags & TF) { c->EFlags &= ~TF; return EXCEPTION_CONTINUE_EXECUTION; }
 
     switch (g_mode)
@@ -90,14 +109,30 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS *ep)
 
 static void arm(int mode) { memset(&g, 0, sizeof(g)); g_mode = mode; g_move_to = 0; }
 
-/* the breakpoint targets live in one RWX page:
+/* the breakpoint targets live in one RWX page, at the same places in both programs:
  *   code+0:  nop; nop; ret                              (three one-byte instructions)
- *   code+16: mov ecx, 5; L: dec ecx; jnz L; ret        (dec at +21, 2 bytes; jnz at +23, 2 bytes)
- *   code+32: mov dword ptr [rcx], 7; ret               (6 bytes, ret at +38; rcx is the first argument)
- *   code+48: mov al, [rcx]; ret                        (2 bytes, ret at +50)
- *   code+64: rep stosb; ret                            (2 bytes, ret at +66; rdi, rcx and rax set by stos_thunk)
- *   code+80: mov rax, rdx; mov qword ptr [rcx], rax; ret  (3 + 3 bytes, ret at +86; rdx is the second argument)
- *   code+96: mov byte ptr [rcx], 1; ret                (3 bytes, ret at +99) */
+ *   code+16: mov ecx, 5; L: dec ecx; jnz L; ret        (dec at +21)
+ *   code+32: store 7 to the 4 bytes at the argument     (the store at STORE4, the ret after it at RET4)
+ *   code+48: load the byte at the argument              (the ret after it at RET1R)
+ *   code+64: rep stosb; ret                             (rdi, rcx and rax set by stos_thunk)
+ *   code+80: store the second argument, 8 bytes, at the first in one access (the ret at RET8)
+ *   code+96: store 1 to the byte at the argument */
+#ifdef _WIN64
+enum { STORE4 = 32, RET4 = 38, RET1R = 50, RET8 = 86 };
+static const uint8_t loop[] = { 0xb9, 0x05, 0x00, 0x00, 0x00, 0xff, 0xc9, 0x75, 0xfc, 0xc3 };   /* dec ecx is ff c9 */
+static const uint8_t write4[] = { 0xc7, 0x01, 0x07, 0x00, 0x00, 0x00, 0xc3 };                  /* mov dword [rcx], 7 */
+static const uint8_t read1[] = { 0x8a, 0x01, 0xc3 };                                           /* mov al, [rcx] */
+static const uint8_t write8[] = { 0x48, 0x89, 0xd0, 0x48, 0x89, 0x01, 0xc3 };                  /* mov rax, rdx; mov [rcx], rax */
+static const uint8_t write1[] = { 0xc6, 0x01, 0x01, 0xc3 };                                     /* mov byte [rcx], 1 */
+#else
+enum { STORE4 = 36, RET4 = 42, RET1R = 54, RET8 = 94 };
+static const uint8_t loop[] = { 0xb9, 0x05, 0x00, 0x00, 0x00, 0x49, 0x75, 0xfd, 0xc3 };         /* dec ecx is 49 */
+static const uint8_t write4[] = { 0x8b, 0x4c, 0x24, 0x04, 0xc7, 0x01, 0x07, 0x00, 0x00, 0x00, 0xc3 };
+static const uint8_t read1[] = { 0x8b, 0x4c, 0x24, 0x04, 0x8a, 0x01, 0xc3 };
+/* mov ecx, [esp+4]; movq xmm0, [esp+8]; movq [ecx], xmm0: one 8-byte store */
+static const uint8_t write8[] = { 0x8b, 0x4c, 0x24, 0x04, 0xf3, 0x0f, 0x7e, 0x44, 0x24, 0x08, 0x66, 0x0f, 0xd6, 0x01, 0xc3 };
+static const uint8_t write1[] = { 0x8b, 0x4c, 0x24, 0x04, 0xc6, 0x01, 0x01, 0xc3 };
+#endif
 static uint8_t *code;
 static int (*fn_nops)(void);
 static int (*fn_loop)(void);
@@ -109,12 +144,7 @@ static void (*fn_write1)(void *);
 static void make_code(void)
 {
     static const uint8_t nops[] = { 0x90, 0x90, 0xc3 };
-    static const uint8_t loop[] = { 0xb9, 0x05, 0x00, 0x00, 0x00, 0xff, 0xc9, 0x75, 0xfc, 0xc3 };
-    static const uint8_t write4[] = { 0xc7, 0x01, 0x07, 0x00, 0x00, 0x00, 0xc3 };
-    static const uint8_t read1[] = { 0x8a, 0x01, 0xc3 };
     static const uint8_t stos[] = { 0xf3, 0xaa, 0xc3 };
-    static const uint8_t write8[] = { 0x48, 0x89, 0xd0, 0x48, 0x89, 0x01, 0xc3 };
-    static const uint8_t write1[] = { 0xc6, 0x01, 0x01, 0xc3 };
 
     code = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     memset(code, 0xcc, 4096);
@@ -135,10 +165,14 @@ static void make_code(void)
 }
 
 /* rep stosb needs rdi, rcx, rax: a tiny thunk written in C with inline asm */
-static void stos_thunk(void *dst, uint64_t n, uint64_t value)
+static void stos_thunk(void *dst, uintptr_t n, uintptr_t value)
 {
     void (*f)(void) = (void *)(code + 64);
+#ifdef _WIN64
     __asm__ volatile("call *%3" : "+D"(dst), "+c"(n), "+a"(value) : "r"(f) : "memory", "cc", "rdx", "r8", "r9", "r10", "r11");
+#else
+    __asm__ volatile("call *%3" : "+D"(dst), "+c"(n), "+a"(value) : "r"(f) : "memory", "cc", "edx");
+#endif
 }
 
 /* DR7 field helpers: n = register, rw: 0 execute, 1 write, 3 read/write; len: 0 1 byte, 1 2 bytes, 3 4 bytes, 2 8 bytes */
@@ -180,7 +214,7 @@ int main(void)
 {
     HANDLE self = GetCurrentThread();
     CONTEXT c;
-    uint64_t f;
+    uintptr_t f;
     DECLSPEC_ALIGN(16) static uint8_t buf[64];
     BOOL r;
 
@@ -196,19 +230,29 @@ int main(void)
     get_dr(self, &c);
     fid_check(c.Dr0 == 0x42424240 && c.Dr1 == 0x126bb070, "rt.dr0dr1", "Dr0 %#llx Dr1 %#llx", (unsigned long long)c.Dr0, (unsigned long long)c.Dr1);
     fid_check((c.Dr7 & ~0xdc00ULL) == 0xffff0115, "rt.dr7", "Dr7 %#llx (want ffff0115 outside bits 10-12, 14, 15)", (unsigned long long)c.Dr7);
-    fid_info("rt.dr7.raw", "%#llx after writing 0xffff0115 (bit 10 reads as 1 on x86, GD bit 13 is sanitised by the kernel)", (unsigned long long)c.Dr7);
+    fid_check(c.Dr7 == 0xffff0515, "rt.dr7.value", "%#llx after writing 0xffff0115 (Windows: 0xffff0515, bit 10 reads as 1)", (unsigned long long)c.Dr7);
     set_dr(self, 0, 0, 0);
     memset(&c, 0, sizeof(c));
     c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
     c.Dr6 = 0xf;
     SetThreadContext(self, &c);
     get_dr(self, &c);
-    fid_check((c.Dr6 & 0xf00f) == 0xf, "rt.dr6", "Dr6 %#llx after writing 0xf (B0-B3 and BD/BS/BT survive a round trip)", (unsigned long long)c.Dr6);
-    fid_info("rt.dr6.raw", "%#llx after writing 0xf (x86 reads bits 4-11 as 1)", (unsigned long long)c.Dr6);
+    fid_check(c.Dr6 == 0, "rt.dr6.dropped", "Dr6 %#llx after writing 0xf (Windows keeps no Dr6 a context sets, it reads 0)", (unsigned long long)c.Dr6);
     c.Dr6 = 0;
     SetThreadContext(self, &c);
     get_dr(self, &c);
     fid_check(c.Dr0 == 0 && c.Dr1 == 0 && c.Dr7 == 0, "rt.cleared", "Dr0 %#llx Dr1 %#llx Dr7 %#llx", (unsigned long long)c.Dr0, (unsigned long long)c.Dr1, (unsigned long long)c.Dr7);
+    /* addresses without an enable bit in DR7, then every DR7 bit */
+    set_dr(self, 0x42424240, 0x126bb070, 0);
+    get_dr(self, &c);
+    fid_check(c.Dr0 == 0 && c.Dr1 == 0 && c.Dr7 == 0, "rt.inactive", "Dr0 %#llx Dr1 %#llx Dr7 %#llx after writing addresses with DR7 0 (Windows reports none while no breakpoint is enabled)", (unsigned long long)c.Dr0, (unsigned long long)c.Dr1, (unsigned long long)c.Dr7);
+    set_dr(self, 0, 0, 0xffffffffffffffffULL);
+    get_dr(self, &c);
+    fid_info("rt.dr7.allbits", "Dr7 %#llx after writing all ones (the bits Windows keeps)", (unsigned long long)c.Dr7);
+    set_dr(self, 0, 0, 0xffff0355);
+    get_dr(self, &c);
+    fid_info("rt.dr7.ge", "Dr7 %#llx after writing 0xffff0355 (LE and GE)", (unsigned long long)c.Dr7);
+    set_dr(self, 0, 0, 0);
     {
         /* a new thread starts with clear registers while the creator has one set */
         CONTEXT tc;
@@ -218,7 +262,7 @@ int main(void)
         WaitForSingleObject(t, 5000);
         CloseHandle(t);
         set_dr(self, 0, 0, 0);
-        fid_info("rt.newthread", "Dr0 %#llx Dr7 %#llx in a thread created while the creator had DR0/DR7 set", (unsigned long long)tc.Dr0, (unsigned long long)tc.Dr7);
+        fid_check(tc.Dr0 == 0 && tc.Dr7 == 0, "rt.newthread", "Dr0 %#llx Dr7 %#llx in a thread created while the creator had DR0/DR7 set (want 0, 0)", (unsigned long long)tc.Dr0, (unsigned long long)tc.Dr7);
     }
 
     /* ---- references: int3 and a trap-flag step ---- */
@@ -226,11 +270,10 @@ int main(void)
     __asm__ volatile("int3");
     fid_check(g.hits == 1 && g.code == EXCEPTION_BREAKPOINT, "ref.int3", "hits %d code %#lx", g.hits, (unsigned long)g.code);
     arm(MODE_RECORD_ONLY);
-    __asm__ volatile("pushfq; popq %0" : "=r"(f));
-    __asm__ volatile("pushq %0; popfq; nop; nop" :: "r"(f | TF) : "cc", "memory");
+    __asm__ volatile("pushf; pop %0" : "=r"(f));
+    __asm__ volatile("push %0; popf; nop; nop" :: "r"(f | TF) : "cc", "memory");
     fid_check(g.hits >= 1 && g.code == EXCEPTION_SINGLE_STEP, "ref.tf", "hits %d code %#lx", g.hits, (unsigned long)g.code);
-    fid_info("ref.tf.dr6", "Dr6 %#llx in the single-step context (x86: BS 0x4000 set)", (unsigned long long)g.dr6);
-    fid_check((g.dr6 & 0x4000) != 0, "ref.tf.bs", "Dr6 %#llx lacks BS", (unsigned long long)g.dr6);
+    fid_check(g.dr6 == 0, "ref.tf.dr6", "Dr6 %#llx in the single-step context (Windows reports 0, no BS)", (unsigned long long)g.dr6);
     fid_info("ref.tf.ctxflags", "ContextFlags %#lx in the single-step context", (unsigned long)g.flags);
 
     /* ---- instruction breakpoints ---- */
@@ -245,9 +288,10 @@ int main(void)
     fid_check(g.params == 0, "exec.params", "NumberParameters %lu", (unsigned long)g.params);
     fid_check((g.flags & CONTEXT_DEBUG_REGISTERS) == CONTEXT_DEBUG_REGISTERS, "exec.ctxflags", "ContextFlags %#lx lacks CONTEXT_DEBUG_REGISTERS", (unsigned long)g.flags);
     fid_check(g.dr0 == (uint64_t)code && (g.dr7 & 1), "exec.ctx.dr", "handler context Dr0 %#llx Dr7 %#llx", (unsigned long long)g.dr0, (unsigned long long)g.dr7);
-    fid_info("exec.ctx.eflags", "EFlags %#llx (RF 0x10000 %s, TF %s)", (unsigned long long)g.eflags, (g.eflags & RF) ? "set" : "clear", (g.eflags & TF) ? "set" : "clear");
+    fid_check(!(g.eflags & RF), "exec.ctx.rf", "EFlags %#llx: RF set in an instruction-breakpoint context (x86 leaves it clear there)", (unsigned long long)g.eflags);
     fid_check(!(g.eflags & TF), "exec.ctx.tf", "TF set in an instruction-breakpoint context");
-    fid_info("exec.dr6.raw", "Dr6 %#llx in the context, %#llx from GetThreadContext inside the handler", (unsigned long long)g.dr6, (unsigned long long)g.entry_dr6);
+    fid_check(g.dr6 == 0xffff0ff1, "exec.dr6.value", "Dr6 %#llx in the context (Windows: 0xffff0ff1, B0 with the bits x86 reads as 1)", (unsigned long long)g.dr6);
+    fid_info("exec.dr6.live", "Dr6 %#llx from GetThreadContext inside the handler (Windows: 0xffff0ff0)", (unsigned long long)g.entry_dr6);
 
     /* every execution: the loop body runs five times with the breakpoint on its dec */
     arm(MODE_RF);
@@ -261,7 +305,7 @@ int main(void)
     set_dr(self, (uint64_t)code, 0, dr7(0, 0, 0));
     fn_nops();
     set_dr(self, 0, 0, 0);
-    fid_info("exec.plain", "continue with the context unchanged: %d hits%s (1 means the kernel set RF for the handler, 8 means the fault repeats until the handler disables it)", g.hits, g.cap_reached ? ", cap reached" : "");
+    fid_check(g.hits == 8 && g.cap_reached, "exec.plain", "continue with the context unchanged: %d hits%s (Windows sets no RF for the handler: the fault repeats until the handler disables the breakpoint)", g.hits, g.cap_reached ? ", cap reached" : "");
 
     /* enabled through DR7 but at another address: no hit. DR0 set and DR7 clear: no hit. */
     arm(MODE_RF);
@@ -286,12 +330,12 @@ int main(void)
     set_dr(self, (uint64_t)code, 0, 2 /* G0 */);
     fn_nops();
     set_dr(self, 0, 0, 0);
-    fid_check(g.hits == 1, "exec.g0", "enabled with G0 instead of L0: hits %d", g.hits);
+    fid_check(g.hits == 0, "exec.g0", "enabled with G0 instead of L0: hits %d (Windows honours only the local enable bits)", g.hits);
     arm(MODE_RF);
     set_dr(self, (uint64_t)code, 0, dr7(0, 0, 3));
     fn_nops();
     set_dr(self, 0, 0, 0);
-    fid_info("exec.len4", "instruction breakpoint with LEN=4 bytes (undefined by the SDM): %d hits", g.hits);
+    fid_check(g.hits == 0, "exec.len4", "instruction breakpoint with LEN=4 bytes: %d hits (undefined by the SDM, none on Windows's AMD EPYC)", g.hits);
     arm(MODE_RF);
     set_dr(self, (uint64_t)code, (uint64_t)code, dr7(0, 0, 0) | dr7(1, 0, 0));
     fn_nops();
@@ -304,9 +348,9 @@ int main(void)
     fn_nops();
     set_dr(self, 0, 0, 0);
     fid_check(g.hits == 2, "exec.sticky.hits", "hits %d", g.hits);
-    fid_info("exec.sticky", "first context Dr6 %#llx, second %#llx with the handler leaving Dr6 alone (sticky B bits would show B0|B1)", (unsigned long long)g.first_dr6, (unsigned long long)g.dr6);
+    fid_check((g.dr6 & 0xf) == 2, "exec.sticky", "first context Dr6 %#llx, second %#llx with the handler leaving Dr6 alone (Windows reports each hit's own bit, Dr6 is not sticky)", (unsigned long long)g.first_dr6, (unsigned long long)g.dr6);
     get_dr(self, &c);
-    fid_info("exec.sticky.after", "Dr6 %#llx from GetThreadContext after the hits", (unsigned long long)c.Dr6);
+    fid_check(c.Dr6 == 0, "exec.sticky.after", "Dr6 %#llx from GetThreadContext after the hits (want 0)", (unsigned long long)c.Dr6);
     c.Dr6 = 0;
     SetThreadContext(self, &c);
 
@@ -325,6 +369,21 @@ int main(void)
     fn_nops();
     set_dr(self, 0, 0, 0);
     fid_check(g.hits == 2 && g.rip == (uint64_t)code + 1, "exec.ctx.dr0", "handler moved Dr0 to code+1: hits %d last Rip %#llx", g.hits, (unsigned long long)g.rip);
+
+    /* an instruction breakpoint on an instruction that then faults: the fault's context has RF set, so continuing
+     * from the fault does not take the breakpoint a second time (one #DB, one access violation) */
+    {
+        uint8_t *ro = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY);
+        arm(MODE_RF);
+        g_fix_page = ro;
+        set_dr(self, (uint64_t)code + STORE4, 0, dr7(0, 0, 0));
+        fn_write4(ro + 8);
+        set_dr(self, 0, 0, 0);
+        g_fix_page = NULL;
+        fid_check(g.hits == 1 && g.av_hits == 1 && *(uint32_t *)(ro + 8) == 7, "exec.fault.rf", "%d breakpoint hits, %d access violations (want 1 and 1: the fault's RF covers the retry)", g.hits, g.av_hits);
+        fid_info("exec.fault.rf.eflags", "EFlags %#llx in the access violation's context", (unsigned long long)g.av_eflags);
+        VirtualFree(ro, 0, MEM_RELEASE);
+    }
 
     /* per thread */
     arm(MODE_RF);
@@ -362,7 +421,7 @@ int main(void)
     set_dr(self, 0, 0, 0);
     fid_check(g.hits == 1 && (g.dr6 & 0xf) == 1, "data.write", "hits %d Dr6 %#llx", g.hits, (unsigned long long)g.dr6);
     fid_check(g.code == EXCEPTION_SINGLE_STEP, "data.code", "%#lx", (unsigned long)g.code);
-    fid_check(g.rip == (uint64_t)code + 38 && g.addr == (uint64_t)code + 38, "data.trap.rip", "Rip %#llx ExceptionAddress %#llx (want the ret after the store, %#llx)", (unsigned long long)g.rip, (unsigned long long)g.addr, (unsigned long long)code + 38);
+    fid_check(g.rip == (uint64_t)code + RET4 && g.addr == (uint64_t)code + RET4, "data.trap.rip", "Rip %#llx ExceptionAddress %#llx (want the ret after the store, %#llx)", (unsigned long long)g.rip, (unsigned long long)g.addr, (unsigned long long)code + RET4);
     fid_check(*(uint32_t *)(buf + 4) == 7, "data.write.done", "the store completed before the trap: %u", *(uint32_t *)(buf + 4));
     fid_info("data.ctx.eflags", "EFlags %#llx in the data-breakpoint context", (unsigned long long)g.eflags);
     arm(MODE_RECORD_ONLY);
@@ -374,7 +433,7 @@ int main(void)
     set_dr(self, (uint64_t)buf + 4, 0, dr7(0, 3, 3));
     fn_read1(buf + 4);
     set_dr(self, 0, 0, 0);
-    fid_check(g.hits == 1 && g.rip == (uint64_t)code + 50, "data.rw.read", "a read of a read/write breakpoint: hits %d Rip %#llx (want %#llx)", g.hits, (unsigned long long)g.rip, (unsigned long long)code + 50);
+    fid_check(g.hits == 1 && g.rip == (uint64_t)code + RET1R, "data.rw.read", "a read of a read/write breakpoint: hits %d Rip %#llx (want %#llx)", g.hits, (unsigned long long)g.rip, (unsigned long long)code + RET1R);
     arm(MODE_RECORD_ONLY);
     set_dr(self, (uint64_t)buf + 4, 0, dr7(0, 1, 3));
     fn_write4(buf + 8);
@@ -390,7 +449,7 @@ int main(void)
     set_dr(self, (uint64_t)buf + 4, 0, dr7(0, 1, 3));
     fn_write8(buf, 0x1122334455667788ULL);
     set_dr(self, 0, 0, 0);
-    fid_check(g.hits == 1 && g.rip == (uint64_t)code + 86, "data.overlap", "an 8-byte write at buf covering the range: hits %d Rip %#llx", g.hits, (unsigned long long)g.rip);
+    fid_check(g.hits == 1 && g.rip == (uint64_t)code + RET8, "data.overlap", "an 8-byte write at buf covering the range: hits %d Rip %#llx", g.hits, (unsigned long long)g.rip);
     arm(MODE_RECORD_ONLY);
     set_dr(self, (uint64_t)buf + 16, 0, dr7(0, 1, 0));
     fn_write1(buf + 16);
@@ -406,12 +465,12 @@ int main(void)
     set_dr(self, (uint64_t)buf + 5, 0, dr7(0, 1, 3));
     fn_write1(buf + 4);
     set_dr(self, 0, 0, 0);
-    fid_info("data.unaligned.below", "4-byte breakpoint at buf+5, byte write at buf+4: %d hits (1 if the processor masks the address to buf+4)", g.hits);
+    fid_check(g.hits == 1, "data.unaligned.below", "4-byte breakpoint at buf+5, byte write at buf+4: %d hits (the processor masks the address to buf+4)", g.hits);
     arm(MODE_RECORD_ONLY);
     set_dr(self, (uint64_t)buf + 5, 0, dr7(0, 1, 3));
     fn_write1(buf + 8);
     set_dr(self, 0, 0, 0);
-    fid_info("data.unaligned.above", "4-byte breakpoint at buf+5, byte write at buf+8: %d hits (0 if masked to buf+4..7)", g.hits);
+    fid_check(g.hits == 0, "data.unaligned.above", "4-byte breakpoint at buf+5, byte write at buf+8: %d hits (masked to buf+4..7)", g.hits);
     /* two registers, the second one hit */
     arm(MODE_RECORD_ONLY);
     set_dr(self, (uint64_t)buf + 32, (uint64_t)buf + 40, dr7(0, 1, 3) | dr7(1, 1, 3));
@@ -424,7 +483,7 @@ int main(void)
     stos_thunk(buf, 32, 0x55);
     set_dr(self, 0, 0, 0);
     fid_check(g.hits == 1, "data.string", "rep stosb over the range: hits %d", g.hits);
-    fid_info("data.string.rip", "Rip %+lld from the rep stosb, Rcx %llu (x86 traps after the iteration that wrote the byte: Rip at the rep, Rcx the bytes left)", (long long)(g.rip - ((uint64_t)code + 64)), (unsigned long long)g.rcx);
+    fid_check(g.rip == (uint64_t)code + 64 && g.rcx == 15, "data.string.rip", "Rip %+lld from the rep stosb, Rcx %llu (x86 traps after the iteration that wrote the byte: Rip at the rep, Rcx the 15 bytes left)", (long long)(g.rip - ((uint64_t)code + 64)), (unsigned long long)g.rcx);
     fid_check(buf[31] == 0x55, "data.string.done", "the string instruction completed after the trap: buf[31] %#x", buf[31]);
     /* another thread writing the range with its own registers clear */
     arm(MODE_RECORD_ONLY);
@@ -453,7 +512,7 @@ int main(void)
             ReadFile(h, buf, 8, &n, NULL);
             set_dr(self, 0, 0, 0);
             CloseHandle(h);
-            fid_info("data.kernel", "ReadFile into the watched range: %d hits, %lu bytes read", g.hits, n);
+            fid_check(g.hits == 0 && n == 8, "data.kernel", "ReadFile into the watched range: %d hits, %lu bytes read (a kernel write is not a program access)", g.hits, n);
         }
     }
 

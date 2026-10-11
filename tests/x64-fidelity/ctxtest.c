@@ -311,6 +311,8 @@ static void check_context(const char *id, const CONTEXT *c, const regstate *want
               "EFlags %#lx want %#llx (mask %#x)", c->EFlags, (unsigned long long)want->rflags, FLAGS_MASK);
     sprintf(name, "%s.ctx.eflags", id);
     fid_info(name, "EFlags %#lx", c->EFlags);
+    sprintf(name, "%s.ctx.eflags.reserved", id);
+    fid_check(!(c->EFlags & 0xffc08028), name, "EFlags %#lx has reserved bits set (3, 5, 15, 22-31 read as 0)", c->EFlags);
     sprintf(name, "%s.ctx.segs", id);
     fid_check(c->SegCs == 0x33 && c->SegSs == 0x2b, name, "cs %#x ss %#x", c->SegCs, c->SegSs);
     fid_info(name, "cs %#x ds %#x es %#x fs %#x gs %#x ss %#x", c->SegCs, c->SegDs, c->SegEs, c->SegFs, c->SegGs, c->SegSs);
@@ -452,6 +454,17 @@ static const uint8_t (*st_of(const regstate *r, uint8_t (*buf)[16]))[16]
     return (const uint8_t (*)[16])buf;
 }
 
+/* x86 saves EFLAGS with RF set for a fault, so that continuing at the faulting instruction does not take its
+ * instruction breakpoint again, and Windows hands that image to the handler; traps (int3, a single step) leave it clear */
+static void check_rf(const char *id, const CONTEXT *c, DWORD code)
+{
+    char name[128];
+    int want = code != EXCEPTION_BREAKPOINT && code != EXCEPTION_SINGLE_STEP;
+    sprintf(name, "%s.ctx.rf", id);
+    fid_check(!!(c->EFlags & 0x10000) == want, name, "EFlags %#lx: RF %s, want it %s for %s", c->EFlags,
+              (c->EFlags & 0x10000) ? "set" : "clear", want ? "set" : "clear", want ? "a fault" : "a trap");
+}
+
 /* one fault kind with the plain continuation (nothing but Rip changed) */
 static void exc_case(const char *id, void *stub, void *stub_end, int mode, DWORD code, const void *addr, DWORD nparams,
                      ULONG_PTR p0, ULONG_PTR p1, const void *want_rip, int64_t rsp_adjust, unsigned seed, uint32_t flags)
@@ -468,6 +481,7 @@ static void exc_case(const char *id, void *stub, void *stub_end, int mode, DWORD
     check_record(id, &g_seen.rec, code, addr, nparams, p0, p1);
     check_context(id, &g_seen.ctx, &g_before, want_rip, g_before.gpr[4] + rsp_adjust, ALL_BUT_RSP, g_seen.has_ymmh,
                   (const uint8_t (*)[16])g_seen.ymmh);
+    check_rf(id, &g_seen.ctx, code);
     check_entry(id, &g_seen);
     want = g_before;
     check_after(id, &g_after, &want, g_before.gpr[4], ALL_BUT_RSP, g_seen.has_ymmh || 1, 5, 0xe0, st_of(&g_before, st));
@@ -517,6 +531,7 @@ static void group_exc(void)
     if (run(stub_exec, stub_exec_end, MODE_EXEC))
     {
         check_record("exc.exec", &g_seen.rec, EXCEPTION_ACCESS_VIOLATION, rw, 2, 8, (ULONG_PTR)rw);
+        check_rf("exc.exec", &g_seen.ctx, EXCEPTION_ACCESS_VIOLATION);
         check_context("exc.exec", &g_seen.ctx, &g_before, rw, g_before.gpr[4] - 8, ALL_BUT_RSP, g_seen.has_ymmh,
                       (const uint8_t (*)[16])g_seen.ymmh);
     }
