@@ -1,6 +1,6 @@
-From 5c0dad4304088aad90eb54b6402e1bbecef7e72b Mon Sep 17 00:00:00 2001
+From 089e0a4b232aa29ff4935063f5f12256f0947386 Mon Sep 17 00:00:00 2001
 From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
-Date: Sun, 11 Oct 2026 14:28:52 +0200
+Date: Sun, 11 Oct 2026 15:39:56 +0200
 Subject: [PATCH] x86 debug registers: DR0-DR3, DR6 and DR7 per thread,
  instruction and data breakpoints
 
@@ -31,18 +31,24 @@ holds the guest's flags between instructions.
 Cost: none for a thread without breakpoints (the doorbell check at every block start now loads 64 bits, which also
 cover the two debug event bytes); a thread with data breakpoints runs about three times slower while they are set.
 
-Windows: the ARM64EC module exports GetX64DebugRegisters and SetX64DebugRegisters(thread, context) for ntdll's x64
-context operations (highball-engine patches-arm64/0029). The current thread takes new registers at once; another thread
-the emulator knows takes them before it runs guest code again (at its next block start, through the doorbell check,
-or when it enters simulation). Contexts built for exceptions and suspension carry them in the ARM64 breakpoint
-registers (Bvr[0-5], tag "64DR" in Bcr[7]), and a loaded context with CONTEXT_DEBUG_REGISTERS sets them. They read as
-Windows reports them: all 0 unless DR7 keeps them (L0-L3, LE, GE), DR7 with bit 10 set, DR6 with the bits x86 reads as 1
-and the B bits of a hit being reported. Recompiling from inside ntdll runs with its memory callbacks off. The WoW64
+Windows: the registers cross the ntdll boundary in contexts, like the rest of the x64 state. The ARM64EC module takes
+them from a context it is entered with (CONTEXT_DEBUG_REGISTERS at BeginSimulation, so in a context ntdll continues a
+thread with) and puts them in every context it builds (exceptions, suspension, system calls), in the ARM64 breakpoint
+registers (Bvr[0-5], tag "64DR" in Bcr[7]), as Windows reports them: all 0 unless DR7 keeps them (L0-L3, LE, GE), DR7
+with bit 10 set, DR6 with the bits x86 reads as 1 and the B bits of a hit being reported. A suspension context keeps RF
+for an instruction the thread resumed at with RF and has not run yet. The one export, KeepX64DebugRegisters, says what
+x86-64 Windows keeps of the registers a context sets (nothing while DR7 enables none, DR7 through the legal mask, never
+DR6; they read back so until the thread runs with them), and its presence tells ntdll that the emulator implements
+them. ntdll keeps a thread's registers while it runs native code or waits and hands changes back with the next context
+the emulator is entered with, ringing the doorbell when the thread goes back to x64 code through native code
+(highball-engine patches-arm64/0029). Recompiling from a context load runs with ntdll's memory callbacks off. The WoW64
 module takes them from the 32-bit context, where Wine keeps them: a reload can happen inside a block (after a system
 call), so the thread applies them at its next block start; they read back as WoW64 reports them (LE added for an
 address with nothing enabled, DR7 through 0xffff0155).
 
-On an M4: drtest 70 of 70 and drtest32 70 of 70, as on x86-64 Windows; ctxtest 546 of 546.
+On an M4: drtest and drtest32 71 of 71, and drdbg and drdbg32 25 of 25 (another process sets and reads them at debug
+events, on threads it suspended in x64 code or in a wait, and on a process created suspended), as on x86-64 Windows;
+ctxtest 546 of 546.
 ---
  FEXCore/Source/Interface/Context/Context.h    |   1 +
  FEXCore/Source/Interface/Core/CPUBackend.cpp  |   5 +-
@@ -50,8 +56,8 @@ On an M4: drtest 70 of 70 and drtest32 70 of 70, as on x86-64 Windows; ctxtest 5
  FEXCore/Source/Interface/Core/Core.cpp        |  52 ++++-
  .../Source/Interface/Core/JIT/AtomicOps.cpp   |  30 +++
  FEXCore/Source/Interface/Core/JIT/JIT.cpp     |  10 +-
- FEXCore/Source/Interface/Core/JIT/JITClass.h  |  12 +
- .../Source/Interface/Core/JIT/MemoryOps.cpp   | 182 +++++++++++++++
+ FEXCore/Source/Interface/Core/JIT/JITClass.h  |  12 ++
+ .../Source/Interface/Core/JIT/MemoryOps.cpp   | 182 ++++++++++++++++++
  FEXCore/Source/Interface/Core/JIT/MiscOps.cpp |  50 +++++
  .../Interface/Core/OpcodeDispatcher.cpp       |  53 ++++-
  .../Source/Interface/Core/OpcodeDispatcher.h  |  41 ++++
@@ -59,15 +65,15 @@ On an M4: drtest 70 of 70 and drtest32 70 of 70, as on x86-64 Windows; ctxtest 5
  .../Interface/Core/SharedCodeBufferManager.h  |   4 +
  FEXCore/Source/Interface/IR/IR.json           |   8 +
  FEXCore/include/FEXCore/Core/Context.h        |   9 +
- FEXCore/include/FEXCore/Core/CoreState.h      |  19 +-
- FEXCore/include/FEXCore/Core/DebugRegisters.h | 143 ++++++++++++
+ FEXCore/include/FEXCore/Core/CoreState.h      |  20 +-
+ FEXCore/include/FEXCore/Core/DebugRegisters.h | 154 +++++++++++++++
  .../FEXCore/Debug/InternalThreadState.h       |   4 +
- Source/Windows/ARM64EC/BTInterface.h          |   2 +
- Source/Windows/ARM64EC/Module.cpp             | 208 ++++++++++++++++--
- Source/Windows/ARM64EC/libarm64ecfex.def      |   2 +
+ Source/Windows/ARM64EC/BTInterface.h          |   1 +
+ Source/Windows/ARM64EC/Module.cpp             | 113 +++++++++--
+ Source/Windows/ARM64EC/libarm64ecfex.def      |   1 +
  Source/Windows/Common/Exception.h             |  15 ++
- Source/Windows/WOW64/Module.cpp               |  92 +++++++-
- 23 files changed, 918 insertions(+), 38 deletions(-)
+ Source/Windows/WOW64/Module.cpp               |  92 ++++++++-
+ 23 files changed, 833 insertions(+), 38 deletions(-)
  create mode 100644 FEXCore/include/FEXCore/Core/DebugRegisters.h
 
 diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
@@ -1044,7 +1050,7 @@ index 63dc7a1..3413c57 100644
     * @brief Reconstructs a compacted EFLAGS from FEX's internal EFLAG representation.
     *
 diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
-index 80514bf..5330b48 100644
+index 80514bf..b00e8e8 100644
 --- a/FEXCore/include/FEXCore/Core/CoreState.h
 +++ b/FEXCore/include/FEXCore/Core/CoreState.h
 @@ -248,6 +248,17 @@ struct alignas(64) CPUState {
@@ -1065,15 +1071,16 @@ index 80514bf..5330b48 100644
  };
  static_assert(std::is_trivially_copyable_v<CPUState>, "Needs to be trivial");
  static_assert(std::is_standard_layout_v<CPUState>, "This needs to be standard layout");
-@@ -432,7 +443,13 @@ struct CpuStateFrame {
+@@ -432,7 +443,14 @@ struct CpuStateFrame {
  
  #ifdef _WIN32
    // Set by the kernel on ARM64EC whenever the JIT should cooperatively suspend running guest code.
 -  uint32_t SuspendDoorbell {};
 +  alignas(8) uint32_t SuspendDoorbell {};
 +  // x86 debug events, next to the doorbell so that the check at every block start covers them with the same load:
-+  // new debug registers queued for this thread (the Windows frontend keeps them), and a data breakpoint the previous
-+  // instruction hit (raised as #DB at the block start, where the guest state is exact)
++  // new debug registers for the thread to take at its next block start (the WoW64 frontend, whose context loads can
++  // happen inside a block), and a data breakpoint the previous instruction hit (raised as #DB at the block start,
++  // where the guest state is exact)
 +  uint8_t DebugRegistersQueued {};
 +  uint8_t DebugWatchHit {};
 +  uint16_t DebugEventsPad {};
@@ -1082,10 +1089,10 @@ index 80514bf..5330b48 100644
    // Pointers that the JIT needs to load to remove relocations
 diff --git a/FEXCore/include/FEXCore/Core/DebugRegisters.h b/FEXCore/include/FEXCore/Core/DebugRegisters.h
 new file mode 100644
-index 0000000..9eb2c30
+index 0000000..b6909d6
 --- /dev/null
 +++ b/FEXCore/include/FEXCore/Core/DebugRegisters.h
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,154 @@
 +// SPDX-License-Identifier: MIT
 +#pragma once
 +#include <cstdint>
@@ -1124,6 +1131,17 @@ index 0000000..9eb2c30
 +    return {};
 +  }
 +  return {{DR[0], DR[1], DR[2], DR[3]}, DR6_READ_AS_ONE | DR6, DR7 | DR7_READ_AS_ONE};
++}
++
++// What the kernel keeps of debug registers a context sets: nothing while DR7 enables none, else DR0-DR3 and DR7 through
++// DR7_LEGAL_MASK; DR6 is never taken from a context. Until the thread runs with them they read back so (measured: DR7
++// 1 set on a suspended thread or one at a debug event reads 1); afterwards they read as the processor gives them back
++// (DebugRegistersForContext, 0x401).
++inline ContextDebugRegisters DebugRegistersAsKept(const uint64_t* DR, uint64_t DR7) {
++  if (!(DR7 & DR7_ACTIVE_MASK)) {
++    return {};
++  }
++  return {{DR[0], DR[1], DR[2], DR[3]}, 0, DR7 & DR7_LEGAL_MASK};
 +}
 +
 +// WoW64 keeps a 32-bit thread's registers through that same kernel: an address set with nothing enabled gets LE so
@@ -1252,44 +1270,30 @@ index 42feabb..20e049a 100644
    void* FrontendPtr;
  
 diff --git a/Source/Windows/ARM64EC/BTInterface.h b/Source/Windows/ARM64EC/BTInterface.h
-index 828096c..3080f12 100644
+index 828096c..97c480c 100644
 --- a/Source/Windows/ARM64EC/BTInterface.h
 +++ b/Source/Windows/ARM64EC/BTInterface.h
-@@ -24,6 +24,8 @@ BOOLEAN STDMETHODCALLTYPE BTCpu64IsProcessorFeaturePresent(UINT Feature);
+@@ -24,6 +24,7 @@ BOOLEAN STDMETHODCALLTYPE BTCpu64IsProcessorFeaturePresent(UINT Feature);
  void STDMETHODCALLTYPE UpdateProcessorInformation(SYSTEM_CPU_INFORMATION* Info);
  // Extensions used by Wine's ntdll, not in the Windows interface
  void STDMETHODCALLTYPE GetX87State(XMM_SAVE_AREA32* FltSave);
-+BOOL GetX64DebugRegisters(HANDLE Thread, CONTEXT* Context);
-+BOOL SetX64DebugRegisters(HANDLE Thread, const CONTEXT* Context);
++void STDMETHODCALLTYPE KeepX64DebugRegisters(CONTEXT* Context);
  BOOL STDMETHODCALLTYPE GetX64Mxcsr(UINT32* Mxcsr);
  BOOL STDMETHODCALLTYPE SetX64Mxcsr(UINT32 Mxcsr);
  }
 diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
-index 0842404..5a25ab8 100644
+index 0842404..5805d39 100644
 --- a/Source/Windows/ARM64EC/Module.cpp
 +++ b/Source/Windows/ARM64EC/Module.cpp
-@@ -11,6 +11,9 @@ $end_info$
+@@ -11,6 +11,7 @@ $end_info$
  #include <FEXCore/Core/SignalDelegator.h>
  #include <FEXCore/Core/Context.h>
  #include <FEXCore/Core/CoreState.h>
 +#include <FEXCore/Core/DebugRegisters.h>
-+
-+#include <atomic>
  #include <FEXCore/Core/DiskCacheFileMapper.h>
  #include <FEXCore/Debug/InternalThreadState.h>
  #include <FEXCore/HLE/SyscallHandler.h>
-@@ -139,6 +142,10 @@ struct ThreadCPUArea {
- 
- struct FrontendThreadData {
-   bool InLockedRWXRead {};
-+  // x86 debug registers another thread set for this one (SetX64DebugRegisters), applied by this thread before it
-+  // runs guest code again (CpuStateFrame::DebugRegistersQueued). Guarded by ThreadCreationMutex.
-+  uint64_t PendingDR[4] {};
-+  uint64_t PendingDR7 {};
- };
- 
- namespace {
-@@ -169,6 +176,22 @@ FrontendThreadData* GetFrontendThreadData(FEXCore::Core::InternalThreadState* Th
+@@ -169,6 +170,22 @@ FrontendThreadData* GetFrontendThreadData(FEXCore::Core::InternalThreadState* Th
    return static_cast<FrontendThreadData*>(Thread->FrontendPtr);
  }
  
@@ -1312,7 +1316,7 @@ index 0842404..5a25ab8 100644
  bool IsEmulatorStackAddress(const ThreadCPUArea CPUArea, uint64_t Address) {
    return Address <= CPUArea.EmulatorStackBase() && Address >= CPUArea.EmulatorStackLimit();
  }
-@@ -401,10 +424,64 @@ static bool HasTag(const CONTEXT& Context) {
+@@ -401,10 +418,36 @@ static bool HasTag(const CONTEXT& Context) {
  
  } // namespace X64StateExtension
  
@@ -1335,49 +1339,21 @@ index 0842404..5a25ab8 100644
 +}
 +} // namespace X64DebugRegisters
 +
-+// Gives the current thread new debug registers. Recompiling for them allocates code memory, which must not come back
-+// into the emulator through ntdll's memory notifications while it holds its code cache locks. Outside a context load
-+// a resume flag only still counts for the instruction the thread is about to run (x86 clears RF after it).
-+static void ApplyDebugRegisters(FEXCore::Core::InternalThreadState* Thread, const uint64_t* DR, uint64_t DR7, bool ContextLoad) {
-+  ScopedCallbackDisable Guard;
-+  auto& State = Thread->CurrentFrame->State;
-+  if (!ContextLoad && State.resume_flag_rip != State.rip) {
-+    State.resume_flag_rip = ~0ULL;
-+  }
-+  CTX->SetDebugRegisters(Thread, DR, DR7);
-+}
-+
-+// Debug registers another thread queued for this one, applied by this thread (at a block start or simulation entry)
-+static void ConsumePendingDebugRegisters(FEXCore::Core::InternalThreadState* Thread, bool ContextLoad) {
-+  auto& Pending = Thread->CurrentFrame->DebugRegistersQueued;
-+  if (!std::atomic_ref(Pending).load(std::memory_order_acquire)) {
-+    return;
-+  }
-+  uint64_t DR[4];
-+  uint64_t DR7;
-+  {
-+    std::scoped_lock Lock(ThreadCreationMutex);
-+    const auto* Data = GetFrontendThreadData(Thread);
-+    memcpy(DR, Data->PendingDR, sizeof(DR));
-+    DR7 = Data->PendingDR7;
-+    std::atomic_ref(Pending).store(uint8_t {0}, std::memory_order_relaxed);
-+  }
-+  ApplyDebugRegisters(Thread, DR, DR7, ContextLoad);
-+}
-+
  static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, CONTEXT& Context) {
    auto& State = Thread->CurrentFrame->State;
    const bool Extended = X64StateExtension::HasTag(Context);
  
 +  if ((Context.ContextFlags & CONTEXT_DEBUG_REGISTERS) == CONTEXT_DEBUG_REGISTERS) {
-+    // DR6 is not taken from a context, as on Windows
-+    ApplyDebugRegisters(Thread, &Context.Dr0, Context.Dr7, true);
++    // DR6 is not taken from a context, as on Windows. Recompiling for new breakpoints allocates code memory, which
++    // must not come back into the emulator through ntdll's memory notifications while it holds its code cache locks.
++    ScopedCallbackDisable Guard;
++    CTX->SetDebugRegisters(Thread, &Context.Dr0, Context.Dr7);
 +  }
 +
    if ((Context.ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER) {
      // General register state
      State.gregs[FEXCore::X86State::REG_RAX] = Context.Rax;
-@@ -429,6 +506,9 @@ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, C
+@@ -429,6 +472,9 @@ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, C
      State.gregs[FEXCore::X86State::REG_RSP] = Context.Rsp;
      State.gregs[FEXCore::X86State::REG_RBP] = Context.Rbp;
      CTX->SetFlagsFromCompactedEFLAGS(Thread, Context.EFlags);
@@ -1387,7 +1363,7 @@ index 0842404..5a25ab8 100644
    }
  
    if ((Context.ContextFlags & CONTEXT_SEGMENTS) == CONTEXT_SEGMENTS) {
-@@ -596,6 +676,8 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
+@@ -596,6 +642,8 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
    ECContext.Fpcr = GuestFPCR;
    ECContext.Fpsr = FPSR;
  
@@ -1396,7 +1372,7 @@ index 0842404..5a25ab8 100644
    return ECContext;
  }
  
-@@ -610,6 +692,11 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
+@@ -610,6 +658,11 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
    ARM64_NT_CONTEXT GuestContext = StoreStateToPackedECContext(Thread, Context.Fpcr, Context.Fpsr);
    LogMan::Msg::DFmt("pc: {:X} rip: {:X}", Context.Pc, GuestContext.Pc);
  
@@ -1408,7 +1384,7 @@ index 0842404..5a25ab8 100644
    // x64 Windows runs exception handlers with TF and DF clear (a handler's string instructions go forwards) and
    // restores the interrupted flags from the context, which carries all of them (X64StateExtension).
    uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
-@@ -618,8 +705,13 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
+@@ -618,8 +671,13 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
  
    BOOL FirstChance = TRUE;
    const bool HostFault = !Fault.FaultToTopAndGeneratedException;
@@ -1422,15 +1398,7 @@ index 0842404..5a25ab8 100644
    if (const uint32_t Flags = HostFault ? FEX::Windows::MXCSRFlagsForFloatException(GuestRec.ExceptionCode) : 0) {
      // An unmasked SSE exception trapped on the host (the FPCR trap enables follow the guest's MXCSR masks in JIT
      // code). Windows x64 reports #XM with the MXCSR, status flag included, in ExceptionInformation[1]; the flag
-@@ -708,6 +800,7 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
-     Context->EFlags = (Context->EFlags & ECValidEFlagsMask) | (StateEFlags & ~ECValidEFlagsMask);
-   }
-   Exception::LoadStateFromECContext(Thread, *Context);
-+  Exception::ConsumePendingDebugRegisters(Thread, true);
- }
- 
- NTSTATUS ProcessInit() {
-@@ -790,22 +883,6 @@ NTSTATUS ProcessInit() {
+@@ -790,22 +848,6 @@ NTSTATUS ProcessInit() {
  
  void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {}
  
@@ -1453,7 +1421,7 @@ index 0842404..5a25ab8 100644
  // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
  bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
    auto Thread = CPUArea.ThreadState();
-@@ -881,11 +958,28 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+@@ -881,11 +923,26 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
    static constexpr uint32_t SuspendTrapMagic {0xD4395FC0}; // brk #0xCAFE
    if (Exception->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && *reinterpret_cast<uint32_t*>(NativeContext->Pc) == SuspendTrapMagic) {
      Exception::ReconstructThreadState(Thread, *NativeContext);
@@ -1462,23 +1430,21 @@ index 0842404..5a25ab8 100644
 -    CPUArea.Area->InSimulation = 0;
 -    *CPUArea.Area->SuspendDoorbell = 0;
 -    return true;
-+    // The same check at every block start stops for debug registers another thread queued for this one, and for a
-+    // data breakpoint the previous instruction hit: #DB now, a trap with RIP at this instruction, which is raised as a
-+    // guest exception below (a suspend request waits for the next block start)
-+    Exception::ConsumePendingDebugRegisters(Thread, false);
++    // The same check stops for a data breakpoint the previous instruction hit: #DB now, a trap with RIP at this
++    // instruction, which is raised as a guest exception below (the doorbell is answered at the next block start)
 +    if (Thread->CurrentFrame->DebugWatchHit) {
 +      Thread->CurrentFrame->DebugWatchHit = 0;
 +      Exception->ExceptionCode = EXCEPTION_SINGLE_STEP;
 +      Exception->ExceptionFlags = 0;
 +      Exception->NumberParameters = 0;
-+    } else if (!*CPUArea.Area->SuspendDoorbell) {
-+      // Nothing to suspend for: continue at this RIP, compiled again with the new breakpoints
-+      NativeContext->Pc = CPUArea.DispatcherLoopTopEnterECFillSRA();
-+      NativeContext->Sp = CPUArea.EmulatorStackBase();
-+      NativeContext->X11 = 0;                                        // ENTRY_FILL_SRA_SINGLE_INST_REG: no single step
-+      NativeContext->X17 = reinterpret_cast<uint64_t>(CPUArea.Area); // EC_ENTRY_CPUAREA_REG
-+      return true;
-+    } else {      *NativeContext = Exception::StoreStateToPackedECContext(Thread, NativeContext->Fpcr, NativeContext->Fpsr);
++    } else {
++      *NativeContext = Exception::StoreStateToPackedECContext(Thread, NativeContext->Fpcr, NativeContext->Fpsr);
++      // The thread resumed here with RF from an instruction breakpoint and has not run the instruction yet: RF is still
++      // set, so the context ntdll continues with keeps it (X14 holds EFlags in its upper half, X64StateExtension)
++      const auto& State = Thread->CurrentFrame->State;
++      if (State.resume_flag_rip == State.rip) {
++        NativeContext->X14 |= static_cast<uint64_t>(1U << FEXCore::X86State::RFLAG_RF_LOC) << 32;
++      }
 +      LogMan::Msg::DFmt("Suspending: RIP: {:X} SP: {:X}", NativeContext->Pc, NativeContext->Sp);
 +      CPUArea.Area->InSimulation = 0;
 +      *CPUArea.Area->SuspendDoorbell = 0;
@@ -1487,95 +1453,36 @@ index 0842404..5a25ab8 100644
    }
  
    // Guest divide errors (EmitDivideTraps): the JIT stopped at a brk before the DIV/IDIV wrote anything, so the
-@@ -1263,6 +1357,78 @@ BOOL SetX64Mxcsr(UINT32 Mxcsr) {
- // exception or longjmps. Fills the x87 part of an FXSAVE image (control, status and abridged tag word, the registers
- // in ST(i) order); MXCSR and the XMM registers are left to the caller. The JIT is not running on this thread here, so
- // the thread state holds the current values.
-+// The x86 debug registers of a thread, for ntdll's x64 context operations (NtGetContextThread, NtSetContextThread,
-+// NtContinue). They are the emulator's: the JIT compiles a thread's breakpoints into its code. FALSE for a thread the
-+// emulator does not know yet (created suspended and not started), whose context only the server holds.
-+static std::optional<DWORD> ThreadIdFromHandle(HANDLE Thread) {
-+  if (Thread == GetCurrentThread()) {
-+    return GetCurrentThreadId();
-+  }
-+  THREAD_BASIC_INFORMATION Info;
-+  if (NtQueryInformationThread(Thread, ThreadBasicInformation, &Info, sizeof(Info), nullptr)) {
-+    return std::nullopt;
-+  }
-+  return static_cast<DWORD>(reinterpret_cast<uintptr_t>(Info.ClientId.UniqueThread));
-+}
-+
-+BOOL GetX64DebugRegisters(HANDLE Thread, CONTEXT* Context) {
-+  const auto TID = ThreadIdFromHandle(Thread);
-+  if (!TID) {
-+    return FALSE;
-+  }
-+  std::scoped_lock Lock(ThreadCreationMutex);
-+  const auto It = Threads.find(*TID);
-+  if (It == Threads.end()) {
-+    return FALSE;
-+  }
-+  auto* Target = It->second;
-+  const auto& State = Target->CurrentFrame->State;
-+  const uint64_t* DR = State.dr;
-+  uint64_t DR7 = State.dr7;
-+  if (std::atomic_ref(Target->CurrentFrame->DebugRegistersQueued).load(std::memory_order_acquire)) {
-+    const auto* Data = GetFrontendThreadData(Target);
-+    DR = Data->PendingDR;
-+    DR7 = Data->PendingDR7;
-+  }
-+  const auto Regs = FEXCore::X86State::DebugRegistersForContext(DR, 0, DR7);
+@@ -1257,6 +1314,20 @@ BOOL SetX64Mxcsr(UINT32 Mxcsr) {
+   return TRUE;
+ }
+ 
++// Not part of the Windows emulator interface. What x86-64 Windows keeps of the debug registers a context sets
++// (DebugRegistersAsKept): ntdll puts the debug registers of a context it hands on (SetThreadContext, NtContinue) in
++// this form, and this export tells it that the emulator implements them. Only the Dr fields are read and written.
++void KeepX64DebugRegisters(CONTEXT* Context) {
++  const uint64_t DR[4] = {Context->Dr0, Context->Dr1, Context->Dr2, Context->Dr3};
++  const auto Regs = FEXCore::X86State::DebugRegistersAsKept(DR, Context->Dr7);
 +  Context->Dr0 = Regs.DR[0];
 +  Context->Dr1 = Regs.DR[1];
 +  Context->Dr2 = Regs.DR[2];
 +  Context->Dr3 = Regs.DR[3];
 +  Context->Dr6 = Regs.DR6;
 +  Context->Dr7 = Regs.DR7;
-+  return TRUE;
 +}
 +
-+// The current thread takes them at once. Another thread takes them itself before it runs guest code again: at its
-+// next block start if it is in the JIT, else when it returns to guest code; DR6 is not taken from a context.
-+BOOL SetX64DebugRegisters(HANDLE Thread, const CONTEXT* Context) {
-+  const uint64_t DR[4] = {Context->Dr0, Context->Dr1, Context->Dr2, Context->Dr3};
-+  const auto TID = ThreadIdFromHandle(Thread);
-+  if (!TID) {
-+    return FALSE;
-+  }
-+  if (*TID == GetCurrentThreadId()) {
-+    auto* Self = GetCPUArea().ThreadState();
-+    if (!Self) {
-+      return FALSE;
-+    }
-+    Exception::ApplyDebugRegisters(Self, DR, Context->Dr7, false);
-+    return TRUE;
-+  }
-+  std::scoped_lock Lock(ThreadCreationMutex);
-+  const auto It = Threads.find(*TID);
-+  if (It == Threads.end()) {
-+    return FALSE;
-+  }
-+  auto* Target = It->second;
-+  auto* Data = GetFrontendThreadData(Target);
-+  memcpy(Data->PendingDR, DR, sizeof(DR));
-+  Data->PendingDR7 = Context->Dr7 & FEXCore::X86State::DR7_LEGAL_MASK;
-+  std::atomic_ref(Target->CurrentFrame->DebugRegistersQueued).store(uint8_t {1}, std::memory_order_release);
-+  return TRUE;
-+}
-+
- void GetX87State(XMM_SAVE_AREA32* FltSave) {
-   auto* Thread = GetCPUArea().ThreadState();
-   if (!Thread) {
+ // Not part of the Windows emulator interface. The calling thread's x87 state, for ntdll's RtlCaptureContext and setjmp,
+ // which run as native code and cannot read it: x64 Windows captures the live control word and RtlRestoreContext and
+ // longjmp load it back, so a made up one would reset the precision and rounding of every program that unwinds an
 diff --git a/Source/Windows/ARM64EC/libarm64ecfex.def b/Source/Windows/ARM64EC/libarm64ecfex.def
-index 97086b5..f72af4d 100644
+index 97086b5..e5ff9df 100644
 --- a/Source/Windows/ARM64EC/libarm64ecfex.def
 +++ b/Source/Windows/ARM64EC/libarm64ecfex.def
-@@ -22,5 +22,7 @@ EXPORTS
+@@ -22,5 +22,6 @@ EXPORTS
    ThreadTerm
    UpdateProcessorInformation
    GetX87State
-+  GetX64DebugRegisters
-+  SetX64DebugRegisters
++  KeepX64DebugRegisters
    GetX64Mxcsr
    SetX64Mxcsr
 diff --git a/Source/Windows/Common/Exception.h b/Source/Windows/Common/Exception.h
@@ -1770,3 +1677,6 @@ index e1934fd..ee7bd71 100644
    if (const uint32_t Flags = HostFault ? FEX::Windows::MXCSRFlagsForFloatException(GuestException.ExceptionCode) : 0) {
      // An unmasked SSE exception trapped on the host (the trap enables follow the guest's MXCSR masks in JIT code). x86
      // sets the flag in MXCSR, and 32-bit Windows reports every SIMD floating-point exception as
+-- 
+2.50.1 (Apple Git-155)
+

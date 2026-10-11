@@ -51,9 +51,13 @@ M1 Pro (2026-10-10 and 2026-10-11). The Wine half is `patches-arm64/0022` to `00
   block so the trap comes right after the access, and REP string instructions run one element per
   execution (RIP at the instruction, RCX the count left). A thread with breakpoints compiles into a
   code buffer of its own. No cost without breakpoints; about three times slower while a data
-  breakpoint is set. The ARM64EC module exports `GetX64DebugRegisters` and `SetX64DebugRegisters`
-  for ntdll (`patches-arm64/0029`); the WoW64 module takes them from the 32-bit context. Registers
-  read back as Windows reports them for a 64-bit and for a 32-bit program, which differ (drtest).
+  breakpoint is set. The registers cross ntdll in contexts, like the rest of the x64 state: the
+  ARM64EC module takes them from a context it is entered with and reports them in the contexts it
+  builds, and exports `KeepX64DebugRegisters`, what x86-64 Windows keeps of registers a context sets
+  (ntdll keeps a thread's registers while it is outside the emulator, `patches-arm64/0029`); the
+  WoW64 module takes them from the 32-bit context. Registers read back as Windows reports them for a
+  64-bit and for a 32-bit program, which differ (drtest), from this thread or from another process
+  (drdbg).
 
 32-bit programs were measured with the engine built by CI (it has the i386 half): x87test32 120/128,
 the same eight x87 gaps as the 64-bit build; the string resume and the code patching probe pass.

@@ -98,12 +98,19 @@ dying with an illegal instruction, and guard pages fault. With the FEX build of 
 
 - `0029-ntdll-arm64ec-x64-debug-registers.patch`: the x64 debug registers DR0-DR3, DR6 and DR7.
   The ARM64EC conversions dropped them and the arm64 Unix side answered them with a FIXME, so
-  hardware breakpoints set with `SetThreadContext`, an exception handler's context or `NtContinue`
-  never existed. They belong to the emulator, which compiles a thread's breakpoints into its code
-  (FEX patch 0017), and ntdll hands x64 context operations to it (`GetX64DebugRegisters`,
-  `SetX64DebugRegisters`, for the current thread or another one it knows). A thread created
-  suspended, before the emulator knows it, keeps them in the context the server holds, in the ARM64
-  breakpoint registers with a tag, and gets them with its first context. Contexts the emulator builds
-  carry them the same way, so handlers see them and a hit's DR6. With Hangover's FEX DLLs they are
-  silently ignored, as on Windows on Arm. drtest and drtest32 70 of 70 on an M4, as on x86-64
-  Windows Server 2022 and 2025.
+  hardware breakpoints set with `SetThreadContext`, by a debugger, or in an exception handler's
+  context never existed. The emulator implements them (FEX patch 0017), and they reach it the way
+  the rest of the x64 state does, in contexts: the ARM64 breakpoint registers carry them, tagged.
+  The Unix side keeps a thread's registers while it runs native code or waits, so that the contexts
+  it reports carry them, and hands a change (from the thread itself, another thread or process, a
+  debugger at a debug event) to the emulator with the next context the thread enters it with; a
+  thread that goes back to x64 code through native code gets there through the suspend doorbell.
+  Another thread's go through the server like its other registers: on hosts other than x86 the
+  server now keeps the debug registers a thread reports for itself (it read them from the processor
+  before, which only works on x86). They read back as x86-64 Windows gives them: as they were set
+  until the thread runs with them (what a set keeps is the emulator's to say,
+  `KeepX64DebugRegisters`), then with DR7 bit 10. With Hangover's FEX DLLs they are ignored and read
+  0, as on Windows on Arm. On an M4, drtest and drtest32 71 of 71 and drdbg and drdbg32 25 of 25, as
+  on x86-64 Windows Server 2022 and 2025. A trap can report registers another process changed while
+  it was being dispatched: Windows Server 2025 showed it once for a 64-bit program, and a 32-bit
+  program on the engine shows it more readily (Wine's wow64 reads the 32-bit context back then).

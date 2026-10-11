@@ -1,6 +1,6 @@
 # x86-64 fidelity tests
 
-Eight standalone Windows x64 programs (two of them also built as 32-bit ones) that check what an x86-64 program can observe about the CPU and the
+Nine standalone Windows x64 programs (three of them also built as 32-bit ones) that check what an x86-64 program can observe about the CPU and the
 Windows exception and memory model. They are the regression tests for the arm64 engine line (Wine ARM64EC +
 FEX), and run unchanged on real x86-64 Windows, which is the reference: a check that fails on real Windows is
 a wrong check, not a finding.
@@ -15,6 +15,7 @@ a wrong check, not a finding.
 | `kattest` | known-answer tests for CRC32 (SSE4.2), AES-NI, PCLMULQDQ, SHA-NI (full SHA-1 and SHA-256 blocks), VAES and VPCLMULQDQ against portable C, for every one of them CPUID advertises |
 | `tsctest` | fenced RDTSC monotonic, happens-before across threads and while migrating, RDTSCP, CPUID's TSC frequency against the measured rate |
 | `drtest` | the hardware debug registers DR0-DR3, DR6 and DR7 through Get/SetThreadContext, exception contexts and NtContinue: what reads back (64-bit and 32-bit programs differ), instruction breakpoints (a fault before the instruction, Dr6 B bits, RF on resume and after a fault, per thread, set by handle on a thread created suspended and on one already running), data breakpoints (write and read/write, every length, range edges, unaligned addresses, rep stosb and repe cmpsb traps with Rcx left, another thread's and the kernel's writes); also built as `drtest32.exe` |
+| `drdbg` | the debug registers of a thread in another process, as a debugger or a trainer reaches them: set at a debug event (one raised by native code, OutputDebugString, and an x64 exception), read back, Dr6 at each breakpoint event, continuing with RF and DBG_CONTINUE; set on a thread suspended while it runs x64 code and on one blocked in a wait, read back before and after the thread ran (DR7 bit 10 only shows once it ran), a second breakpoint added to the ones read back, cleared; set on a process created suspended before its first instruction; also built as `drdbg32.exe` |
 
 Output: one line per check, `PASS <id>`, `FAIL <id>: <detail>` or `INFO <id>: <value>`, then
 `SUMMARY <test> pass=N fail=M`; the exit code is the number of failures.
