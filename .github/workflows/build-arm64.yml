@@ -9,8 +9,8 @@
 # programs at Rosetta speed on a compute loop, Vulkan through MoltenVK. What it lacks: a renderer
 # overlay. DXMT needs the Mac driver's Metal glue, which upstream Wine does not carry (CrossOver's
 # tree does), so no overlay is packaged here until CrossOver 27's sources are out or the glue is
-# ported. GStreamer is left out
-# for the same reason the first Intel build left things out: one thing at a time.
+# ported. GStreamer is the official macOS framework, pruned to what winegstreamer uses
+# (gstreamer/prune.py), in frameworks/ as for the Intel engines.
 #
 # FEX: built from FEX 2610 with the series in fex/patches/ (the default since 2026-10-11, the owner's
 # decision). With fex_build: hangover it takes Hangover 11.16's FEX 2608 DLLs instead.
@@ -73,13 +73,46 @@ jobs:
       - name: toolchain
         run: |
           set -euo pipefail
-          # No gstreamer here yet (see the header). MoltenVK and the Vulkan headers for winevulkan.
+          # MoltenVK and the Vulkan headers for winevulkan. GStreamer comes from its own framework (next step).
           brew install -q bison pkg-config ccache gnutls freetype sdl2 libpng jpeg-turbo molten-vk vulkan-headers || true
           echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
           echo "$PWD/toolchains/llvm-mingw/bin" >> "$GITHUB_PATH"
           toolchains/llvm-mingw/bin/arm64ec-w64-mingw32-clang --version | head -1
           toolchains/llvm-mingw/bin/ld.lld --version | head -1
           clang --version | head -1
+      # GStreamer for winegstreamer, which Media Foundation and DirectShow need to play games' videos
+      # (MP4 and H.264, WMV, WebM, Ogg). The official macOS framework, nothing installed: both packages
+      # are expanded flat and gstreamer/unpkg.py unpacks only the components in inputs-arm64.json into
+      # frameworks/GStreamer.framework (the whole devel package would be 4.7 GB). gstreamer/prune.py then
+      # keeps the plugins Wine can use and the libraries they link, thinned to arm64. The licence texts
+      # come from the devel package. Wine is built against a copy with the core and GLib headers.
+      - name: GStreamer
+        run: |
+          set -euo pipefail
+          field() { python3 -c "import json;v=json.load(open('inputs-arm64.json'))['gstreamer']['$1'];print(' '.join(v) if isinstance(v,list) else v)"; }
+          V=$(field version)
+          for p in runtime devel; do
+            curl -sSL --retry 3 -o "gst-$p.pkg" "$(field ${p}_url)"
+            echo "$(field ${p}_sha256)  gst-$p.pkg" | shasum -a 256 -c -
+            pkgutil --expand "gst-$p.pkg" "gst-$p"
+          done
+          F=out/frameworks/GStreamer.framework
+          S=gst-sdk/GStreamer.framework/Versions/1.0
+          python3 gstreamer/unpkg.py "gst-runtime/osx-framework-$V-universal.pkg" "$F"
+          for c in $(field components); do python3 gstreamer/unpkg.py "gst-runtime/$c-$V-universal.pkg" "$F/Versions/1.0"; done
+          mkdir -p gst-sdk && ditto "$F" gst-sdk/GStreamer.framework
+          python3 gstreamer/unpkg.py "gst-devel/base-system-1.0-devel-$V-universal.pkg" "$S" './include/*' './lib/glib-2.0/*'
+          python3 gstreamer/unpkg.py "gst-devel/gstreamer-1.0-core-devel-$V-universal.pkg" "$S" './include/*'
+          python3 gstreamer/prune.py "$F" --thin
+          for c in $(field components); do
+            d="gst-devel/$c-devel-$V-universal.pkg"
+            if [ -d "$d" ]; then python3 gstreamer/unpkg.py "$d" "$F/Versions/1.0" './share/licenses/*'; fi
+          done
+          cp gst-runtime/Resources/license.txt "$F/Versions/1.0/share/licenses/gstreamer-installer-license.txt"
+          ls "$F/Versions/1.0/share/licenses"
+          du -sh "$F"
+          rm -rf gst-runtime gst-devel gst-runtime.pkg gst-devel.pkg
+          echo "GST_SDK=$PWD/$S" >> "$GITHUB_ENV"
       # FEX 2610 with the x86-64 fidelity series (fex/README.md). Both DLLs come from one source tree:
       # libarm64ecfex.dll (x86-64 through ARM64EC) and libwow64fex.dll (x86 through WoW64). The tag's
       # submodule commits are the pinned ones.
@@ -124,17 +157,20 @@ jobs:
             --enable-archs=arm64ec,aarch64,i386 \
             --with-mingw \
             --without-x --without-alsa --without-capi --with-coreaudio --without-cups --without-dbus \
-            --without-fontconfig --with-freetype --with-gnutls --without-gphoto --without-gstreamer \
+            --without-fontconfig --with-freetype --with-gnutls --without-gphoto --with-gstreamer \
             --without-krb5 --without-netapi --without-oss --without-pulse \
             --without-sane --with-sdl --without-udev --without-usb --without-v4l2 \
             --without-pcap --without-ffmpeg --disable-tests --with-vulkan \
             CPPFLAGS="-I$(brew --prefix vulkan-headers)/include" LDFLAGS="-L$(brew --prefix molten-vk)/lib" \
+            GSTREAMER_CFLAGS="-I$GST_SDK/include/gstreamer-1.0 -I$GST_SDK/include/glib-2.0 -I$GST_SDK/lib/glib-2.0/include -I$GST_SDK/include" \
+            GSTREAMER_LIBS="-L$GST_SDK/lib -lgstvideo-1.0 -lgstaudio-1.0 -lgsttag-1.0 -lgstbase-1.0 -lgstreamer-1.0 -lgobject-2.0 -lglib-2.0 -lintl -Wl,-rpath,@loader_path/../../GStreamer.framework/Versions/1.0/lib" \
             CC="ccache /usr/bin/clang" CXX="ccache /usr/bin/clang++" \
             arm64ec_CC="ccache arm64ec-w64-mingw32-clang" aarch64_CC="ccache aarch64-w64-mingw32-clang" \
             i386_CC="ccache i686-w64-mingw32-clang"
           make -j"$(sysctl -n hw.ncpu)"
           make install-lib
           grep -E "SONAME_LIB(VULKAN|FREETYPE|GNUTLS|SDL2) " include/config.h
+          test -f ../out/engine/lib/wine/aarch64-unix/winegstreamer.so
       - name: FEX
         run: |
           set -euo pipefail
@@ -204,6 +240,14 @@ jobs:
           assert not left, left
           print("host libraries in engine/lib:", sorted(seen))
           PY
+          # winegstreamer.so looks for GStreamer at @loader_path/../../GStreamer.framework/Versions/1.0/lib,
+          # that is engine/lib/GStreamer.framework. Highball links it to frameworks/ (EngineStore.linkRuntime);
+          # the same link goes in the tarball so it works on its own. Every library it links must be shipped.
+          ln -s ../../frameworks/GStreamer.framework out/engine/lib/GStreamer.framework
+          for d in $(otool -L out/engine/lib/wine/aarch64-unix/winegstreamer.so | awk '/@rpath\/lib/ {print $1}'); do
+            test -f "out/engine/lib/GStreamer.framework/Versions/1.0/lib/${d#@rpath/}" || { echo "not shipped: $d"; exit 1; }
+          done
+          echo "winegstreamer.so links: $(otool -L out/engine/lib/wine/aarch64-unix/winegstreamer.so | awk '/@rpath\/lib/ {printf "%s ", $1}')"
           # The Homebrew libraries the Unix side links (freetype, gnutls, sdl2 and what they pull
           # in), copied flat into frameworks/. Highball runs every Wine process with
           # DYLD_FALLBACK_LIBRARY_PATH on that directory, and dyld resolves an absolute install name

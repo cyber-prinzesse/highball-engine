@@ -73,7 +73,8 @@ Rosetta on a compute loop, and there is no renderer yet, because DXMT needs the 
 glue that only CrossOver's tree has. Since 2026-10-11 the build has Vulkan through MoltenVK and ships
 the host libraries Wine opens by name (MoltenVK, FreeType, GnuTLS, SDL) in `lib/`, so D3D12 and D3D11
 through vkd3d-proton and DXVK work with those placed in a prefix. They are not packaged as an
-overlay yet. The decision document and the measurements are in Highball's
+overlay yet. Games' videos play through Media Foundation with GStreamer, the official macOS framework
+pruned to 46 MB in `frameworks/` (`gstreamer/`). The decision document and the measurements are in Highball's
 `private/notes/rosetta-transition-plan.md`. The Intel line stays the default for every macOS up to 27.
 
 What an x86-64 program can observe about the CPU and the Windows exception and memory model is

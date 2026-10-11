@@ -36,6 +36,27 @@
     ],
     "note": "The submodules the Windows DLLs need, at the commits the tag records. Built with llvm-mingw for arm64ec (libarm64ecfex.dll) and aarch64 (libwow64fex.dll), Release, no LTO, generic tuning, then installed like Hangover's DLLs. The default since 2026-10-11 (the owner's decision). Hangover's build above stays available."
   },
+  "gstreamer": {
+    "name": "GStreamer 1.28.7, the official macOS framework (universal runtime and devel installer packages from gstreamer.freedesktop.org)",
+    "version": "1.28.7",
+    "runtime_url": "https://gstreamer.freedesktop.org/data/pkg/osx/1.28.7/gstreamer-1.0-1.28.7-universal.pkg",
+    "runtime_size": 153594157,
+    "runtime_sha256": "529fdf4a4027d942e59b5b3564f6400adaa008f63ce5f3fed4ffe35d73911994",
+    "devel_url": "https://gstreamer.freedesktop.org/data/pkg/osx/1.28.7/gstreamer-1.0-devel-1.28.7-universal.pkg",
+    "devel_size": 753854434,
+    "devel_sha256": "72a44870cf02472cbf6e9a84bcc25ee6807dd1c26659a112066373544d365e7a",
+    "components": [
+      "base-system-1.0",
+      "base-crypto",
+      "gstreamer-1.0-core",
+      "gstreamer-1.0-playback",
+      "gstreamer-1.0-codecs",
+      "gstreamer-1.0-codecs-restricted",
+      "gstreamer-1.0-effects",
+      "gstreamer-1.0-libav"
+    ],
+    "note": "Expanded flat with pkgutil and unpacked component by component (gstreamer/unpkg.py), never installed. The runtime components above are merged into frameworks/GStreamer.framework, then gstreamer/prune.py keeps the plugins winegstreamer can use for games and the libraries they link, thinned to arm64 (45 MB). Wine is built against a copy with the core and GLib headers from the devel package. 1.28.8 had no macOS packages on 2026-10-11. Both checksums match the ones published beside the packages."
+  },
   "toolchain": {
     "runner": "macos-26",
     "hostArch": "arm64",
