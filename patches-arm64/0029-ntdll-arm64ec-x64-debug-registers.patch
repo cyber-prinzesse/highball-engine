@@ -1,4 +1,4 @@
-From 08151774d4f2535234e8806422038519ff0b9c05 Mon Sep 17 00:00:00 2001
+From d157117af22d7737cd70a43b2adee22e3881a6d1 Mon Sep 17 00:00:00 2001
 From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
 Date: Sun, 11 Oct 2026 14:25:10 +0200
 Subject: [PATCH] ntdll: the x64 debug registers of an ARM64EC thread
@@ -27,14 +27,14 @@ code), and they cross into it the way the rest of the x64 state does, in context
 With an emulator that does not export KeepX64DebugRegisters (Hangover's FEX) they are ignored and read 0, as on
 Windows on Arm. Native ARM64 debug registers keep their existing path.
 ---
- dlls/ntdll/signal_arm64ec.c    |  64 +++++++++++++++--
+ dlls/ntdll/signal_arm64ec.c    |  66 ++++++++++++++++--
  dlls/ntdll/unix/signal_arm64.c | 121 ++++++++++++++++++++++++++++++++-
  dlls/ntdll/unwind.h            |  32 +++++++++
  server/thread.c                |   6 ++
- 4 files changed, 216 insertions(+), 7 deletions(-)
+ 4 files changed, 218 insertions(+), 7 deletions(-)
 
 diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
-index 45a368b..fbc2f8a 100644
+index 45a368b..571ea3b 100644
 --- a/dlls/ntdll/signal_arm64ec.c
 +++ b/dlls/ntdll/signal_arm64ec.c
 @@ -59,6 +59,7 @@ static void     (WINAPI *pUpdateProcessorInformation)(SYSTEM_CPU_INFORMATION*);
@@ -117,7 +117,7 @@ index 45a368b..fbc2f8a 100644
      return syscall_NtContinueEx( &arm_ctx, args );
  }
  
-@@ -761,6 +795,8 @@ NTSTATUS SYSCALL_API NtGetContextThread( HANDLE handle, CONTEXT *context )
+@@ -761,9 +795,13 @@ NTSTATUS SYSCALL_API NtGetContextThread( HANDLE handle, CONTEXT *context )
      DWORD flags = context->ContextFlags;
      NTSTATUS status;
  
@@ -126,7 +126,12 @@ index 45a368b..fbc2f8a 100644
      if ((status = syscall_NtGetContextThread( handle, &arm_ctx ))) return status;
      x64 = init_x64_xcontext( &full );
      context_arm_to_x64_ex( x64, &arm_ctx );
-@@ -856,6 +892,22 @@ NTSTATUS SYSCALL_API NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context,
++    /* without the emulator's they read 0 */
++    x64->ContextFlags |= flags & CONTEXT_AMD64_DEBUG_REGISTERS;
+     /* the current thread is in native code here: its x87 state is the emulator's */
+     if (handle == GetCurrentThread() && pGetX87State) pGetX87State( &x64->AMD64_Context.FltSave );
+     if (!(x64->ContextFlags & CONTEXT_AMD64_XSTATE & ~CONTEXT_AMD64)) flags &= ~(CONTEXT_AMD64_XSTATE & ~CONTEXT_AMD64);
+@@ -856,6 +894,22 @@ NTSTATUS SYSCALL_API NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context,
      ARM64_NT_CONTEXT arm_ctx;
  
      context_x64_to_arm_xstate( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
@@ -149,7 +154,7 @@ index 45a368b..fbc2f8a 100644
      return syscall_NtRaiseException( rec, &arm_ctx, first_chance );
  }
  
-@@ -882,11 +934,14 @@ NTSTATUS SYSCALL_API NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
+@@ -882,11 +936,14 @@ NTSTATUS SYSCALL_API NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
  NTSTATUS SYSCALL_API NtSetContextThread( HANDLE handle, const CONTEXT *context )
  {
      static const DWORD full = (CONTEXT_AMD64_CONTROL | CONTEXT_AMD64_INTEGER | CONTEXT_AMD64_FLOATING_POINT) & ~CONTEXT_AMD64;
@@ -166,7 +171,7 @@ index 45a368b..fbc2f8a 100644
      {
          /* merge the classes given into the thread's full current state, see NtGetContextThread */
          ARM64_NT_CONTEXT cur_arm = { .ContextFlags = CONTEXT_ARM64_FULL };
-@@ -904,6 +959,7 @@ NTSTATUS SYSCALL_API NtSetContextThread( HANDLE handle, const CONTEXT *context )
+@@ -904,6 +961,7 @@ NTSTATUS SYSCALL_API NtSetContextThread( HANDLE handle, const CONTEXT *context )
          context_x64_to_arm_xstate( &arm_ctx, x64 );
      }
      else context_x64_to_arm_xstate( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
