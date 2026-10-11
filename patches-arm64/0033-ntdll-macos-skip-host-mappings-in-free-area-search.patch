@@ -1,0 +1,92 @@
+From 03130debe76e1fbe398efd7ba51d422c2630a180 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 18:22:36 +0200
+Subject: [PATCH] ntdll: on macOS, skip the host mapping in the way when
+ looking for free memory
+
+map_free_area tries a fixed mapping at every allocation granularity step of a gap between Wine's views
+until one succeeds. On arm64 macOS those gaps hold gigabytes of host mappings Wine has no view for: the
+loader image at 0x170000000, right above the reserved low memory of 0018, then the shared system libraries
+(about 6000 regions up to 0x34a900000 in MSFS 2024's process), and 385 GB the kernel keeps for the GPU at
+0xfc0000000. Every ARM64EC thread allocates its thread data and its emulator stack above 4 GB, so once a
+program has used the reserved space up to 0x170000000, each new thread costs two searches of about 130 000
+failing mach_vm_map calls. After a failed attempt try_map_free_area now asks the kernel which mapping is in
+the way (mach_vm_region) and continues past it, upwards or downwards. Every start it skips overlaps that
+mapping, so the address found is the one the stepping would have found.
+
+Measured on an M4 (macOS 27.0, 2026-10-11) with an x86-64 program under FEX creating and joining threads:
+2440 ms per thread with 4 to 8 GB filled the way MSFS 2024 fills it, 0.535 ms with this patch, 0.37 ms in a
+fresh process either way. MSFS 2024 reached its first boot video 38 s after launch instead of 13 minutes.
+---
+ dlls/ntdll/unix/virtual.c | 41 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 1e74163..6b6784c 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -1611,6 +1611,36 @@ static struct wine_rb_entry *find_view_inside_range( void **base_ptr, void **end
+ }
+ 
+ 
++#ifdef __APPLE__
++/***********************************************************************
++ *           skip_host_mapping
++ *
++ * After a failed fixed mapping at start, the next start worth trying: past the host mapping in the
++ * way rather than one step further. The host holds gigabytes Wine has no view for (the shared system
++ * libraries, the range reserved for the GPU, an emulator's code cache), and stepping through them one
++ * allocation granularity at a time costs a system call per step. NULL when the host reports nothing
++ * in the way.
++ */
++static void *skip_host_mapping( void *start, size_t size, ptrdiff_t step )
++{
++    mach_vm_address_t addr = (mach_vm_address_t)start;
++    mach_vm_size_t region_size = 0;
++    vm_region_basic_info_data_64_t info;
++    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
++    mach_port_t object = MACH_PORT_NULL;
++    size_t mask = (step > 0 ? step : -step) - 1;
++
++    if (mach_vm_region( mach_task_self(), &addr, &region_size, VM_REGION_BASIC_INFO_64,
++                        (vm_region_info_t)&info, &count, &object )) return NULL;
++    if (object != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), object );
++    if (addr >= (mach_vm_address_t)start + size) return NULL;
++    if (step > 0) return ROUND_ADDR( addr + region_size + mask, mask );
++    if (addr < size) return NULL;
++    return ROUND_ADDR( addr - size, mask );
++}
++#endif
++
++
+ /***********************************************************************
+  *           try_map_free_area
+  *
+@@ -1622,6 +1652,10 @@ static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
+ {
+     while (start && base <= start && (char*)start + size <= (char*)end)
+     {
++#ifdef __APPLE__
++        void *next;
++#endif
++
+         if (anon_mmap_tryfixed( start, size, unix_prot, 0 ) != MAP_FAILED) return start;
+         TRACE( "Found free area is already mapped, start %p.\n", start );
+         if (errno != EEXIST)
+@@ -1634,6 +1668,13 @@ static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
+             (step < 0 && (char *)start - (char *)base < -step) ||
+             step == 0)
+             break;
++#ifdef __APPLE__
++        if ((next = skip_host_mapping( start, size, step )) && (step > 0 ? next > start : next < start))
++        {
++            start = next;
++            continue;
++        }
++#endif
+         start = (char *)start + step;
+     }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

@@ -139,3 +139,14 @@ with it (MoltenVK and the Vulkan headers from Homebrew).
   unconverted. MoltenVK reports one layered API where Linux drivers report none, and vkd3d-proton's device setup
   faulted in `vkGetPhysicalDeviceProperties2`. The proper fix belongs in make_vulkan. Verified: a D3D12 device through
   vkd3d-proton on MoltenVK.
+
+- `0033-ntdll-macos-skip-host-mappings-in-free-area-search.patch`: `map_free_area` tries a fixed mapping at every
+  64 KB step of a gap between Wine's views until one succeeds. On arm64 macOS those gaps hold gigabytes of host
+  mappings Wine has no view for: the loader image at 0x170000000 right above the reserved low memory of 0018, the
+  shared system libraries after it, and 385 GB the kernel keeps for the GPU at 0xfc0000000. Every ARM64EC thread
+  allocates its thread data and its emulator stack above 4 GB, so in a program that has used the reserved space up to
+  0x170000000 each new thread cost two searches of about 130 000 failing `mach_vm_map` calls. After a failed attempt
+  `try_map_free_area` now asks the kernel which mapping is in the way (`mach_vm_region`) and continues past it, which
+  finds the same address. On an M4: 2440 ms per thread with 4 to 8 GB filled as MSFS 2024 fills it, 0.535 ms with the
+  patch, 0.37 ms in a fresh process either way. MSFS 2024 reached its first boot video 38 s after launch instead of
+  13 minutes.
