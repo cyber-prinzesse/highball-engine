@@ -27,6 +27,16 @@
 #define CTX_CX(c) ((c)->Ecx)
 #endif
 
+/* What Get/SetThreadContext give back differs between a 64-bit program and a 32-bit one (measured on Windows Server
+ * 2022 and 2025). x64: the kernel keeps the registers only while DR7 has L0-L3, LE or GE set, reports all of them as 0
+ * otherwise, and reads DR7 back with bit 10 set; GE survives. WoW64: an address set with nothing enabled gets LE, the
+ * addresses always read back, and DR7 reads back through the 32-bit mask 0xffff0155 (no bit 10, no GE). */
+#ifdef _WIN64
+#define WOW64 0
+#else
+#define WOW64 1
+#endif
+
 enum { MODE_RF = 0, MODE_PLAIN, MODE_DR7_ZERO, MODE_MOVE_DR0, MODE_KEEP_DR6, MODE_RECORD_ONLY };
 
 static volatile uint8_t *g_fix_page;
@@ -116,7 +126,8 @@ static void arm(int mode) { memset(&g, 0, sizeof(g)); g_mode = mode; g_move_to =
  *   code+48: load the byte at the argument              (the ret after it at RET1R)
  *   code+64: rep stosb; ret                             (rdi, rcx and rax set by stos_thunk)
  *   code+80: store the second argument, 8 bytes, at the first in one access (the ret at RET8)
- *   code+96: store 1 to the byte at the argument */
+ *   code+96: store 1 to the byte at the argument
+ *   code+112: repe cmpsb; ret                           (rsi, rdi, rcx set by cmps_thunk) */
 #ifdef _WIN64
 enum { STORE4 = 32, RET4 = 38, RET1R = 50, RET8 = 86 };
 static const uint8_t loop[] = { 0xb9, 0x05, 0x00, 0x00, 0x00, 0xff, 0xc9, 0x75, 0xfc, 0xc3 };   /* dec ecx is ff c9 */
@@ -145,6 +156,7 @@ static void make_code(void)
 {
     static const uint8_t nops[] = { 0x90, 0x90, 0xc3 };
     static const uint8_t stos[] = { 0xf3, 0xaa, 0xc3 };
+    static const uint8_t cmps[] = { 0xf3, 0xa6, 0xc3 };
 
     code = VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     memset(code, 0xcc, 4096);
@@ -155,6 +167,7 @@ static void make_code(void)
     memcpy(code + 64, stos, sizeof(stos));
     memcpy(code + 80, write8, sizeof(write8));
     memcpy(code + 96, write1, sizeof(write1));
+    memcpy(code + 112, cmps, sizeof(cmps));
     FlushInstructionCache(GetCurrentProcess(), code, 4096);
     fn_nops = (void *)(code + 0);
     fn_loop = (void *)(code + 16);
@@ -173,6 +186,28 @@ static void stos_thunk(void *dst, uintptr_t n, uintptr_t value)
 #else
     __asm__ volatile("call *%3" : "+D"(dst), "+c"(n), "+a"(value) : "r"(f) : "memory", "cc", "edx");
 #endif
+}
+
+/* repe cmpsb over n bytes; returns rcx left and the flags after it */
+static uintptr_t cmps_thunk(const void *a, const void *b, uintptr_t n, uintptr_t *flags)
+{
+    void (*f)(void) = (void *)(code + 112);
+    uintptr_t fl;
+#ifdef _WIN64
+    __asm__ volatile("call *%4; pushf; pop %3" : "+S"(a), "+D"(b), "+c"(n), "=r"(fl) : "r"(f) : "memory", "cc", "rax", "rdx", "r8", "r9", "r10", "r11");
+#else
+    __asm__ volatile("call *%4; pushf; pop %3" : "+S"(a), "+D"(b), "+c"(n), "=r"(fl) : "r"(f) : "memory", "cc", "eax", "edx");
+#endif
+    *flags = fl;
+    return n;
+}
+
+static DWORD WINAPI wait_loop(void *p)
+{
+    HANDLE ev = p;
+    WaitForSingleObject(ev, 10000);
+    fn_nops();
+    return 0;
 }
 
 /* DR7 field helpers: n = register, rw: 0 execute, 1 write, 3 read/write; len: 0 1 byte, 1 2 bytes, 3 4 bytes, 2 8 bytes */
@@ -230,7 +265,7 @@ int main(void)
     get_dr(self, &c);
     fid_check(c.Dr0 == 0x42424240 && c.Dr1 == 0x126bb070, "rt.dr0dr1", "Dr0 %#llx Dr1 %#llx", (unsigned long long)c.Dr0, (unsigned long long)c.Dr1);
     fid_check((c.Dr7 & ~0xdc00ULL) == 0xffff0115, "rt.dr7", "Dr7 %#llx (want ffff0115 outside bits 10-12, 14, 15)", (unsigned long long)c.Dr7);
-    fid_check(c.Dr7 == 0xffff0515, "rt.dr7.value", "%#llx after writing 0xffff0115 (Windows: 0xffff0515, bit 10 reads as 1)", (unsigned long long)c.Dr7);
+    fid_check(c.Dr7 == (WOW64 ? 0xffff0115 : 0xffff0515), "rt.dr7.value", "%#llx after writing 0xffff0115 (Windows x64: 0xffff0515, bit 10 reads as 1; WoW64: 0xffff0115)", (unsigned long long)c.Dr7);
     set_dr(self, 0, 0, 0);
     memset(&c, 0, sizeof(c));
     c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
@@ -245,26 +280,32 @@ int main(void)
     /* addresses without an enable bit in DR7, then every DR7 bit */
     set_dr(self, 0x42424240, 0x126bb070, 0);
     get_dr(self, &c);
-    fid_check(c.Dr0 == 0 && c.Dr1 == 0 && c.Dr7 == 0, "rt.inactive", "Dr0 %#llx Dr1 %#llx Dr7 %#llx after writing addresses with DR7 0 (Windows reports none while no breakpoint is enabled)", (unsigned long long)c.Dr0, (unsigned long long)c.Dr1, (unsigned long long)c.Dr7);
+    if (WOW64)
+        fid_check(c.Dr0 == 0x42424240 && c.Dr1 == 0x126bb070 && c.Dr7 == 0x100, "rt.inactive", "Dr0 %#llx Dr1 %#llx Dr7 %#llx after writing addresses with DR7 0 (WoW64 keeps them and sets LE)", (unsigned long long)c.Dr0, (unsigned long long)c.Dr1, (unsigned long long)c.Dr7);
+    else
+        fid_check(c.Dr0 == 0 && c.Dr1 == 0 && c.Dr7 == 0, "rt.inactive", "Dr0 %#llx Dr1 %#llx Dr7 %#llx after writing addresses with DR7 0 (x64 Windows reports none while DR7 keeps nothing)", (unsigned long long)c.Dr0, (unsigned long long)c.Dr1, (unsigned long long)c.Dr7);
     set_dr(self, 0, 0, 0xffffffffffffffffULL);
     get_dr(self, &c);
-    fid_info("rt.dr7.allbits", "Dr7 %#llx after writing all ones (the bits Windows keeps)", (unsigned long long)c.Dr7);
+    fid_check(c.Dr7 == (WOW64 ? 0xffff0155 : 0xffff0755), "rt.dr7.allbits", "Dr7 %#llx after writing all ones (Windows keeps x64 0xffff0755, WoW64 0xffff0155)", (unsigned long long)c.Dr7);
     set_dr(self, 0, 0, 0xffff0355);
     get_dr(self, &c);
-    fid_info("rt.dr7.ge", "Dr7 %#llx after writing 0xffff0355 (LE and GE)", (unsigned long long)c.Dr7);
+    fid_check(c.Dr7 == (WOW64 ? 0xffff0155 : 0xffff0755), "rt.dr7.ge", "Dr7 %#llx after writing 0xffff0355 (LE and GE; x64 keeps GE, WoW64 does not)", (unsigned long long)c.Dr7);
+    set_dr(self, 0, 0, 0x200);
+    get_dr(self, &c);
+    fid_info("rt.ge.alone", "Dr7 %#llx after writing GE alone", (unsigned long long)c.Dr7);
     /* when LE shows up: an address with only L0, LE alone, an address with LE alone */
     set_dr(self, 0x42424240, 0, 1);
     get_dr(self, &c);
-    fid_info("rt.le.l0", "Dr0 %#llx Dr7 %#llx after writing Dr0 and Dr7 1", (unsigned long long)c.Dr0, (unsigned long long)c.Dr7);
+    fid_check(c.Dr0 == 0x42424240 && c.Dr7 == (WOW64 ? 0x1 : 0x401), "rt.le.l0", "Dr0 %#llx Dr7 %#llx after writing Dr0 and Dr7 1", (unsigned long long)c.Dr0, (unsigned long long)c.Dr7);
     set_dr(self, 0, 0, 0x100);
     get_dr(self, &c);
-    fid_info("rt.le.alone", "Dr0 %#llx Dr7 %#llx after writing Dr7 0x100 and no address", (unsigned long long)c.Dr0, (unsigned long long)c.Dr7);
+    fid_check(c.Dr0 == 0 && c.Dr7 == (WOW64 ? 0x100 : 0x500), "rt.le.alone", "Dr0 %#llx Dr7 %#llx after writing Dr7 0x100 and no address (LE alone keeps the registers)", (unsigned long long)c.Dr0, (unsigned long long)c.Dr7);
     set_dr(self, 0x42424240, 0, 0x100);
     get_dr(self, &c);
-    fid_info("rt.le.addr", "Dr0 %#llx Dr7 %#llx after writing Dr0 and Dr7 0x100", (unsigned long long)c.Dr0, (unsigned long long)c.Dr7);
+    fid_check(c.Dr0 == 0x42424240 && c.Dr7 == (WOW64 ? 0x100 : 0x500), "rt.le.addr", "Dr0 %#llx Dr7 %#llx after writing Dr0 and Dr7 0x100", (unsigned long long)c.Dr0, (unsigned long long)c.Dr7);
     set_dr(self, 0, 0x126bb070, 0);
     get_dr(self, &c);
-    fid_info("rt.le.dr1", "Dr1 %#llx Dr7 %#llx after writing Dr1 and Dr7 0", (unsigned long long)c.Dr1, (unsigned long long)c.Dr7);
+    fid_check(WOW64 ? (c.Dr1 == 0x126bb070 && c.Dr7 == 0x100) : (c.Dr1 == 0 && c.Dr7 == 0), "rt.le.dr1", "Dr1 %#llx Dr7 %#llx after writing Dr1 and Dr7 0 (x64: none kept; WoW64: kept with LE)", (unsigned long long)c.Dr1, (unsigned long long)c.Dr7);
     set_dr(self, 0, 0, 0);
     {
         /* a new thread starts with clear registers while the creator has one set */
@@ -375,7 +416,7 @@ int main(void)
     get_dr(self, &c);
     set_dr(self, 0, 0, 0);
     fid_check(g.hits == 1, "exec.ctx.dr7", "handler wrote Dr7=0 in the context: hits %d over two calls (want 1)", g.hits);
-    fid_check(c.Dr7 == 0, "exec.ctx.dr7.readback", "Dr7 %#llx after the handler cleared it", (unsigned long long)c.Dr7);
+    fid_check(c.Dr7 == (WOW64 ? 0x100 : 0), "exec.ctx.dr7.readback", "Dr7 %#llx after the handler cleared it (WoW64 keeps Dr0 with LE)", (unsigned long long)c.Dr7);
     arm(MODE_MOVE_DR0);
     g_move_to = (uint64_t)code + 1;
     set_dr(self, (uint64_t)code, 0, dr7(0, 0, 0));
@@ -422,6 +463,24 @@ int main(void)
         CloseHandle(ev);
         fid_check(r && c.Dr0 == (uint64_t)code && (c.Dr7 & 1), "exec.thread.set", "set %d, read back by handle Dr0 %#llx Dr7 %#llx", r, (unsigned long long)c.Dr0, (unsigned long long)c.Dr7);
         fid_check(g.hits == 1 && g.rip == (uint64_t)code && g.tid == tid, "exec.thread.hit", "hits %d Rip %#llx in thread %llu (want thread %lu)", g.hits, (unsigned long long)g.rip, (unsigned long long)g.tid, tid);
+    }
+    /* a thread that has started (blocked in a wait), suspended, given a breakpoint by handle, resumed */
+    arm(MODE_RF);
+    {
+        HANDLE ev = CreateEventA(NULL, TRUE, FALSE, NULL);
+        HANDLE t = run_thread(wait_loop, ev, 0);
+        DWORD tid = GetThreadId(t);
+        Sleep(50);
+        SuspendThread(t);
+        r = set_dr(t, (uint64_t)code, 0, dr7(0, 0, 0));
+        get_dr(t, &c);
+        ResumeThread(t);
+        SetEvent(ev);
+        WaitForSingleObject(t, 5000);
+        CloseHandle(t);
+        CloseHandle(ev);
+        fid_check(r && c.Dr0 == (uint64_t)code && (c.Dr7 & 1), "exec.thread.started.set", "set %d, read back by handle Dr0 %#llx Dr7 %#llx", r, (unsigned long long)c.Dr0, (unsigned long long)c.Dr7);
+        fid_check(g.hits == 1 && g.rip == (uint64_t)code && g.tid == tid, "exec.thread.started.hit", "hits %d Rip %#llx in thread %llu (want thread %lu)", g.hits, (unsigned long long)g.rip, (unsigned long long)g.tid, tid);
     }
     get_dr(self, &c);
     fid_check(c.Dr0 == 0 && c.Dr7 == 0, "exec.thread.self", "the main thread's registers after setting another thread's: Dr0 %#llx Dr7 %#llx", (unsigned long long)c.Dr0, (unsigned long long)c.Dr7);
@@ -498,6 +557,20 @@ int main(void)
     fid_check(g.hits == 1, "data.string", "rep stosb over the range: hits %d", g.hits);
     fid_check(g.rip == (uint64_t)code + 64 && g.rcx == 15, "data.string.rip", "Rip %+lld from the rep stosb, Rcx %llu (x86 traps after the iteration that wrote the byte: Rip at the rep, Rcx the 15 bytes left)", (long long)(g.rip - ((uint64_t)code + 64)), (unsigned long long)g.rcx);
     fid_check(buf[31] == 0x55, "data.string.done", "the string instruction completed after the trap: buf[31] %#x", buf[31]);
+    /* repe cmpsb over two equal 32-byte buffers with a read breakpoint on the second one's byte 16: the trap comes
+     * after that element with Rip at the instruction and Rcx the 15 elements left, then the compare completes */
+    {
+        static uint8_t ca[32], cb[32];
+        uintptr_t left, fl;
+        memset(ca, 0x33, sizeof(ca));
+        memset(cb, 0x33, sizeof(cb));
+        arm(MODE_RECORD_ONLY);
+        set_dr(self, (uint64_t)cb + 16, 0, dr7(0, 3, 0));
+        left = cmps_thunk(ca, cb, 32, &fl);
+        set_dr(self, 0, 0, 0);
+        fid_check(g.hits == 1 && g.rip == (uint64_t)code + 112 && g.rcx == 15, "data.cmps", "hits %d Rip %+lld from the repe cmpsb Rcx %llu (want 1 hit at +0 with 15 left)", g.hits, (long long)(g.rip - ((uint64_t)code + 112)), (unsigned long long)g.rcx);
+        fid_check(left == 0 && (fl & 0x40), "data.cmps.done", "after the trap the compare finished: Rcx %llu, ZF %d", (unsigned long long)left, !!(fl & 0x40));
+    }
     /* another thread writing the range with its own registers clear */
     arm(MODE_RECORD_ONLY);
     set_dr(self, (uint64_t)buf + 4, 0, dr7(0, 1, 3));
