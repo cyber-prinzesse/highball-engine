@@ -1,4 +1,4 @@
-From d157117af22d7737cd70a43b2adee22e3881a6d1 Mon Sep 17 00:00:00 2001
+From 09e0abfa6b0e0a84034cf8b1ece2e3d349f1cfe0 Mon Sep 17 00:00:00 2001
 From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
 Date: Sun, 11 Oct 2026 14:25:10 +0200
 Subject: [PATCH] ntdll: the x64 debug registers of an ARM64EC thread
@@ -180,7 +180,7 @@ index 45a368b..571ea3b 100644
  }
  
 diff --git a/dlls/ntdll/unix/signal_arm64.c b/dlls/ntdll/unix/signal_arm64.c
-index 63075f7..3b1ab5b 100644
+index 63075f7..d1ee3de 100644
 --- a/dlls/ntdll/unix/signal_arm64.c
 +++ b/dlls/ntdll/unix/signal_arm64.c
 @@ -66,7 +66,9 @@ WINE_DEFAULT_DEBUG_CHANNEL(seh);
@@ -200,11 +200,11 @@ index 63075f7..3b1ab5b 100644
  
 +/* An ARM64EC thread's x64 debug registers. The emulator implements them while the thread runs x64 code: it takes
 + * them from the context it is entered with and reports them in the contexts it builds. This side keeps them for the
-+ * thread (x64_debug), so that the contexts it reports carry them, and takes the ones a context hands over from
-+ * elsewhere (SetThreadContext from another thread or process, a debugger, through the server): those are pending
-+ * until the emulator gets them with the next context it is entered with. A thread that goes back to x64 code through
-+ * native code instead gets there by the doorbell, which makes the emulator stop at its next block start and come
-+ * back through a context. Contexts carry them in the breakpoint registers, tagged in Bcr[7] (see
++ * thread (x64_debug), so that the contexts it reports carry them, and takes the ones a context hands over (the
++ * thread's own SetThreadContext and NtContinue, another thread or process and a debugger through the server): those
++ * are pending until the emulator gets them with the next context it is entered with. A thread that goes back to x64
++ * code through native code instead gets there by the doorbell, which makes the emulator stop at its next block start
++ * and come back through a context. Contexts carry them in the breakpoint registers, tagged in Bcr[7] (see
 + * dlls/ntdll/unwind.h): Bvr[0-3] Dr0-Dr3, Bvr[4] Dr6, Bvr[5] Dr7. */
 +#define ARM64EC_X64_DEBUG_TAG      0x52443436  /* "64DR" */
 +#define ARM64EC_X64_DEBUG_DOORBELL 1           /* a suspend rings ~0 */
