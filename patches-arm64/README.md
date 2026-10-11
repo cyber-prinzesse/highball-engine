@@ -37,10 +37,13 @@ CrossOver 27's sources are published or the glue is ported (about 500 lines).
 The rest makes x86-64 programs see what real x86-64 Windows shows them (2026-10-11, M1 Pro, macOS
 27.0). Each finding comes from a check in `tests/x64-fidelity`, whose expectations hold on real
 x86-64 Windows (the `x64-fidelity` workflow). 0022 to 0024 come from the FEX and arm64 spikes of
-2026-10-09 and 2026-10-10. With Hangover's FEX DLLs (the default) every one of them is harmless:
-the state they carry is simply absent, and the hooks that ask the emulator fall back when its
-exports are missing. With the FEX build of `fex/patches/` (`fex_build: source`) they are its other
-half.
+2026-10-09 and 2026-10-10. With Hangover's FEX DLLs (the default) they break nothing that works on
+main's engine, checked with the whole `tests/x64-fidelity` suite on an M1 Pro (build-arm64 run
+38126527000 against run 37245359313). The state they carry is simply absent there, and the hooks
+that ask the emulator fall back when its exports are missing. 0022 to 0024 help even then: a
+program that unmasks a floating-point exception through the CRT gets the exception instead of
+dying with an illegal instruction, and guard pages fault. With the FEX build of `fex/patches/`
+(`fex_build: source`) they are its other half.
 
 - `0022-ntdll-arm64-macos-fp-trap-sigill.patch`: Apple silicon implements the FPCR trap enables,
   and macOS reports a trapped floating-point exception as SIGILL with ILL_ILLTRP instead of
