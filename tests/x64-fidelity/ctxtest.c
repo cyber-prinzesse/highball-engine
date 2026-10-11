@@ -900,12 +900,20 @@ static void seh_case(const char *id, int raise)
     CHECK_EQ64(name, (uintptr_t)g_seh_frame, g_saved_rsp);
     sprintf(name, "%s.controlpc", id);
     fid_info(name, "%+lld relative to seh_outer_catch", (long long)(g_seh_controlpc - (uintptr_t)seh_outer_catch));
-    /* the handler's context holds the inner values (live at the fault or the call) */
+    /* the handler's context holds the inner values (live at the fault). A raised exception's context is the one
+     * inside RaiseException, whose own frame may use nonvolatile registers (Windows Server 2025 shows rbx 0 there):
+     * recorded only */
     sprintf(name, "%s.ctx.gpr", id);
-    fid_check(cmp_gprs(&g_seh_ctx.Rax, g_inner.gpr, NONVOL_GPRS), name, "%s", g_why);
+    if (!raise)
+        fid_check(cmp_gprs(&g_seh_ctx.Rax, g_inner.gpr, NONVOL_GPRS), name, "%s", g_why);
+    else if (!cmp_gprs(&g_seh_ctx.Rax, g_inner.gpr, NONVOL_GPRS))
+        fid_info(name, "%s", g_why);
     sprintf(name, "%s.ctx.xmm", id);
-    fid_check(cmp_vec((const uint8_t *)&g_seh_ctx.FltSave.XmmRegisters[6], g_inner.ymm[6], 10, 16, 32, 16, "xmm6+"),
-              name, "%s", g_why);
+    if (!raise)
+        fid_check(cmp_vec((const uint8_t *)&g_seh_ctx.FltSave.XmmRegisters[6], g_inner.ymm[6], 10, 16, 32, 16, "xmm6+"),
+                  name, "%s", g_why);
+    else if (!cmp_vec((const uint8_t *)&g_seh_ctx.FltSave.XmmRegisters[6], g_inner.ymm[6], 10, 16, 32, 16, "xmm6+"))
+        fid_info(name, "%s", g_why);
     sprintf(name, "%s.ctx.fcw", id);
     fid_check(g_seh_ctx.FltSave.ControlWord == g_outer.fcw, name, "ControlWord %#x want %#x", g_seh_ctx.FltSave.ControlWord,
               g_outer.fcw);

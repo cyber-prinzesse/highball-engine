@@ -3,7 +3,8 @@
  * FXAM on every class (normal, zero, infinity, NaN, denormal, unsupported encodings, empty) with C0-C3;
  * full tag word (FNSTENV/FNSAVE) and abridged tag (FXSAVE); TOP through pushes, FINCSTP/FDECSTP/FFREE;
  * FNSAVE re-initialisation and FRSTOR/FLDENV round trips; precision and rounding control; masked exception
- * flags (IE, DE, ZE, OE, UE, PE) and stack fault (SF, C1); FPREM/FPREM1 quotient bits; FCOM/FUCOM/FCOMI;
+ * flags (IE, DE, ZE, OE, UE, PE) and stack fault (SF, C1); FPREM/FPREM1 values, quotient bits and partial
+ * reduction (C2); FCOM/FUCOM/FCOMI;
  * FIST out of range; FRNDINT per RC; MMX aliasing (TOP 0, tags valid, exponent 0xFFFF, EMMS);
  * MXCSR control/status (round trip, sticky flags, DAZ, FTZ, RC); the CRT's _controlfp against MXCSR.
  * Build: x86_64-w64-mingw32-clang -O2 x87test.c -o x87test.exe */
@@ -379,6 +380,76 @@ static void group_compare(void)
     (void)one;
 }
 
+/* ---------------------------------------------------------------- FPREM and FPREM1 in full */
+
+/* FPREM (one = 0) or FPREM1 on ST(0) = *a, ST(1) = b, repeated while C2 says the reduction is partial, as programs
+ * loop; returns the last status word, *a the remainder */
+static uint16_t fprem_loop(f80 *a, f80 b, int one, unsigned *steps, uint16_t *first_sw)
+{
+    uint16_t sw = 0;
+    unsigned n;
+    for (n = 0; n < 4096; n++)
+    {
+        if (one)
+            __asm__ volatile("fninit\n\tfldt %2\n\tfldt %1\n\tfprem1\n\tfnstsw %0\n\tfstpt %1\n\tfninit\n\tfldcw %3"
+                             : "=m"(sw), "+m"(*a) : "m"(b), "m"(FCW_DEFAULT) : "memory");
+        else
+            __asm__ volatile("fninit\n\tfldt %2\n\tfldt %1\n\tfprem\n\tfnstsw %0\n\tfstpt %1\n\tfninit\n\tfldcw %3"
+                             : "=m"(sw), "+m"(*a) : "m"(b), "m"(FCW_DEFAULT) : "memory");
+        if (!n) *first_sw = sw;
+        if (!(sw & C2)) break;
+    }
+    *steps = n + 1;
+    return sw;
+}
+
+static void group_fprem(void)
+{
+    static const struct
+    {
+        const char *name;
+        int one;
+        uint16_t a_sexp; uint64_t a_mant;
+        uint16_t b_sexp; uint64_t b_mant;
+        uint16_t want_sexp; uint64_t want_mant;
+        unsigned q;          /* Q2 Q1 Q0, in C0 C3 C1 */
+        int partial;         /* the first step leaves C2 set */
+        uint16_t flags;      /* exception flags wanted in the status word (IE 1, DE 2) */
+    } c[] =
+    {
+        { "fprem.neg",          0, 0xc001, 0xe000000000000000ull, 0x4000, 0x8000000000000000ull, 0xbfff, 0x8000000000000000ull, 3, 0, 0 }, /* -7 mod 2 = -1 */
+        { "fprem.frac",         0, 0x4001, 0xf000000000000000ull, 0x4000, 0x8000000000000000ull, 0x3fff, 0xc000000000000000ull, 3, 0, 0 }, /* 7.5 mod 2 = 1.5 */
+        { "fprem1.tie_even",    1, 0x4001, 0xa000000000000000ull, 0x4000, 0x8000000000000000ull, 0x3fff, 0x8000000000000000ull, 2, 0, 0 }, /* 5 rem 2 = 1, Q 2 */
+        { "fprem1.neg_up",      1, 0xc001, 0xe000000000000000ull, 0x4000, 0x8000000000000000ull, 0x3fff, 0x8000000000000000ull, 4, 0, 0 }, /* -7 rem 2 = 1, Q 4 */
+        { "fprem1.half_up",     1, 0x4000, 0xc000000000000000ull, 0x4001, 0x8000000000000000ull, 0xbfff, 0x8000000000000000ull, 1, 0, 0 }, /* 3 rem 4 = -1 */
+        { "fprem1.half_tie",    1, 0x4000, 0x8000000000000000ull, 0x4001, 0x8000000000000000ull, 0x4000, 0x8000000000000000ull, 0, 0, 0 }, /* 2 rem 4 = 2 */
+        { "fprem1.half_neg",    1, 0xc000, 0xc000000000000000ull, 0x4001, 0x8000000000000000ull, 0x3fff, 0x8000000000000000ull, 1, 0, 0 }, /* -3 rem 4 = 1 */
+        { "fprem.wide",         0, 0x403e, 0xffffffffffffffffull, 0x4001, 0xe000000000000000ull, 0x3fff, 0x8000000000000000ull, 2, 0, 0 }, /* (2^64-1) mod 7 = 1 */
+        { "fprem.partial",      0, 0x4063, 0x8000000000000000ull, 0x4000, 0xc000000000000000ull, 0x3fff, 0x8000000000000000ull, 5, 1, 0 }, /* 2^100 mod 3 = 1 */
+        { "fprem1.partial",     1, 0x4063, 0x8000000000000000ull, 0x4000, 0xc000000000000000ull, 0x3fff, 0x8000000000000000ull, 5, 1, 0 }, /* 2^100 rem 3 = 1 */
+        { "fprem.multiple",     0, 0x4063, 0x8000000000000000ull, 0x3f9b, 0x8000000000000000ull, 0x0000, 0x0000000000000000ull, 0, 1, 0 }, /* 2^100 mod 2^-100 = 0 */
+        { "fprem.denormal",     0, 0x3fff, 0x8000000000000000ull, 0x0000, 0x0000200000000000ull, 0x0000, 0x0000000000000000ull, 0, 1, 2 }, /* 1 mod 2^-16400 = 0, DE */
+        { "fprem.inf_divisor",  0, 0x4001, 0xa000000000000000ull, 0x7fff, 0x8000000000000000ull, 0x4001, 0xa000000000000000ull, 0, 0, 0 }, /* 5 mod inf = 5 */
+        { "fprem.zero",         0, 0x8000, 0x0000000000000000ull, 0x4001, 0xa000000000000000ull, 0x8000, 0x0000000000000000ull, 0, 0, 0 }, /* -0 mod 5 = -0 */
+        { "fprem.inf_dividend", 0, 0x7fff, 0x8000000000000000ull, 0x4001, 0xa000000000000000ull, 0xffff, 0xc000000000000000ull, 0, 0, 1 }, /* invalid */
+        { "fprem.zero_divisor", 0, 0x4001, 0xa000000000000000ull, 0x0000, 0x0000000000000000ull, 0xffff, 0xc000000000000000ull, 0, 0, 1 }, /* invalid */
+    };
+    unsigned i;
+    for (i = 0; i < sizeof(c) / sizeof(c[0]); i++)
+    {
+        f80 a = mk(c[i].a_sexp, c[i].a_mant), b = mk(c[i].b_sexp, c[i].b_mant);
+        unsigned steps, q;
+        uint16_t first = 0, sw = fprem_loop(&a, b, c[i].one, &steps, &first);
+        int value_ok = sexp_of(&a) == c[i].want_sexp && mant_of(&a) == c[i].want_mant;
+        q = (!!(sw & C0) << 2) | (!!(sw & C3) << 1) | !!(sw & C1);
+        fid_check(value_ok && (c[i].flags & 1 || q == c[i].q) && (sw & c[i].flags) == c[i].flags && !!(first & C2) == c[i].partial,
+                  c[i].name, "%04x:%016llx Q %u in %u steps (first C2 %d) fsw %#x, want %04x:%016llx Q %u%s%s", sexp_of(&a),
+                  (unsigned long long)mant_of(&a), q, steps, !!(first & C2), sw, c[i].want_sexp, (unsigned long long)c[i].want_mant,
+                  c[i].q, c[i].partial ? ", partial first" : "", c[i].flags & 2 ? ", DE" : c[i].flags & 1 ? ", IE" : "");
+        if (c[i].partial) fid_info(c[i].name, "%u steps", steps);
+    }
+}
+
 /* ---------------------------------------------------------------- MMX aliasing */
 
 static void group_mmx(void)
@@ -584,6 +655,7 @@ int main(int argc, char **argv)
     group_control();
     group_flags();
     group_compare();
+    group_fprem();
     group_mmx();
     group_pointers();
     group_mxcsr();
