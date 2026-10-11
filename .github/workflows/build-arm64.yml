@@ -22,6 +22,11 @@ on:
         description: "why this build (free text, goes in the artifact name)"
         required: false
         default: "manual"
+      fex_build:
+        description: "FEX DLLs: hangover (Hangover 11.16, FEX 2608) or source (FEX 2610 + fex/patches/, see fex/README.md)"
+        type: choice
+        options: [hangover, source]
+        default: hangover
 permissions:
   contents: write
 jobs:
@@ -68,6 +73,29 @@ jobs:
           toolchains/llvm-mingw/bin/arm64ec-w64-mingw32-clang --version | head -1
           toolchains/llvm-mingw/bin/ld.lld --version | head -1
           clang --version | head -1
+      # FEX 2610 with the x86-64 fidelity series (fex/README.md), in place of Hangover's DLLs. Both DLLs
+      # come from one source tree: libarm64ecfex.dll (x86-64 through ARM64EC) and libwow64fex.dll (x86
+      # through WoW64). The tag's submodule commits are the pinned ones.
+      - name: FEX from source
+        if: ${{ github.event.inputs.fex_build == 'source' }}
+        run: |
+          set -euo pipefail
+          field() { python3 -c "import json;v=json.load(open('inputs-arm64.json'))['fex-source']['$1'];print(' '.join(v) if isinstance(v,list) else v)"; }
+          git clone -q --depth 1 --branch "$(field tag)" "$(field url)" fex-src
+          test "$(git -C fex-src rev-parse HEAD)" = "$(field commit)"
+          git -C fex-src submodule update -q --init $(field submodules)
+          for p in fex/patches/*.patch; do echo "applying $p"; git -C fex-src apply "../$p"; done
+          brew install -q ninja || true
+          for t in arm64ec:arm64ecfex aarch64:wow64fex; do
+            triple=${t%%:*}; target=${t##*:}
+            cmake -G Ninja -S fex-src -B "fexbuild-$triple" -DCMAKE_TOOLCHAIN_FILE="$PWD/fex-src/Data/CMake/toolchain_mingw.cmake" \
+              -DMINGW_TRIPLE="$triple-w64-mingw32" -DCMAKE_BUILD_TYPE=Release -DENABLE_LTO=False -DBUILD_TESTING=OFF \
+              -DENABLE_ASSERTIONS=OFF -DBUILD_FEXCONFIG=OFF -DTUNE_CPU=generic -DTUNE_ARCH=generic > "fexbuild-$triple.log" \
+              || { tail -40 "fexbuild-$triple.log"; exit 1; }
+            ninja -C "fexbuild-$triple" "$target"
+          done
+          cp fexbuild-arm64ec/Bin/libarm64ecfex.dll fexbuild-aarch64/Bin/libwow64fex.dll fex-dlls/
+          ls -la fex-dlls
       - name: ccache
         uses: actions/cache@v4
         with:
@@ -191,4 +219,6 @@ jobs:
           set -euo pipefail
           f=$(ls engine-arm64-*.tar.gz | head -1)
           tag="${f%.tar.gz}"
-          gh release create "$tag" "$f" "$f.sha256" --title "$tag" --notes "Native arm64 Wine from the pinned upstream source (inputs-arm64.json) with the patch series in patches-arm64/ and FEX (Hangover 11.16) under Wine's emulator names. Runs through Highball's signed Wine loader only. No renderer overlay yet. Built by run ${{ github.run_id }}. Checksum in the .sha256 file."
+          fex="FEX (Hangover 11.16)"
+          if [ "${{ github.event.inputs.fex_build }}" = source ]; then fex="FEX 2610 built with fex/patches/"; fi
+          gh release create "$tag" "$f" "$f.sha256" --title "$tag" --notes "Native arm64 Wine from the pinned upstream source (inputs-arm64.json) with the patch series in patches-arm64/ and $fex under Wine's emulator names. Runs through Highball's signed Wine loader only. No renderer overlay yet. Built by run ${{ github.run_id }}. Checksum in the .sha256 file."

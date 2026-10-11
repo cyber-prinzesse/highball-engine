@@ -1,0 +1,75 @@
+From 6a494aa02d679101d24de54a8cdb7d8d185988e0 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 08:13:41 +0200
+Subject: [PATCH 4/4] ntdll: route the ARM64EC x64 information hooks through
+ the emulator
+
+__os_arm64x_get_x64_information and __os_arm64x_set_x64_information are how the CRT's _controlfp reads and sets MXCSR for x64 code, and how it reads the x87 control word. MXCSR's exception masks belong to the emulator (it arms the FPCR trap enables for x64 code only, native code must not trap), so they now come from and go to its GetX64Mxcsr and SetX64Mxcsr, while RC, FZ, DAZ and the status flags stay in FPCR and FPSR; without those exports the hooks behave as before. The x87 control word comes from GetX87State instead of a fixed 0x27f.
+---
+ dlls/ntdll/signal_arm64ec.c | 22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index ab95f38..f3ca72f 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -56,8 +56,11 @@ static void     (WINAPI *pResetToConsistentState)(EXCEPTION_RECORD*,CONTEXT*,ARM
+ static NTSTATUS (WINAPI *pThreadInit)(void);
+ static void     (WINAPI *pThreadTerm)(HANDLE,LONG);
+ static void     (WINAPI *pUpdateProcessorInformation)(SYSTEM_CPU_INFORMATION*);
+-/* emulator extension: the calling thread's x87 state, which native code cannot read */
++/* emulator extensions: the calling thread's x87 state, which native code cannot read, and the MXCSR control bits,
++ * whose exception masks the emulator keeps (native code runs with the trap enables off) */
+ static void     (WINAPI *pGetX87State)(XMM_SAVE_AREA32*);
++static BOOL     (WINAPI *pGetX64Mxcsr)(UINT*);
++static BOOL     (WINAPI *pSetX64Mxcsr)(UINT);
+ 
+ static BOOLEAN emulated_processor_features[PROCESSOR_FEATURE_MAX];
+ static BYTE KiUserExceptionDispatcher_orig[16]; /* to detect patching */
+@@ -243,6 +246,8 @@ NTSTATUS arm64ec_process_init( HMODULE module )
+     GET_PTR( ThreadTerm );
+     GET_PTR( UpdateProcessorInformation );
+     GET_PTR( GetX87State );
++    GET_PTR( GetX64Mxcsr );
++    GET_PTR( SetX64Mxcsr );
+ #undef GET_PTR
+ 
+     RtlGetCurrentPeb()->ChpeV2ProcessInfo = info;
+@@ -983,14 +988,23 @@ static NTSTATUS WINAPI LdrpGetX64Information( ULONG type, void *output, void *ex
+     case 0:
+     {
+         UINT64 fpcr, fpsr;
++        UINT mxcsr, masks;
+ 
+         __asm__ __volatile__( "mrs %0, fpcr; mrs %1, fpsr" : "=r" (fpcr), "=r" (fpsr) );
+-        *(UINT *)output = fpcsr_to_mxcsr( fpcr, fpsr );
++        mxcsr = fpcsr_to_mxcsr( fpcr, fpsr );
++        /* the exception masks are the emulator's, the rest is in FPCR and FPSR */
++        if (pGetX64Mxcsr && pGetX64Mxcsr( &masks )) mxcsr = (mxcsr & ~0x1f80) | (masks & 0x1f80);
++        *(UINT *)output = mxcsr;
+         return STATUS_SUCCESS;
+     }
+     case 2:
+-        *(UINT *)output = 0x27f;  /* hard-coded x87 control word */
++    {
++        XMM_SAVE_AREA32 fx = { .ControlWord = 0x27f };  /* the x64 default without an emulator */
++
++        if (pGetX87State) pGetX87State( &fx );
++        *(UINT *)output = fx.ControlWord;
+         return STATUS_SUCCESS;
++    }
+     default:
+         FIXME( "not implemented type %lu\n", type );
+         return STATUS_INVALID_PARAMETER;
+@@ -1007,6 +1021,8 @@ static NTSTATUS WINAPI LdrpSetX64Information( ULONG type, ULONG_PTR input, void
+     case 0:
+     {
+         UINT64 fpcsr = mxcsr_to_fpcsr( input );
++        /* the emulator keeps the exception masks and arms them for x64 code; native code must not trap */
++        if (pSetX64Mxcsr && pSetX64Mxcsr( input )) fpcsr &= ~(UINT64)0x9f00;
+         __asm__ __volatile__( "msr fpcr, %0; msr fpsr, %1" :: "r" (fpcsr), "r" (fpcsr >> 32) );
+         return STATUS_SUCCESS;
+     }
+-- 
+2.50.1 (Apple Git-155)
+

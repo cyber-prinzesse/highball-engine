@@ -1,0 +1,78 @@
+From 45139c6e595ffc0d731ff60ac6e11c3584800fd0 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 08:59:17 +0200
+Subject: [PATCH 12/13] Skip FPCR writes that change nothing
+
+Writing FPCR costs about 4 ns on Apple cores even when the value does not change; reading it costs almost nothing. The
+fp-exceptions change made every fill and spill of the static registers write FPCR on hosts without AFP (the M1), which
+had never written it there, so every call from x64 code into ARM64EC code got 5.6 ns slower (27.2 to 32.8 ns for
+GetCurrentThreadId on an M1 Pro). The fill now writes FPCR only when the value differs, the spill only when a trap enable
+is armed (tested with cbz, NZCV is still live there), and ExitFunctionEC only when it has bits to clear, which saves the
+write stock FEX made on every exit too. Back to 27.4 ns; x87 and SSE throughput unchanged.
+---
+ .../Interface/Core/ArchHelpers/Arm64Emitter.cpp    | 14 ++++++++++++++
+ Source/Windows/ARM64EC/Module.S                    | 11 +++++++----
+ 2 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+index d4bfc23..8986ec4 100644
+--- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
++++ b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+@@ -675,7 +675,14 @@ void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Regi
+   }
+ 
+   if (SupportsAFP || SupportsFloatExceptions) {
++    // Writing FPCR costs about 4 ns on Apple cores even when nothing changes, reading it almost nothing: skip the
++    // write in the common case (no trap enable armed, AFP bits already set)
++    ARMEmitter::ForwardLabel Unchanged;
++    mrs(TmpReg2, ARMEmitter::SystemRegister::FPCR);
++    eor(ARMEmitter::Size::i64Bit, TmpReg2, TmpReg2, TmpReg);
++    (void)cbz(ARMEmitter::Size::i64Bit, TmpReg2, &Unchanged);
+     msr(ARMEmitter::SystemRegister::FPCR, TmpReg);
++    (void)Bind(&Unchanged);
+   }
+ #endif
+ 
+@@ -721,10 +728,17 @@ void Arm64Emitter::SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOp
+     }
+     msr(ARMEmitter::SystemRegister::FPCR, TmpReg);
+   } else if (EmitterCTX->HostFeatures.SupportsFloatExceptions) {
++    // Without AFP there is nothing to clear unless a trap enable is armed (bits 8-12 and 15; 13 and 14 are RES0), and
++    // writing FPCR is slow: test first, without touching NZCV, which is spilled below
++    ARMEmitter::ForwardLabel NoTraps;
++    mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
++    and_(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, 0xff00);
++    (void)cbz(ARMEmitter::Size::i64Bit, TmpReg, &NoTraps);
+     mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
+     bic(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, 0x1f00);
+     bic(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, 0x8000);
+     msr(ARMEmitter::SystemRegister::FPCR, TmpReg);
++    (void)Bind(&NoTraps);
+   }
+ #endif
+ 
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index deee6c3..754511c 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -57,10 +57,13 @@ BeginSimulation:
+ ExitFunctionEC:
+   // Clear any the AFP NEP and AH bits in FPCR as native code won't expect their behaviour.
+   mrs x17, fpcr
+-  and x17, x17, #~6 // NEP + AH
+-  and x17, x17, #~0x1f00 // floating-point trap enables IOE DZE OFE UFE IXE (armed from MXCSR while in the JIT)
+-  and x17, x17, #~0x8000 // IDE
+-  msr fpcr, x17
++  and x16, x17, #~6 // NEP + AH
++  and x16, x16, #~0x1f00 // floating-point trap enables IOE DZE OFE UFE IXE (armed from MXCSR while in the JIT)
++  and x16, x16, #~0x8000 // IDE
++  eor x17, x17, x16 // writing FPCR is slow on Apple cores, skip it when nothing changes
++  cbz x17, 1f
++  msr fpcr, x16
++1:
+   ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
+   strb wzr, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
+   ldr x17, [x17, #0x20] // ChpeV2CpuAreaInfo->SuspendDoorbell
+-- 
+2.50.1 (Apple Git-155)
+

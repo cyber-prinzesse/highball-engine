@@ -1,0 +1,205 @@
+From ab2ef6f971eda9c8e220a64a9b09ce8f7ec50138 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 08:05:24 +0200
+Subject: [PATCH 03/13] ARM64EC: carry the x64 state the ARM64 context has no
+ room for through ntdll
+
+The ARM64EC register mapping keeps the x87 registers but not the x87 control, status and tag words, the MXCSR control bits beyond what FPCR holds (DAZ), or the EFLAGS bits NZCV cannot express (PF, AF, DF, TF and the rest). Every exception and every continue lost them: handlers saw a default control word, a continued context reset the x87 state, and DF, PF and AF came back from stale JIT state.
+
+StoreStateToPackedECContext now also packs X13 = FCW | FSW << 16 | abridged FTW << 32, X14 = MXCSR | EFLAGS << 32 and X28 = a marker with flags (x87, YMM upper halves in V16-V31). These registers are reserved in ARM64EC code, so the values survive ntdll's conversion, and Wine's context_arm_to_x64 turns them into the x64 context (tagged in FltSave reserved bytes). LoadStateFromECContext reads the control words, the x87 registers in ST order and EFLAGS back from a tagged context, falling back to the old behaviour otherwise. RethrowGuestException clears TF and DF for the handler as x64 Windows does.
+---
+ Source/Windows/ARM64EC/Module.cpp | 137 +++++++++++++++++++++---------
+ 1 file changed, 98 insertions(+), 39 deletions(-)
+
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 3f5e23e..3b6b31c 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -380,8 +380,54 @@ static bool HandleUnalignedAccess(const ThreadCPUArea CPUArea, ARM64_NT_CONTEXT&
+   return Result.has_value();
+ }
+ 
++// x64 state with no place in the ARM64EC register mapping travels in registers ARM64EC code never uses; the layout is
++// shared with Wine's dlls/ntdll/unwind.h (Highball's patch):
++//   X13 = FCW | FSW << 16 | abridged FTW << 32 | FOP << 40, X14 = MXCSR | EFlags << 32, X28 = Marker | flags,
++//   V16-V31 = YMM upper halves.
++// An x64 context Wine builds from such a native context carries Tag in FltSave's software-available bytes: its EFlags,
++// x87 and MXCSR fields are then the thread's state and are loaded as they are.
++namespace X64StateExtension {
++constexpr uint64_t Marker = 0x4842583600000000ULL;
++constexpr uint64_t FlagX87 = 0x1;
++constexpr uint64_t FlagYMM = 0x2;
++constexpr uint64_t Tag = 0x6574617473343678ULL; // "x64state"
++constexpr size_t TagOffset = offsetof(XSAVE_FORMAT, Reserved4) + 88;
++
++static bool HasTag(const CONTEXT& Context) {
++  uint64_t Value;
++  memcpy(&Value, reinterpret_cast<const uint8_t*>(&Context.FltSave) + TagOffset, sizeof(Value));
++  return Value == Tag;
++}
++
++static uint16_t FSW(const FEXCore::Core::CPUState& State) {
++  using namespace FEXCore::X86State;
++  uint16_t Value = (State.flags[X87FLAG_TOP_LOC] & 7) << 11;
++  Value |= (State.flags[X87FLAG_C0_LOC] & 1) << 8 | (State.flags[X87FLAG_C1_LOC] & 1) << 9 | (State.flags[X87FLAG_C2_LOC] & 1) << 10 |
++           (State.flags[X87FLAG_C3_LOC] & 1) << 14;
++  for (int i = 0; i < 7; ++i) {
++    Value |= (State.flags[X87FLAG_IE_LOC + i] & 1) << i; // IE DE ZE OE UE PE SF
++  }
++  Value |= (State.flags[X87FLAG_ES_LOC] & 1) << 7 | (State.flags[X87FLAG_ES_LOC] & 1) << 15; // ES and B
++  return Value;
++}
++
++static void SetFSW(FEXCore::Core::CPUState& State, uint16_t Value) {
++  using namespace FEXCore::X86State;
++  for (int i = 0; i < 7; ++i) {
++    State.flags[X87FLAG_IE_LOC + i] = (Value >> i) & 1;
++  }
++  State.flags[X87FLAG_ES_LOC] = (Value >> 7) & 1;
++  State.flags[X87FLAG_C0_LOC] = (Value >> 8) & 1;
++  State.flags[X87FLAG_C1_LOC] = (Value >> 9) & 1;
++  State.flags[X87FLAG_C2_LOC] = (Value >> 10) & 1;
++  State.flags[X87FLAG_C3_LOC] = (Value >> 14) & 1;
++  State.flags[X87FLAG_TOP_LOC] = (Value >> 11) & 0b111;
++}
++} // namespace X64StateExtension
++
+ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, CONTEXT& Context) {
+   auto& State = Thread->CurrentFrame->State;
++  const bool Extended = X64StateExtension::HasTag(Context);
+ 
+   if ((Context.ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER) {
+     // General register state
+@@ -439,27 +485,27 @@ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, C
+     } else {
+       CTX->SetXMMRegistersFromState(Thread, reinterpret_cast<const __uint128_t*>(Context.FltSave.XmmRegisters), nullptr);
+     }
+-    memcpy(State.mm, Context.FltSave.FloatRegisters, sizeof(State.mm));
+-
+     // The MXCSR control bits (masks, rounding, FZ, DAZ) follow the context: an exception handler may change the masks
+     // before continuing. The status flags are in FPSR, which ntdll restores from the same MxCsr.
+     State.mxcsr = Context.MxCsr & 0xFFC0;
+-    // ntdll builds these x64 contexts from ARM64 ones, which carry no x87 control, status or tag state: FltSave
+-    // arrives zeroed on every system call return and exception continue. A control word of 0 never occurs in practice
+-    // (Windows initialises 0x27f), so keep the JIT's x87 state then; a context from NtSetContextThread or an FXSAVE
+-    // image always carries a real control word.
+-    if (Context.FltSave.ControlWord != 0) {
++
++    if (Extended) {
++      // The x87 environment and the registers in stack order (FloatRegisters[i] is ST(i), mm[] is physical)
+       State.FCW = Context.FltSave.ControlWord;
+-      const uint16_t FSW = Context.FltSave.StatusWord;
+-      for (int i = 0; i < 7; ++i) {
+-        State.flags[FEXCore::X86State::X87FLAG_IE_LOC + i] = (FSW >> i) & 1; // IE DE ZE OE UE PE SF
++      X64StateExtension::SetFSW(State, Context.FltSave.StatusWord);
++      State.AbridgedFTW = Context.FltSave.TagWord;
++      const uint32_t Top = State.flags[FEXCore::X86State::X87FLAG_TOP_LOC];
++      for (uint32_t i = 0; i < 8; ++i) {
++        memcpy(State.mm[(Top + i) & 7], &Context.FltSave.FloatRegisters[i], sizeof(State.mm[0]));
+       }
+-      State.flags[FEXCore::X86State::X87FLAG_ES_LOC] = (FSW >> 7) & 1;
+-      State.flags[FEXCore::X86State::X87FLAG_C0_LOC] = (FSW >> 8) & 1;
+-      State.flags[FEXCore::X86State::X87FLAG_C1_LOC] = (FSW >> 9) & 1;
+-      State.flags[FEXCore::X86State::X87FLAG_C2_LOC] = (FSW >> 10) & 1;
+-      State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = (FSW >> 14) & 1;
+-      State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = (FSW >> 11) & 0b111;
++    } else if (Context.FltSave.ControlWord != 0) {
++      // A Wine without the extension builds these x64 contexts from ARM64 ones that carry no x87 control, status or
++      // tag state: FltSave arrives zeroed on every system call return and exception continue, so the JIT's x87 state
++      // (registers included, which that context holds in an unknown rotation) is kept then. A control word of 0 never
++      // occurs in practice (Windows initialises 0x27f); a context from NtSetContextThread or an FXSAVE image has one.
++      memcpy(State.mm, Context.FltSave.FloatRegisters, sizeof(State.mm));
++      State.FCW = Context.FltSave.ControlWord;
++      X64StateExtension::SetFSW(State, Context.FltSave.StatusWord);
+       State.AbridgedFTW = Context.FltSave.TagWord;
+     }
+   }
+@@ -520,28 +566,39 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
+ 
+   CTX->ReconstructXMMRegisters(Thread, reinterpret_cast<__uint128_t*>(&ECContext.V[0]), reinterpret_cast<__uint128_t*>(&ECContext.V[16]));
+ 
+-  ECContext.Lr = State.mm[0][0];
+-  ECContext.X6 = State.mm[1][0];
+-  ECContext.X7 = State.mm[2][0];
+-  ECContext.X9 = State.mm[3][0];
+-  ECContext.X16 = (State.mm[3][1] & 0xffff) << 48 | (State.mm[2][1] & 0xffff) << 32 | (State.mm[1][1] & 0xffff) << 16 | (State.mm[0][1] & 0xffff);
+-  ECContext.X10 = State.mm[4][0];
+-  ECContext.X11 = State.mm[5][0];
+-  ECContext.X12 = State.mm[6][0];
+-  ECContext.X15 = State.mm[7][0];
+-  ECContext.X17 = (State.mm[7][1] & 0xffff) << 48 | (State.mm[6][1] & 0xffff) << 32 | (State.mm[5][1] & 0xffff) << 16 | (State.mm[4][1] & 0xffff);
+-
+-  // Zero all disallowed registers
+-  ECContext.X13 = 0;
+-  ECContext.X14 = 0;
++  // The x87 registers in the ST(i) slots of the x64 context (FloatRegisters[i] is ST(i)); mm[] is in physical order.
++  const uint32_t Top = State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] & 7;
++  const auto ST = [&](uint32_t i) -> const uint64_t* {
++    return State.mm[(Top + i) & 7];
++  };
++  ECContext.Lr = ST(0)[0];
++  ECContext.X6 = ST(1)[0];
++  ECContext.X7 = ST(2)[0];
++  ECContext.X9 = ST(3)[0];
++  ECContext.X16 = (ST(3)[1] & 0xffff) << 48 | (ST(2)[1] & 0xffff) << 32 | (ST(1)[1] & 0xffff) << 16 | (ST(0)[1] & 0xffff);
++  ECContext.X10 = ST(4)[0];
++  ECContext.X11 = ST(5)[0];
++  ECContext.X12 = ST(6)[0];
++  ECContext.X15 = ST(7)[0];
++  ECContext.X17 = (ST(7)[1] & 0xffff) << 48 | (ST(6)[1] & 0xffff) << 32 | (ST(5)[1] & 0xffff) << 16 | (ST(4)[1] & 0xffff);
++
++  // Zero the disallowed registers that carry nothing
+   ECContext.X18 = 0;
+   ECContext.X23 = 0;
+   ECContext.X24 = 0;
+-  ECContext.X28 = 0;
+ 
+-  // NZCV+SS will be converted into EFlags by ntdll, the rest are lost during exception handling.
+-  // See HandleGuestException
+   uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
++
++  // The rest of the x64 state (see X64StateExtension): x87 environment, the guest's MXCSR with its flags (FPSR holds
++  // them while the JIT runs), all of EFlags. NZCV+SS below stay authoritative for the flags they map.
++  const uint32_t MXCSR = (State.mxcsr & 0xFFC0) | FEX::Windows::MXCSRFlagsFromFPSR(FPSR);
++  ECContext.X13 = State.FCW | static_cast<uint64_t>(X64StateExtension::FSW(State)) << 16 | static_cast<uint64_t>(State.AbridgedFTW) << 32;
++  ECContext.X14 = MXCSR | static_cast<uint64_t>(EFlags) << 32;
++  ECContext.X28 = X64StateExtension::Marker | X64StateExtension::FlagX87;
++  if (ECContext.ContextFlags & CONTEXT_ARM64_FEX_YMMSTATE & ~CONTEXT_ARM64) {
++    ECContext.X28 |= X64StateExtension::FlagYMM;
++  }
++
+   ECContext.Cpsr = 0;
+   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)) ? (1U << 21) : 0;
+   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_OF_RAW_LOC)) ? (1U << 28) : 0;
+@@ -574,11 +631,10 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
+   ARM64_NT_CONTEXT GuestContext = StoreStateToPackedECContext(Thread, Context.Fpcr, Context.Fpsr);
+   LogMan::Msg::DFmt("pc: {:X} rip: {:X}", Context.Pc, GuestContext.Pc);
+ 
+-  // X64 Windows always clears TF, DF and AF when handling an exception, restoring after.
+-  // Current ARM64EC windows can only restore NZCV+SS when returning from an exception and other flags are left untouched from the handler context.
+-  // TODO: Can extend wine to support this by mapping the remaining EFlags into reserved cpsr members.
++  // x64 Windows runs exception handlers with TF and DF clear (a handler's string instructions go forwards) and
++  // restores the interrupted flags from the context, which carries all of them (X64StateExtension).
+   uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+-  EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
++  EFlags &= ~((1 << FEXCore::X86State::RFLAG_TF_RAW_LOC) | (1 << FEXCore::X86State::RFLAG_DF_RAW_LOC));
+   CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
+ 
+   BOOL FirstChance = TRUE;
+@@ -665,8 +721,11 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
+                                                (1U << FEXCore::X86State::RFLAG_ZF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_SF_RAW_LOC) |
+                                                (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)};
+ 
+-  uint32_t StateEFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+-  Context->EFlags = (Context->EFlags & ECValidEFlagsMask) | (StateEFlags & ~ECValidEFlagsMask);
++  // A context that carries the extension has all of them (an exception handler or SetThreadContext may have changed them).
++  if (!Exception::X64StateExtension::HasTag(*Context)) {
++    uint32_t StateEFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
++    Context->EFlags = (Context->EFlags & ECValidEFlagsMask) | (StateEFlags & ~ECValidEFlagsMask);
++  }
+   Exception::LoadStateFromECContext(Thread, *Context);
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

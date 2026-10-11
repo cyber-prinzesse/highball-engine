@@ -1,0 +1,51 @@
+From a3d2646bf4c146f96eed2d8ae9db0b0dc67a529f Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 08:06:14 +0200
+Subject: [PATCH 2/4] ntdll: describe the x64 XSAVE layout on aarch64 hosts
+
+KUSER_SHARED_DATA.XState stayed empty on aarch64, so GetEnabledXStateFeatures returned 0 to x64 code under emulation although CPUID and XGETBV report AVX, and contexts could not carry the YMM upper halves. Fill it with the standard (non-compacted) layout of x87, SSE and AVX, the one the emulator's CPUID leaf 0xD reports.
+---
+ dlls/ntdll/unix/system.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
+index c0b62cb..d36bcbf 100644
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -759,6 +759,25 @@ static ULONGLONG get_cpu_features(void)
+     return 0;  /* FIXME */
+ }
+ 
++#ifdef __aarch64__
++/* The XSAVE layout x64 code sees under emulation (ARM64EC): x87, SSE and AVX, standard form, which is what
++ * the emulator's CPUID leaf 0xD and XGETBV report. Contexts carry the AVX upper halves (CONTEXT_EX). */
++static void init_xstate_features( XSTATE_CONFIGURATION *xstate )
++{
++    xstate->EnabledFeatures = (1 << XSTATE_LEGACY_FLOATING_POINT) | (1 << XSTATE_LEGACY_SSE) | (1 << XSTATE_AVX);
++    xstate->EnabledVolatileFeatures = xstate->EnabledFeatures;
++    xstate->AllFeatureSize = 0x340;
++    xstate->OptimizedSave = 0;
++    xstate->CompactionEnabled = 0;
++    xstate->Features[0].Size = xstate->AllFeatures[0] = offsetof(XSAVE_FORMAT, XmmRegisters);
++    xstate->Features[1].Size = xstate->AllFeatures[1] = sizeof(M128A) * 16;
++    xstate->Features[1].Offset = xstate->Features[0].Size;
++    xstate->Features[2].Offset = 0x240;
++    xstate->Features[2].Size = xstate->AllFeatures[2] = 0x100;
++    xstate->Size = 0x340;
++}
++#endif
++
+ void init_shared_data_cpuinfo( KUSER_SHARED_DATA *data )
+ {
+     BOOLEAN *features = data->ProcessorFeatures;
+@@ -819,6 +838,7 @@ void init_shared_data_cpuinfo( KUSER_SHARED_DATA *data )
+             break;
+         }
+     }
++    init_xstate_features( &data->XState );
+ #endif
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

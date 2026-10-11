@@ -1,0 +1,15 @@
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1986,6 +1986,12 @@
+         setenv( "DYLD_LIBRARY_PATH", path, 1 );
+         return 1;
+     }
++#if defined(__aarch64__)
++    /* Highball: a process started by a shell or a launcher does not pass through exec_wineloader, so the 4 KB page
++     * exec in preloader_exec only ever ran for child processes and the main program kept the host's 16 KB pages.
++     * Exec when this process still has 16 KB pages; the spawned image runs with 4 KB and takes the no-exec path. */
++    if (getpagesize() != 4096 && !getenv( "HB_NO_4K_PAGES" ) && posix_spawnattr_set_4k_page_size_np) return 1;
++#endif
+ #ifdef HAVE_WINE_PRELOADER
+     return 1;
+ #else

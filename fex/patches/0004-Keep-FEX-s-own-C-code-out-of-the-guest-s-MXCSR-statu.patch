@@ -1,0 +1,124 @@
+From 23882a3ff002cd88a5eb23a7ea92c3ec242dc0da Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 08:05:45 +0200
+Subject: [PATCH 04/13] Keep FEX's own C++ code out of the guest's MXCSR status
+ flags
+
+With the fp-exceptions change the guest's MXCSR status flags are the host FPSR cumulative bits while the JIT runs. The compiler, the block linker and code invalidation are C++ and set host flags as they go, inexact above all (hash table load factors), so the first call of every API set MXCSR.PE in the guest, and a program testing PE after an exact computation saw it set.
+
+The dispatcher keeps the guest FPSR on the host stack across the compile, link and single step calls and the code entry removal, the Mono backpatcher op does the same, and the ARM64EC syscall handler reads FPSR before it runs any C++. Calls into ARM64EC code keep FPSR: MXCSR status bits are volatile across calls in the x64 ABI, and the CRT's _clearfp is such a call.
+---
+ .../Interface/Core/Dispatcher/Dispatcher.cpp  | 23 +++++++++++++++++++
+ FEXCore/Source/Interface/Core/JIT/MiscOps.cpp |  9 ++++++++
+ Source/Windows/ARM64EC/Module.cpp             |  8 ++++---
+ 3 files changed, 37 insertions(+), 3 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index 2f4babd..ffa6ce1 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -249,8 +249,26 @@ void Dispatcher::EmitDispatcher() {
+     ret();
+   }
+ 
++  // The guest's MXCSR status flags live in the FPSR cumulative bits while the JIT runs (SupportsFloatExceptions). FEX's
++  // own C++ code (compiler, linker, code invalidation) sets host flags in them as it goes, inexact above all, which the
++  // guest would then read as its own: keep the guest's FPSR on the host stack across such a call.
++  auto SaveGuestFPSR = [&](ARMEmitter::XRegister TmpReg) {
++    if (CTX->HostFeatures.SupportsFloatExceptions) {
++      mrs(TmpReg, ARMEmitter::SystemRegister::FPSR);
++      str<ARMEmitter::IndexType::PRE>(TmpReg, ARMEmitter::Reg::rsp, -16);
++    }
++  };
++  auto RestoreGuestFPSR = [&](ARMEmitter::XRegister TmpReg) {
++    if (CTX->HostFeatures.SupportsFloatExceptions) {
++      ldr<ARMEmitter::IndexType::POST>(TmpReg, ARMEmitter::Reg::rsp, 16);
++      msr(ARMEmitter::SystemRegister::FPSR, TmpReg);
++    }
++  };
++
+   // Clobbers TMP1/2
+   auto EmitSignalGuardedRegion = [&](auto Body) {
++    SaveGuestFPSR(TMP1);
++
+ #ifndef _WIN32
+     ldr(TMP2, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
+     add(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
+@@ -265,6 +283,9 @@ void Dispatcher::EmitDispatcher() {
+ 
+     Body();
+ 
++    // TMP1 holds the branch target here
++    RestoreGuestFPSR(TMP2);
++
+ #ifdef ARCHITECTURE_arm64ec
+     ldr(TMP2, ARMEmitter::XReg::x18, TEB_CPU_AREA_OFFSET);
+     strb(ARMEmitter::WReg::zr, TMP2, CPU_AREA_IN_SYSCALL_CALLBACK_OFFSET);
+@@ -556,12 +577,14 @@ void Dispatcher::EmitDispatcher() {
+     ThreadDispatchRemoveCodeEntry = GetCursorAddress<uint64_t>();
+ 
+     // Arguments are already in x0, x1. Just jump to the handler.
++    SaveGuestFPSR(ARMEmitter::XReg::x2);
+     ldr(ARMEmitter::XReg::x2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.ThreadRemoveCodeEntryFromJIT));
+     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
+       GenerateIndirectRuntimeCall<void, void*, void*>(ARMEmitter::Reg::r2);
+     } else {
+       blr(ARMEmitter::Reg::r2);
+     }
++    RestoreGuestFPSR(ARMEmitter::XReg::x1);
+ 
+     FillStaticRegs({
+       .OptionalReg = ARMEmitter::Reg::r1,
+diff --git a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+index 20300fd..f6cc340 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+@@ -396,6 +396,11 @@ DEF_OP(MonoBackpatcherWrite) {
+ 
+   PushDynamicRegs(TMP1);
+   SpillStaticRegs(TMP1);
++  if (HostSupportsFloatExceptions) {
++    // Keep the guest's MXCSR status flags (FPSR) out of reach of the C++ code invalidation
++    mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
++    str<ARMEmitter::IndexType::PRE>(TMP1, ARMEmitter::Reg::rsp, -16);
++  }
+ 
+   mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, STATE.R());
+   mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, IR::OpSizeToSize(Op->Size));
+@@ -423,6 +428,10 @@ DEF_OP(MonoBackpatcherWrite) {
+   strb(ARMEmitter::WReg::zr, TMP2, CPU_AREA_IN_SYSCALL_CALLBACK_OFFSET);
+ #endif
+ 
++  if (HostSupportsFloatExceptions) {
++    ldr<ARMEmitter::IndexType::POST>(TMP1, ARMEmitter::Reg::rsp, 16);
++    msr(ARMEmitter::SystemRegister::FPSR, TMP1);
++  }
+   FillStaticRegs();
+   PopDynamicRegs();
+ }
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 3b6b31c..521fc20 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -665,13 +665,15 @@ public:
+   ECSyscallHandler() = default;
+ 
+   void HandleSyscall(FEXCore::Core::CpuStateFrame* Frame) override {
++    // The guest's MXCSR status flags are the FPSR cumulative bits: read them before any C++ code can add its own
++    uint64_t FPCR, FPSR;
++    __asm volatile("mrs %[fpcr], fpcr" : [fpcr] "=r"(FPCR));
++    __asm volatile("mrs %[fpsr], fpsr" : [fpsr] "=r"(FPSR));
++
+     ProcessPendingCrossProcessEmulatorWork();
+ 
+     // Manually raise an exeption with the current JIT state packed into a native context, ntdll handles this and
+     // reenters the JIT (see dlls/ntdll/signal_arm64ec.c in wine).
+-    uint64_t FPCR, FPSR;
+-    __asm volatile("mrs %[fpcr], fpcr" : [fpcr] "=r"(FPCR));
+-    __asm volatile("mrs %[fpsr], fpsr" : [fpsr] "=r"(FPSR));
+ 
+     auto* Thread = GetCPUArea().ThreadState();
+     KiUserExceptionDispatcherStackLayout DispatchArgs {
+-- 
+2.50.1 (Apple Git-155)
+

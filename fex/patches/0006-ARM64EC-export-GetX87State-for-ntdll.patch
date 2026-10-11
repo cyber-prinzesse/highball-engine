@@ -1,0 +1,69 @@
+From 042c1af8ac6e11ea26c4e14a4fe8b388b216b090 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 08:05:45 +0200
+Subject: [PATCH 06/13] ARM64EC: export GetX87State for ntdll
+
+ntdll's RtlCaptureContext and setjmp run as native code and cannot read the x87 state, so they reported a control word of 0x27f and RtlRestoreContext and longjmp loaded it back: after every exception raised with RaiseException (a C++ throw) and unwound, or every longjmp, the x87 control word was reset, which drops mingw-w64 programs from 64-bit to 53-bit precision. GetX87State (not part of the Windows interface) fills the x87 part of an FXSAVE image from the thread state; the JIT is not running on the calling thread, so the state is current.
+---
+ Source/Windows/ARM64EC/BTInterface.h     |  2 ++
+ Source/Windows/ARM64EC/Module.cpp        | 23 +++++++++++++++++++++++
+ Source/Windows/ARM64EC/libarm64ecfex.def |  1 +
+ 3 files changed, 26 insertions(+)
+
+diff --git a/Source/Windows/ARM64EC/BTInterface.h b/Source/Windows/ARM64EC/BTInterface.h
+index d576030..aabc905 100644
+--- a/Source/Windows/ARM64EC/BTInterface.h
++++ b/Source/Windows/ARM64EC/BTInterface.h
+@@ -22,4 +22,6 @@ void STDMETHODCALLTYPE BTCpu64NotifyMemoryDirty(void* Address, SIZE_T Size);
+ void STDMETHODCALLTYPE BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After, NTSTATUS Status);
+ BOOLEAN STDMETHODCALLTYPE BTCpu64IsProcessorFeaturePresent(UINT Feature);
+ void STDMETHODCALLTYPE UpdateProcessorInformation(SYSTEM_CPU_INFORMATION* Info);
++// Extension used by Wine's ntdll, not in the Windows interface
++void STDMETHODCALLTYPE GetX87State(XMM_SAVE_AREA32* FltSave);
+ }
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index c4cadef..b58448e 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -1258,6 +1258,29 @@ BOOLEAN BTCpu64IsProcessorFeaturePresent(UINT Feature) {
+   return CPUFeatures->IsFeaturePresent(Feature) ? TRUE : FALSE;
+ }
+ 
++// Not part of the Windows emulator interface. The calling thread's x87 state, for ntdll's RtlCaptureContext and setjmp,
++// which run as native code and cannot read it: x64 Windows captures the live control word and RtlRestoreContext and
++// longjmp load it back, so a made up one would reset the precision and rounding of every program that unwinds an
++// exception or longjmps. Fills the x87 part of an FXSAVE image (control, status and abridged tag word, the registers
++// in ST(i) order); MXCSR and the XMM registers are left to the caller. The JIT is not running on this thread here, so
++// the thread state holds the current values.
++void GetX87State(XMM_SAVE_AREA32* FltSave) {
++  auto* Thread = GetCPUArea().ThreadState();
++  if (!Thread) {
++    return;
++  }
++
++  const auto& State = Thread->CurrentFrame->State;
++  const unsigned Top = State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] & 7;
++  FltSave->ControlWord = State.FCW;
++  FltSave->StatusWord = Exception::X64StateExtension::FSW(State);
++  FltSave->TagWord = State.AbridgedFTW;
++  for (unsigned i = 0; i < 8; ++i) {
++    memset(&FltSave->FloatRegisters[i], 0, sizeof(FltSave->FloatRegisters[i]));
++    memcpy(&FltSave->FloatRegisters[i], State.mm[(Top + i) & 7], 10);
++  }
++}
++
+ void UpdateProcessorInformation(SYSTEM_CPU_INFORMATION* Info) {
+   CPUFeatures->UpdateInformation(Info);
+ }
+diff --git a/Source/Windows/ARM64EC/libarm64ecfex.def b/Source/Windows/ARM64EC/libarm64ecfex.def
+index bb51ca8..fe46723 100644
+--- a/Source/Windows/ARM64EC/libarm64ecfex.def
++++ b/Source/Windows/ARM64EC/libarm64ecfex.def
+@@ -21,3 +21,4 @@ EXPORTS
+   ThreadInit
+   ThreadTerm
+   UpdateProcessorInformation
++  GetX87State
+-- 
+2.50.1 (Apple Git-155)
+

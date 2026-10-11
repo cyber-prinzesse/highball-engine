@@ -1,0 +1,400 @@
+From 5acca7e17c6c8ddd4b8e70a66f10ff98b6a96271 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 08:06:14 +0200
+Subject: [PATCH 3/4] ntdll: keep the x64 state the ARM64EC mapping has no room
+ for, and ask the emulator for the rest
+
+The ARM64EC register mapping keeps the x87 registers but not the x87 control, status and tag words, the EFLAGS bits NZCV cannot hold, MXCSR's DAZ, or the YMM upper halves. context_x64_to_arm now also packs them into registers ARM64EC code never uses (X13 x87 words, X14 MXCSR and EFLAGS, X28 a marker; the YMM upper halves in V16-V31 with CONTEXT_ARM64_FEX_YMMSTATE), and context_arm_to_x64 reads them back when the marker is there. The MXCSR status flags always come from FPSR, where they live. Exception dispatch, NtContinue, NtRaiseException, APC dispatch and Get/SetThreadContext use an x64 context with room for the AVX state (CONTEXT_EX), and a partial SetThreadContext merges into the full current context instead of zeroing the rest.
+
+RtlCaptureContext reports what x64 Windows does (ContextFlags, segment selectors) and takes the x87 state from the emulator (GetX87State) instead of a fixed 0x27f control word, which RtlRestoreContext then loaded after every unwind of a RaiseException; setjmp stores the emulator's control word too, and GetThreadContext on the current thread uses it.
+---
+ dlls/ntdll/signal_arm64ec.c | 124 ++++++++++++++++++++++++++++++------
+ dlls/ntdll/unwind.h         |  98 ++++++++++++++++++++++++++++
+ 2 files changed, 201 insertions(+), 21 deletions(-)
+
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index 24d3b6d..ab95f38 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -56,11 +56,39 @@ static void     (WINAPI *pResetToConsistentState)(EXCEPTION_RECORD*,CONTEXT*,ARM
+ static NTSTATUS (WINAPI *pThreadInit)(void);
+ static void     (WINAPI *pThreadTerm)(HANDLE,LONG);
+ static void     (WINAPI *pUpdateProcessorInformation)(SYSTEM_CPU_INFORMATION*);
++/* emulator extension: the calling thread's x87 state, which native code cannot read */
++static void     (WINAPI *pGetX87State)(XMM_SAVE_AREA32*);
+ 
+ static BOOLEAN emulated_processor_features[PROCESSOR_FEATURE_MAX];
+ static BYTE KiUserExceptionDispatcher_orig[16]; /* to detect patching */
+ extern void KiUserExceptionDispatcher_thunk(void) asm("EXP+#KiUserExceptionDispatcher");
+ 
++/* an x64 context with room for the AVX state (CONTEXT_EX + XSAVE header + YMM) */
++union ARM64EC_NT_XCONTEXT
++{
++    ARM64EC_NT_CONTEXT context;
++    BYTE buffer[0x800];
++};
++
++/* initialize an x64 context buffer (16-byte aligned, 0x800 bytes) with a CONTEXT_EX when the system has AVX */
++static ARM64EC_NT_CONTEXT *init_x64_xcontext( void *buffer )
++{
++    ARM64EC_NT_CONTEXT *ctx = buffer;
++    CONTEXT_EX *xctx;
++
++    if (!RtlGetEnabledExtendedFeatures( 1 << XSTATE_AVX ) ||
++        RtlInitializeExtendedContext( buffer, CONTEXT_AMD64_FULL | CONTEXT_AMD64_XSTATE, &xctx ))
++        ctx->ContextFlags = 0;
++    return ctx;
++}
++
++/* convert a native context into an x64 context made by init_x64_xcontext */
++static void context_arm_to_x64_ex( ARM64EC_NT_CONTEXT *ctx, const ARM64_NT_CONTEXT *arm_ctx )
++{
++    if ((ctx->ContextFlags & CONTEXT_AMD64_XSTATE) == CONTEXT_AMD64_XSTATE) context_arm_to_x64_xstate( ctx, arm_ctx );
++    else context_arm_to_x64( ctx, arm_ctx );
++}
++
+ static inline CHPE_V2_CPU_AREA_INFO *get_arm64ec_cpu_area(void)
+ {
+     return NtCurrentTeb()->ChpeV2CpuAreaInfo;
+@@ -214,6 +242,7 @@ NTSTATUS arm64ec_process_init( HMODULE module )
+     GET_PTR( ThreadInit );
+     GET_PTR( ThreadTerm );
+     GET_PTR( UpdateProcessorInformation );
++    GET_PTR( GetX87State );
+ #undef GET_PTR
+ 
+     RtlGetCurrentPeb()->ChpeV2ProcessInfo = info;
+@@ -667,7 +696,7 @@ NTSTATUS SYSCALL_API NtContinue( CONTEXT *context, BOOLEAN alertable )
+ {
+     ARM64_NT_CONTEXT arm_ctx;
+ 
+-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
++    context_x64_to_arm_xstate( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+     return syscall_NtContinue( &arm_ctx, alertable );
+ }
+ 
+@@ -675,7 +704,7 @@ NTSTATUS SYSCALL_API NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
+ {
+     ARM64_NT_CONTEXT arm_ctx;
+ 
+-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
++    context_x64_to_arm_xstate( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+     return syscall_NtContinueEx( &arm_ctx, args );
+ }
+ 
+@@ -716,13 +745,28 @@ NTSTATUS SYSCALL_API NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_
+     return status;
+ }
+ 
++/* The x64 state does not follow the x64 context classes once mapped onto ARM64 registers (the x87 registers
++ * and the EFlags extension live in integer registers, Lr is a control register), so both directions work on
++ * the full native context and copy or merge the classes the caller asked for. */
+ NTSTATUS SYSCALL_API NtGetContextThread( HANDLE handle, CONTEXT *context )
+ {
+-    ARM64_NT_CONTEXT arm_ctx = { .ContextFlags = ctx_flags_x64_to_arm( context->ContextFlags ) };
+-    NTSTATUS status = syscall_NtGetContextThread( handle, &arm_ctx );
++    ARM64_NT_CONTEXT arm_ctx = { .ContextFlags = CONTEXT_ARM64_FULL | (context->ContextFlags & exception_flags_mask) };
++    union ARM64EC_NT_XCONTEXT full;
++    ARM64EC_NT_CONTEXT *x64;
++    DWORD flags = context->ContextFlags;
++    NTSTATUS status;
+ 
+-    if (!status) context_arm_to_x64( (ARM64EC_NT_CONTEXT *)context, &arm_ctx );
+-    return status;
++    if ((status = syscall_NtGetContextThread( handle, &arm_ctx ))) return status;
++    x64 = init_x64_xcontext( &full );
++    context_arm_to_x64_ex( x64, &arm_ctx );
++    /* the current thread is in native code here: its x87 state is the emulator's */
++    if (handle == GetCurrentThread() && pGetX87State) pGetX87State( &x64->AMD64_Context.FltSave );
++    if (!(x64->ContextFlags & CONTEXT_AMD64_XSTATE & ~CONTEXT_AMD64)) flags &= ~(CONTEXT_AMD64_XSTATE & ~CONTEXT_AMD64);
++    if ((status = RtlCopyContext( context, flags, &x64->AMD64_Context ))) return status;
++    if (flags & (CONTEXT_AMD64_CONTROL | CONTEXT_AMD64_FLOATING_POINT) & ~CONTEXT_AMD64)
++        context->MxCsr = x64->AMD64_MxCsr_copy;
++    context->ContextFlags = (context->ContextFlags & ~exception_flags_mask) | (x64->ContextFlags & exception_flags_mask);
++    return STATUS_SUCCESS;
+ }
+ 
+ static void notify_map_view_of_section( HANDLE handle, void *addr, SIZE_T size, ULONG alloc,
+@@ -806,7 +850,7 @@ NTSTATUS SYSCALL_API NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context,
+ {
+     ARM64_NT_CONTEXT arm_ctx;
+ 
+-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
++    context_x64_to_arm_xstate( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+     return syscall_NtRaiseException( rec, &arm_ctx, first_chance );
+ }
+ 
+@@ -832,9 +876,28 @@ NTSTATUS SYSCALL_API NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
+ 
+ NTSTATUS SYSCALL_API NtSetContextThread( HANDLE handle, const CONTEXT *context )
+ {
++    static const DWORD full = (CONTEXT_AMD64_CONTROL | CONTEXT_AMD64_INTEGER | CONTEXT_AMD64_FLOATING_POINT) & ~CONTEXT_AMD64;
+     ARM64_NT_CONTEXT arm_ctx;
++    DWORD flags = context->ContextFlags;
+ 
+-    context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
++    if ((flags & full) != full)
++    {
++        /* merge the classes given into the thread's full current state, see NtGetContextThread */
++        ARM64_NT_CONTEXT cur_arm = { .ContextFlags = CONTEXT_ARM64_FULL };
++        union ARM64EC_NT_XCONTEXT cur;
++        ARM64EC_NT_CONTEXT *x64;
++        NTSTATUS status;
++
++        if ((status = syscall_NtGetContextThread( handle, &cur_arm ))) return status;
++        x64 = init_x64_xcontext( &cur );
++        context_arm_to_x64_ex( x64, &cur_arm );
++        if (!(x64->ContextFlags & CONTEXT_AMD64_XSTATE & ~CONTEXT_AMD64)) flags &= ~(CONTEXT_AMD64_XSTATE & ~CONTEXT_AMD64);
++        if ((status = RtlCopyContext( &x64->AMD64_Context, flags, (CONTEXT *)context ))) return status;
++        if (flags & (CONTEXT_AMD64_CONTROL | CONTEXT_AMD64_FLOATING_POINT) & ~CONTEXT_AMD64)
++            x64->AMD64_MxCsr_copy = context->MxCsr;
++        context_x64_to_arm_xstate( &arm_ctx, x64 );
++    }
++    else context_x64_to_arm_xstate( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
+     return syscall_NtSetContextThread( handle, &arm_ctx );
+ }
+ 
+@@ -1263,7 +1326,8 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
+  */
+ void dispatch_emulation( ARM64_NT_CONTEXT *arm_ctx )
+ {
+-    context_arm_to_x64( get_arm64ec_cpu_area()->ContextAmd64, arm_ctx );
++    /* the CPU area's inline buffer has room for the extended context below the emulator stack */
++    context_arm_to_x64_ex( init_x64_xcontext( get_arm64ec_cpu_area()->ContextAmd64 ), arm_ctx );
+     pBeginSimulation();
+ }
+ __ASM_GLOBAL_FUNC( "#KiUserEmulationDispatcher",
+@@ -1293,10 +1357,12 @@ static void dispatch_syscall( ARM64_NT_CONTEXT *context )
+ }
+ 
+ 
+-static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD *rec, ARM64EC_NT_CONTEXT *context, ARM64_NT_CONTEXT *arm_ctx )
++static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD *rec, union ARM64EC_NT_XCONTEXT *xcontext, ARM64_NT_CONTEXT *arm_ctx )
+ {
++    ARM64EC_NT_CONTEXT *context = &xcontext->context;
++
+     if (rec->ExceptionCode == STATUS_EMULATION_SYSCALL) dispatch_syscall( arm_ctx );
+-    context_arm_to_x64( context, arm_ctx );
++    context_arm_to_x64_ex( init_x64_xcontext( xcontext ), arm_ctx );
+     if (pResetToConsistentState) pResetToConsistentState( rec, &context->AMD64_Context, arm_ctx );
+     /* call x64 dispatcher if the thunk or the function pointer was modified */
+     if (pWow64PrepareForException || memcmp( KiUserExceptionDispatcher_thunk, KiUserExceptionDispatcher_orig,
+@@ -1312,12 +1378,12 @@ void __attribute__((naked)) KiUserExceptionDispatcher( EXCEPTION_RECORD *rec, CO
+ {
+     asm( ".seh_proc \"#KiUserExceptionDispatcher\"\n\t"
+          ".seh_context\n\t"
+-         "sub sp, sp, #0x4d0\n\t"       /* sizeof(ARM64EC_NT_CONTEXT) */
+-         ".seh_stackalloc 0x4d0\n\t"
++         "sub sp, sp, #0x800\n\t"       /* sizeof(union ARM64EC_NT_XCONTEXT) */
++         ".seh_stackalloc 0x800\n\t"
+          ".seh_endprologue\n\t"
+-         "add x0, sp, #0x3b0+0x4d0\n\t" /* rec */
++         "add x0, sp, #0x3b0+0x800\n\t" /* rec */
+          "mov x1, sp\n\t"               /* context */
+-         "add x2, sp, #0x4d0\n\t"       /* arm_ctx (context + 1) */
++         "add x2, sp, #0x800\n\t"       /* arm_ctx (above the context) */
+          "bl \"#prepare_exception_arm64ec\"\n\t"
+          "cbz x0, 1f\n\t"
+          /* bypass exit thunk to avoid messing up the stack */
+@@ -1325,7 +1391,7 @@ void __attribute__((naked)) KiUserExceptionDispatcher( EXCEPTION_RECORD *rec, CO
+          "ldr x16, [x16, #:lo12:__os_arm64x_dispatch_call_no_redirect]\n\t"
+          "mov x9, x0\n\t"
+          "blr x16\n"
+-         "1:\tadd x0, sp, #0x3b0+0x4d0\n\t" /* rec */
++         "1:\tadd x0, sp, #0x3b0+0x800\n\t" /* rec */
+          "mov x1, sp\n\t"                   /* context */
+          "bl #dispatch_exception\n\t"
+          "brk #1\n\t"
+@@ -1340,11 +1406,12 @@ static void __attribute__((used)) dispatch_apc( void (CALLBACK *func)(ULONG_PTR,
+                                                 ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3,
+                                                 BOOLEAN alertable, ARM64_NT_CONTEXT *arm_ctx )
+ {
+-    ARM64EC_NT_CONTEXT context;
++    union ARM64EC_NT_XCONTEXT xcontext;
++    ARM64EC_NT_CONTEXT *context = init_x64_xcontext( &xcontext );
+ 
+-    context_arm_to_x64( &context, arm_ctx );
+-    func( arg1, arg2, arg3, &context.AMD64_Context );
+-    NtContinue( &context.AMD64_Context, alertable );
++    context_arm_to_x64_ex( context, arm_ctx );
++    func( arg1, arg2, arg3, &context->AMD64_Context );
++    NtContinue( &context->AMD64_Context, alertable );
+ }
+ __ASM_GLOBAL_FUNC( "#KiUserApcDispatcher",
+                    ".seh_context\n\t"
+@@ -1419,12 +1486,21 @@ static void __attribute__((used)) unwind_entry_thunk( CONTEXT *context )
+ /* capture context information; helper for RtlCaptureContext */
+ static void __attribute__((used)) capture_context( CONTEXT *context, UINT cpsr, UINT fpcr, UINT fpsr )
+ {
+-    context->ContextFlags = CONTEXT_AMD64_FULL;
++    /* what x64 Windows reports; the x87 state belongs to the emulator */
++    context->ContextFlags = CONTEXT_AMD64_FULL | CONTEXT_AMD64_SEGMENTS;
++    context->SegCs = 0x33;
++    context->SegDs = 0x2b;
++    context->SegEs = 0x2b;
++    context->SegFs = 0x53;
++    context->SegGs = 0x2b;
++    context->SegSs = 0x2b;
+     context->EFlags = cpsr_to_eflags( cpsr );
+     context->MxCsr = fpcsr_to_mxcsr( fpcr, fpsr );
+     context->FltSave.ControlWord = 0x27f;
+     context->FltSave.StatusWord = 0;
++    context->FltSave.TagWord = 0;
+     context->FltSave.MxCsr = context->MxCsr;
++    if (pGetX87State) pGetX87State( &context->FltSave );
+     unwind_entry_thunk( context );
+ }
+ 
+@@ -1483,6 +1559,12 @@ static int __attribute__((used)) do_setjmpex( _JUMP_BUFFER *buf, UINT fpcr, UINT
+ 
+     buf->MxCsr = fpcsr_to_mxcsr( fpcr, fpsr );
+     buf->FpCsr = 0x27f;
++    if (pGetX87State)
++    {
++        XMM_SAVE_AREA32 fx = { .ControlWord = 0x27f };
++        pGetX87State( &fx );
++        buf->FpCsr = fx.ControlWord;
++    }
+ 
+     context.Rbx = buf->Rbx;
+     context.Rsp = buf->Rsp;
+diff --git a/dlls/ntdll/unwind.h b/dlls/ntdll/unwind.h
+index 1852708..9701a2c 100644
+--- a/dlls/ntdll/unwind.h
++++ b/dlls/ntdll/unwind.h
+@@ -31,6 +31,25 @@
+ static const ULONG exception_flags_mask = CONTEXT_EXCEPTION_ACTIVE |
+     CONTEXT_SERVICE_ACTIVE | CONTEXT_EXCEPTION_REQUEST | CONTEXT_EXCEPTION_REPORTING;
+ 
++/* x86-64 state that has no place in the ARM64EC register mapping (EFlags beyond NZCV and TF, the x87 control,
++ * status and tag words, the full MXCSR, the upper halves of the YMM registers) travels in registers ARM64EC code
++ * never uses, so it survives every native context path (signal frames, NtContinue, the wineserver):
++ *   X13     = FCW | FSW << 16 | abridged FTW << 32 | FOP << 40
++ *   X14     = MXCSR | EFlags << 32
++ *   X28     = ARM64EC_X64_STATE_MARKER | ARM64EC_X64_STATE_* flags
++ *   V16-V31 = YMM0-15 bits 128-255 (FEX's CONTEXT_ARM64_FEX_YMMSTATE flags them where context flags survive)
++ * The emulator packs and unpacks the same layout. An x64 context built from a native context that carries it
++ * gets ARM64EC_X64_STATE_TAG in FltSave's software-available bytes, which tells the emulator that the EFlags,
++ * x87 and MXCSR fields are the thread's real state. */
++#define CONTEXT_ARM64_FEX_YMMSTATE (CONTEXT_ARM64 | 0x00000040)
++#define ARM64EC_X64_STATE_MARKER   0x4842583600000000ull
++#define ARM64EC_X64_STATE_MASK     0xffffffff00000000ull
++#define ARM64EC_X64_STATE_X87      0x1
++#define ARM64EC_X64_STATE_YMM      0x2
++#define ARM64EC_X64_STATE_TAG      0x6574617473343678ull  /* "x64state" */
++#define ARM64EC_X64_STATE_TAG_POS  88                      /* in AMD64_XSAVE_FORMAT_Reserved4: FltSave bytes 504-511 */
++#define EFLAGS_FROM_CPSR           0x09c1                  /* CF ZF SF TF OF */
++
+ static inline ULONG ctx_flags_x64_to_arm( ULONG flags )
+ {
+     ULONG ret = CONTEXT_ARM64 | (flags & exception_flags_mask);
+@@ -39,6 +58,7 @@ static inline ULONG ctx_flags_x64_to_arm( ULONG flags )
+     if (flags & CONTEXT_AMD64_CONTROL) ret |= CONTEXT_ARM64_CONTROL;
+     if (flags & CONTEXT_AMD64_INTEGER) ret |= CONTEXT_ARM64_INTEGER;
+     if (flags & CONTEXT_AMD64_FLOATING_POINT) ret |= CONTEXT_ARM64_FLOATING_POINT;
++    if ((flags & 0x40) == 0x40) ret |= CONTEXT_ARM64_FEX_YMMSTATE;  /* CONTEXT_AMD64_XSTATE */
+     return ret;
+ }
+ 
+@@ -53,6 +73,24 @@ static inline ULONG ctx_flags_arm_to_x64( ULONG flags )
+     return ret;
+ }
+ 
++static inline BOOL arm64ec_x64_state( const ARM64_NT_CONTEXT *arm_ctx, ULONG64 flag )
++{
++    return (arm_ctx->X28 & ARM64EC_X64_STATE_MASK) == ARM64EC_X64_STATE_MARKER && (arm_ctx->X28 & flag);
++}
++
++/* the YMM upper halves of an x64 context with CONTEXT_AMD64_XSTATE, NULL if absent or in their initial state */
++static inline const M128A *arm64ec_ymm_high( const ARM64EC_NT_CONTEXT *ec_ctx )
++{
++    const CONTEXT_EX *xctx = (const CONTEXT_EX *)(ec_ctx + 1);
++    const XSTATE *xs;
++
++    if (xctx->XState.Length < sizeof(XSTATE)) return NULL;
++    xs = (const XSTATE *)((const char *)xctx + xctx->XState.Offset);
++    if (xs->CompactionMask) return NULL;  /* only the standard form is created for these contexts */
++    if (!(xs->Mask & (1 << XSTATE_AVX))) return NULL;
++    return (const M128A *)&xs->YmmContext;
++}
++
+ static inline UINT eflags_to_cpsr( UINT eflags )
+ {
+     UINT ret = 0;
+@@ -169,6 +207,26 @@ static inline void context_x64_to_arm( ARM64_NT_CONTEXT *arm_ctx, const ARM64EC_
+     fpcsr = mxcsr_to_fpcsr( ec_ctx->AMD64_MxCsr );
+     arm_ctx->Fpcr = fpcsr;
+     arm_ctx->Fpsr = fpcsr >> 32;
++
++    arm_ctx->X13 = ec_ctx->AMD64_ControlWord | (DWORD64)ec_ctx->AMD64_StatusWord << 16 |
++                   (DWORD64)ec_ctx->AMD64_TagWord << 32 | (DWORD64)(ec_ctx->AMD64_ErrorOpcode & 0x7ff) << 40;
++    arm_ctx->X14 = ec_ctx->AMD64_MxCsr | (DWORD64)ec_ctx->AMD64_EFlags << 32;
++    arm_ctx->X28 = ARM64EC_X64_STATE_MARKER | ARM64EC_X64_STATE_X87;
++}
++
++/* same, also taking the YMM upper halves from the CONTEXT_EX of a context with CONTEXT_AMD64_XSTATE; only for
++ * contexts that come from the x64 API, where that flag guarantees a CONTEXT_EX */
++static inline void context_x64_to_arm_xstate( ARM64_NT_CONTEXT *arm_ctx, const ARM64EC_NT_CONTEXT *ec_ctx )
++{
++    context_x64_to_arm( arm_ctx, ec_ctx );
++    if ((ec_ctx->ContextFlags & CONTEXT_AMD64_XSTATE) == CONTEXT_AMD64_XSTATE)
++    {
++        const M128A *ymm = arm64ec_ymm_high( ec_ctx );
++        /* absent from the mask means the initial state, zeros, which context_x64_to_arm left */
++        if (ymm) memcpy( arm_ctx->V + 16, ymm, 16 * sizeof(*ymm) );
++        arm_ctx->ContextFlags |= CONTEXT_ARM64_FEX_YMMSTATE;
++        arm_ctx->X28 |= ARM64EC_X64_STATE_YMM;
++    }
+ }
+ 
+ static inline void context_arm_to_x64( ARM64EC_NT_CONTEXT *ec_ctx, const ARM64_NT_CONTEXT *arm_ctx )
+@@ -219,6 +277,46 @@ static inline void context_arm_to_x64( ARM64EC_NT_CONTEXT *ec_ctx, const ARM64_N
+     ec_ctx->X17_3 = arm_ctx->X17 >> 48;
+ 
+     memcpy( ec_ctx->V, arm_ctx->V, sizeof(ec_ctx->V) );
++
++    if (arm64ec_x64_state( arm_ctx, ARM64EC_X64_STATE_X87 ))
++    {
++        DWORD eflags = arm_ctx->X14 >> 32;
++
++        ec_ctx->AMD64_ControlWord = arm_ctx->X13;
++        ec_ctx->AMD64_StatusWord  = arm_ctx->X13 >> 16;
++        ec_ctx->AMD64_TagWord     = arm_ctx->X13 >> 32;
++        ec_ctx->AMD64_ErrorOpcode = (arm_ctx->X13 >> 40) & 0x7ff;
++        /* the MXCSR control bits from the extension (DAZ has no FPCR bit on every host), the status flags from FPSR,
++         * where they live: the flag of a trapping SSE exception is added there after the state was packed */
++        ec_ctx->AMD64_MxCsr = ec_ctx->AMD64_MxCsr_copy = ((DWORD)arm_ctx->X14 & ~0x3f) |
++                                                         (fpcsr_to_mxcsr( arm_ctx->Fpcr, arm_ctx->Fpsr ) & 0x3f);
++        /* NZCV and SS are authoritative for the flags they map, the rest comes from the extension */
++        ec_ctx->AMD64_EFlags = (eflags & ~EFLAGS_FROM_CPSR) | (ec_ctx->AMD64_EFlags & EFLAGS_FROM_CPSR) | 2;
++        *(ULONG64 *)&ec_ctx->AMD64_XSAVE_FORMAT_Reserved4[ARM64EC_X64_STATE_TAG_POS] = ARM64EC_X64_STATE_TAG;
++    }
++    else ec_ctx->AMD64_ControlWord = 0x27f;  /* the x64 default; the state of native code */
++}
++
++/* same, for an x64 context initialized with a CONTEXT_EX (RtlInitializeExtendedContext with
++ * CONTEXT_AMD64_XSTATE): also sets CONTEXT_AMD64_XSTATE and the YMM upper halves */
++static inline void context_arm_to_x64_xstate( ARM64EC_NT_CONTEXT *ec_ctx, const ARM64_NT_CONTEXT *arm_ctx )
++{
++    CONTEXT_EX *xctx = (CONTEXT_EX *)(ec_ctx + 1);
++    XSTATE *xs = (XSTATE *)((char *)xctx + xctx->XState.Offset);
++
++    context_arm_to_x64( ec_ctx, arm_ctx );
++    ec_ctx->ContextFlags |= CONTEXT_AMD64_XSTATE;
++    if ((arm_ctx->ContextFlags & CONTEXT_ARM64_FEX_YMMSTATE) == CONTEXT_ARM64_FEX_YMMSTATE ||
++        arm64ec_x64_state( arm_ctx, ARM64EC_X64_STATE_YMM ))
++    {
++        xs->Mask |= 1 << XSTATE_AVX;
++        memcpy( &xs->YmmContext, arm_ctx->V + 16, sizeof(xs->YmmContext) );
++    }
++    else
++    {
++        xs->Mask &= ~(1 << XSTATE_AVX);
++        memset( &xs->YmmContext, 0, sizeof(xs->YmmContext) );  /* the initial state, for whoever reads it */
++    }
+ }
+ 
+ #endif /* __aarch64__ || __arm64ec__ */
+-- 
+2.50.1 (Apple Git-155)
+

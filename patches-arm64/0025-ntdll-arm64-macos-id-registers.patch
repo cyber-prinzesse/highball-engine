@@ -1,0 +1,104 @@
+From 83083bae3c8d8b08af61f332c9fca95a234be388 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 08:06:13 +0200
+Subject: [PATCH 1/4] ntdll: build the ARM64 ID registers from the macOS
+ feature sysctls
+
+FEX reads the host's ID_AA64* registers from the registry values ntdll fills (CP 40xx) to decide which x86 extensions it can implement: AES-NI, PCLMULQDQ, SHA-NI, CRC32 and others need the matching ARMv8 features. On macOS, reading ID registers from user space traps, so get_core_id_regs_arm64 returned nothing and FEX disabled every one of them although the M1 and later have them all. Build the registers field by field from hw.optional.arm.FEAT_* as the Arm ARM defines them. CTR_EL0 is not published and stays out.
+---
+ dlls/ntdll/unix/system.c | 79 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 79 insertions(+)
+
+diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
+index aaae9a2..c0b62cb 100644
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -2101,6 +2101,85 @@ static DWORD get_core_id_regs_arm64( struct smbios_wine_id_reg_value_arm64 *regs
+     return regidx;
+ }
+ 
++#elif defined(__APPLE__)
++
++/* macOS traps reads of the ID registers from user space, but publishes the features they describe as
++ * hw.optional.arm.FEAT_* sysctls. Build the registers from those, field by field as the Arm ARM defines
++ * them. A field left at zero means "not implemented", except FP and AdvSIMD in ID_AA64PFR0_EL1, where
++ * zero means implemented. CTR_EL0 (cache geometry) is not published, so it is left out. */
++static UINT64 id_field( const char *feature, unsigned int shift, UINT64 value )
++{
++    return has_feature( feature ) ? value << shift : 0;
++}
++
++static UINT64 id_field2( const char *feature2, UINT64 value2, const char *feature1, UINT64 value1, unsigned int shift )
++{
++    if (has_feature( feature2 )) return value2 << shift;
++    return id_field( feature1, shift, value1 );
++}
++
++static DWORD get_core_id_regs_arm64( struct smbios_wine_id_reg_value_arm64 *regs,
++                                     WORD logical_thread_id )
++{
++    UINT64 isar0 = 0, isar1 = 0, isar2 = 0, pfr0, pfr1 = 0, mmfr0 = 0, mmfr1 = 0, mmfr2 = 0;
++    DWORD regidx = 0;
++
++    isar0 |= id_field2( "FEAT_PMULL", 2, "FEAT_AES", 1, 4 );
++    isar0 |= id_field( "FEAT_SHA1", 8, 1 );
++    isar0 |= id_field2( "FEAT_SHA512", 2, "FEAT_SHA256", 1, 12 );
++    isar0 |= id_field( "FEAT_CRC32", 16, 1 );
++    isar0 |= id_field2( "FEAT_LSE128", 3, "FEAT_LSE", 2, 20 );
++    isar0 |= id_field( "FEAT_RDM", 28, 1 );
++    isar0 |= id_field( "FEAT_SHA3", 32, 1 );
++    isar0 |= id_field( "FEAT_DotProd", 44, 1 );
++    isar0 |= id_field( "FEAT_FHM", 48, 1 );
++    isar0 |= id_field2( "FEAT_FlagM2", 2, "FEAT_FlagM", 1, 52 );
++    isar0 |= id_field( "FEAT_RNG", 60, 1 );
++
++    isar1 |= id_field2( "FEAT_DPB2", 2, "FEAT_DPB", 1, 0 );
++    isar1 |= id_field( "FEAT_JSCVT", 12, 1 );
++    isar1 |= id_field( "FEAT_FCMA", 16, 1 );
++    isar1 |= has_feature( "FEAT_LRCPC3" ) ? 3ull << 20 : id_field2( "FEAT_LRCPC2", 2, "FEAT_LRCPC", 1, 20 );
++    isar1 |= id_field( "FEAT_FRINTTS", 32, 1 );
++    isar1 |= id_field( "FEAT_SB", 36, 1 );
++    isar1 |= id_field2( "FEAT_SPECRES2", 2, "FEAT_SPECRES", 1, 40 );
++    isar1 |= id_field2( "FEAT_EBF16", 2, "FEAT_BF16", 1, 44 );
++    isar1 |= id_field( "FEAT_I8MM", 52, 1 );
++
++    isar2 |= id_field( "FEAT_WFxT", 0, 2 );
++    isar2 |= id_field( "FEAT_RPRES", 4, 1 );
++    isar2 |= id_field( "FEAT_MOPS", 16, 1 );
++    isar2 |= id_field( "FEAT_HBC", 20, 1 );
++    isar2 |= id_field( "FEAT_CLRBHB", 28, 1 );
++    isar2 |= id_field( "FEAT_CSSC", 52, 1 );
++
++    pfr0 = 1 | (1 << 4);  /* EL0 and EL1: AArch64 only */
++    if (has_feature( "FEAT_FP16" )) pfr0 |= (1ull << 16) | (1ull << 20);  /* FP and AdvSIMD with half precision */
++    pfr0 |= id_field( "FEAT_DIT", 48, 1 );
++    pfr0 |= id_field2( "FEAT_CSV2_2", 2, "FEAT_CSV2", 1, 56 );
++    pfr0 |= id_field( "FEAT_CSV3", 60, 1 );
++
++    pfr1 |= id_field( "FEAT_BTI", 0, 1 );
++    pfr1 |= id_field2( "FEAT_SSBS2", 2, "FEAT_SSBS", 1, 4 );
++    pfr1 |= id_field2( "FEAT_SME2", 2, "FEAT_SME", 1, 24 );
++
++    mmfr0 |= id_field( "FEAT_ECV", 60, 1 );
++    mmfr1 |= id_field( "FEAT_AFP", 44, 1 );
++    mmfr2 |= id_field( "FEAT_LSE2", 32, 1 );
++
++    regs[regidx++] = (struct smbios_wine_id_reg_value_arm64){ 0x4000, (0x61 << 24) | (0x0f << 16) };  /* MIDR_EL1, as cpu_id */
++    regs[regidx++] = (struct smbios_wine_id_reg_value_arm64){ 0x4020, pfr0 };   /* ID_AA64PFR0_EL1 */
++    regs[regidx++] = (struct smbios_wine_id_reg_value_arm64){ 0x4021, pfr1 };   /* ID_AA64PFR1_EL1 */
++    regs[regidx++] = (struct smbios_wine_id_reg_value_arm64){ 0x4024, 0 };      /* ID_AA64ZFR0_EL1: no SVE */
++    regs[regidx++] = (struct smbios_wine_id_reg_value_arm64){ 0x4030, isar0 };  /* ID_AA64ISAR0_EL1 */
++    regs[regidx++] = (struct smbios_wine_id_reg_value_arm64){ 0x4031, isar1 };  /* ID_AA64ISAR1_EL1 */
++    regs[regidx++] = (struct smbios_wine_id_reg_value_arm64){ 0x4032, isar2 };  /* ID_AA64ISAR2_EL1 */
++    regs[regidx++] = (struct smbios_wine_id_reg_value_arm64){ 0x4038, mmfr0 };  /* ID_AA64MMFR0_EL1 */
++    regs[regidx++] = (struct smbios_wine_id_reg_value_arm64){ 0x4039, mmfr1 };  /* ID_AA64MMFR1_EL1 */
++    regs[regidx++] = (struct smbios_wine_id_reg_value_arm64){ 0x403a, mmfr2 };  /* ID_AA64MMFR2_EL1 */
++    return regidx;
++}
++
+ #else
+ 
+ static DWORD get_core_id_regs_arm64( struct smbios_wine_id_reg_value_arm64 *regs,
+-- 
+2.50.1 (Apple Git-155)
+

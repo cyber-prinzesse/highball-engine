@@ -1,0 +1,106 @@
+From 6f2804c160482cd30a73d9c5b62e20cfab8c6071 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 08:13:41 +0200
+Subject: [PATCH 09/13] ARM64EC: one MXCSR for x64 code and the native CRT
+
+x64 programs change MXCSR through the CRT's _controlfp, which is native ARM64EC code and sets FPCR and FPSR through __os_arm64x_set_x64_information. The JIT kept its own copy of the control bits and never looked at FPCR again: after _controlfp(_RC_DOWN) the arithmetic rounded down but STMXCSR still said nearest (and a save and restore of MXCSR then undid it), _DN_FLUSH never showed, and an exception unmasked with _controlfp never trapped, because the trap enables were armed from the stale copy on the way back into the JIT. Windows x64 shows all of them; Windows 11 on Arm shows the first two.
+
+The JIT now takes RC, FZ and DAZ (FPCR bit 19) back from FPCR whenever ARM64EC code enters or returns to x64 code, and inserts DAZ into FIZ there too. The exception masks stay the emulator's: GetX64Mxcsr and SetX64Mxcsr (not in the Windows interface) let ntdll's x64 information hooks read and set them, and native code keeps running with the trap enables off.
+---
+ .../Interface/Core/Dispatcher/Dispatcher.cpp  | 19 ++++++++++++++-
+ Source/Windows/ARM64EC/BTInterface.h          |  4 +++-
+ Source/Windows/ARM64EC/Module.cpp             | 23 +++++++++++++++++++
+ Source/Windows/ARM64EC/libarm64ecfex.def      |  2 ++
+ 4 files changed, 46 insertions(+), 2 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index ffa6ce1..4a2f988 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -121,7 +121,24 @@ void Dispatcher::EmitDispatcher() {
+ 
+   ldr(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
+ 
+-  FillSpecialRegs(TMP1, TMP2, {.SetFIZ = false, .SetPredRegs = true});
++  // FPCR holds the guest's MXCSR rounding mode, flush to zero and DAZ (bit 19, as in the ARM64EC context mapping)
++  // while ARM64EC code runs, and that code may change them on the guest's behalf: the CRT's _controlfp does, through
++  // __os_arm64x_set_x64_information. Take them back. The exception masks stay with the emulator (SetX64Mxcsr), the
++  // trap enables are off in native code.
++  // FPCR.RMode (23:22) 01 = towards +inf, 10 = towards -inf; MXCSR.RC (14:13) 01 = down, 10 = up.
++  mrs(TMP1, ARMEmitter::SystemRegister::FPCR);
++  ldr(TMP2.W(), STATE_PTR(CpuStateFrame, State.mxcsr));
++  ubfx(ARMEmitter::Size::i64Bit, TMP3, TMP1, 23, 1);
++  bfi(ARMEmitter::Size::i64Bit, TMP2, TMP3, 13, 1);
++  ubfx(ARMEmitter::Size::i64Bit, TMP3, TMP1, 22, 1);
++  bfi(ARMEmitter::Size::i64Bit, TMP2, TMP3, 14, 1);
++  ubfx(ARMEmitter::Size::i64Bit, TMP3, TMP1, 24, 1);
++  bfi(ARMEmitter::Size::i64Bit, TMP2, TMP3, 15, 1);
++  ubfx(ARMEmitter::Size::i64Bit, TMP3, TMP1, 19, 1);
++  bfi(ARMEmitter::Size::i64Bit, TMP2, TMP3, 6, 1);
++  str(TMP2.W(), STATE_PTR(CpuStateFrame, State.mxcsr));
++
++  FillSpecialRegs(TMP1, TMP2, {.SetFIZ = true, .SetPredRegs = true});
+ 
+   // As ARM64EC uses this as an entrypoint for both guest calls and host returns, opportunistically try to return
+   // using the call-ret stack to avoid unbalancing it.
+diff --git a/Source/Windows/ARM64EC/BTInterface.h b/Source/Windows/ARM64EC/BTInterface.h
+index aabc905..828096c 100644
+--- a/Source/Windows/ARM64EC/BTInterface.h
++++ b/Source/Windows/ARM64EC/BTInterface.h
+@@ -22,6 +22,8 @@ void STDMETHODCALLTYPE BTCpu64NotifyMemoryDirty(void* Address, SIZE_T Size);
+ void STDMETHODCALLTYPE BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After, NTSTATUS Status);
+ BOOLEAN STDMETHODCALLTYPE BTCpu64IsProcessorFeaturePresent(UINT Feature);
+ void STDMETHODCALLTYPE UpdateProcessorInformation(SYSTEM_CPU_INFORMATION* Info);
+-// Extension used by Wine's ntdll, not in the Windows interface
++// Extensions used by Wine's ntdll, not in the Windows interface
+ void STDMETHODCALLTYPE GetX87State(XMM_SAVE_AREA32* FltSave);
++BOOL STDMETHODCALLTYPE GetX64Mxcsr(UINT32* Mxcsr);
++BOOL STDMETHODCALLTYPE SetX64Mxcsr(UINT32 Mxcsr);
+ }
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index b58448e..32cb3a4 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -1258,6 +1258,29 @@ BOOLEAN BTCpu64IsProcessorFeaturePresent(UINT Feature) {
+   return CPUFeatures->IsFeaturePresent(Feature) ? TRUE : FALSE;
+ }
+ 
++// Not part of the Windows emulator interface. The MXCSR control bits of the calling thread's x64 code (masks, RC, FZ,
++// DAZ), for ntdll's __os_arm64x_get_x64_information and __os_arm64x_set_x64_information, which the x64 CRT's
++// _controlfp uses. The exception masks live only here: the JIT arms the FPCR trap enables from them, and native code
++// runs with the trap enables off. The status flags are FPSR, and native code keeps RC, FZ and DAZ in FPCR as well,
++// which the JIT takes back when it is entered again.
++BOOL GetX64Mxcsr(UINT32* Mxcsr) {
++  auto* Thread = GetCPUArea().ThreadState();
++  if (!Thread) {
++    return FALSE;
++  }
++  *Mxcsr = Thread->CurrentFrame->State.mxcsr & 0xFFC0;
++  return TRUE;
++}
++
++BOOL SetX64Mxcsr(UINT32 Mxcsr) {
++  auto* Thread = GetCPUArea().ThreadState();
++  if (!Thread) {
++    return FALSE;
++  }
++  Thread->CurrentFrame->State.mxcsr = Mxcsr & 0xFFC0;
++  return TRUE;
++}
++
+ // Not part of the Windows emulator interface. The calling thread's x87 state, for ntdll's RtlCaptureContext and setjmp,
+ // which run as native code and cannot read it: x64 Windows captures the live control word and RtlRestoreContext and
+ // longjmp load it back, so a made up one would reset the precision and rounding of every program that unwinds an
+diff --git a/Source/Windows/ARM64EC/libarm64ecfex.def b/Source/Windows/ARM64EC/libarm64ecfex.def
+index fe46723..97086b5 100644
+--- a/Source/Windows/ARM64EC/libarm64ecfex.def
++++ b/Source/Windows/ARM64EC/libarm64ecfex.def
+@@ -22,3 +22,5 @@ EXPORTS
+   ThreadTerm
+   UpdateProcessorInformation
+   GetX87State
++  GetX64Mxcsr
++  SetX64Mxcsr
+-- 
+2.50.1 (Apple Git-155)
+

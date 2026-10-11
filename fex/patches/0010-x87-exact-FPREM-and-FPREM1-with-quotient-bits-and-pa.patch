@@ -1,0 +1,180 @@
+From d2ec3c11a643649e387d9cddea470ad5a8eec9e9 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 08:20:41 +0200
+Subject: [PATCH 10/13] x87: exact FPREM and FPREM1 with quotient bits and
+ partial reduction
+
+FPREM divided, rounded the quotient to 64 bits, truncated it and multiplied back, so the remainder was wrong whenever the quotient needed more bits: 2^100 mod 3 gave 0 instead of 1, and 1 mod 2^-16400 gave minus infinity. C0, C3 and C1 never held the quotient bits that trigonometric range reduction reads, and C2 was always cleared, so programs never saw a partial remainder. FPREM1 used SoftFloat's IEEE remainder, right in value but also without the condition codes.
+
+Both now follow the Intel SDM: with an exponent difference below 64 the quotient is computed whole in 128-bit integers (truncated, or rounded to nearest even for FPREM1) and the remainder is exact; from 64 on, one step reduces by a multiple of ST(1) * 2^(D - N) with N = 32 + D mod 32, as AMD documents it, sets C2 and leaves the rest to the program's loop, and the quotient bits of the last step are those of the whole quotient. Operands that are NaN, infinite or zero keep SoftFloat's IEEE remainder, which matches the x87 results and gives the negative real indefinite; unsupported encodings raise invalid. The handler sets C0 to C3 and DE for a denormal operand, so the opcode table no longer clears C2. The reduced precision path is unchanged.
+---
+ FEXCore/Source/Common/SoftFloat.h             | 87 +++++++++++++++++++
+ .../Core/Interpreter/Fallbacks/F80Fallbacks.h | 22 ++++-
+ .../Interface/Core/X86Tables/X87Tables.cpp    |  4 +-
+ 3 files changed, 109 insertions(+), 4 deletions(-)
+
+diff --git a/FEXCore/Source/Common/SoftFloat.h b/FEXCore/Source/Common/SoftFloat.h
+index 3588fcd..00e8e62 100644
+--- a/FEXCore/Source/Common/SoftFloat.h
++++ b/FEXCore/Source/Common/SoftFloat.h
+@@ -232,6 +232,93 @@ struct FEX_PACKED X80SoftFloat {
+ #endif
+   }
+ 
++  struct FPREMInfo {
++    uint8_t Quotient;     // the low three bits of the quotient, for C0 (Q2), C3 (Q1) and C1 (Q0)
++    bool Partial;         // C2: the exponent difference was 64 or more and only part of it was reduced
++    bool DenormalOperand; // DE
++  };
++
++  // FPREM (RoundNearest false) and FPREM1 (true) as the Intel SDM defines them. The remainder is exact: with an
++  // exponent difference D below 64, Q is the whole quotient (truncated, or rounded to nearest even for FPREM1) and
++  // ST(0) - Q * ST(1) is computed in integers; from 64 on, the instruction reduces ST(0) by a multiple of
++  // ST(1) * 2^(D - N) and sets C2, and the program loops. N is 32 + D mod 32, as AMD documents it. Operands that are
++  // NaN, infinite or zero take SoftFloat's IEEE remainder, which gives the x87 results for them.
++  FEXCORE_PRESERVE_ALL_ATTR static X80SoftFloat
++  FPREM(softfloat_state* state, const X80SoftFloat& lhs, const X80SoftFloat& rhs, bool RoundNearest, FPREMInfo* Info) {
++    const auto Unsupported = [](const X80SoftFloat& v) {
++      return v.Top.Exponent != 0 && !(v.Significand & 0x8000'0000'0000'0000ULL);
++    };
++    const auto Denormal = [](const X80SoftFloat& v) {
++      return v.Top.Exponent == 0 && v.Significand != 0;
++    };
++    *Info = {0, false, Denormal(lhs) || Denormal(rhs)};
++
++    if (Unsupported(lhs) || Unsupported(rhs)) {
++      // An unnormal, pseudo-NaN or pseudo-infinity: invalid, the real indefinite
++      softfloat_raiseFlags(state, softfloat_flag_invalid);
++      return X80SoftFloat(1, 0x7FFF, 0xC000'0000'0000'0000ULL);
++    }
++    if (lhs.Top.Exponent == 0x7FFF || rhs.Top.Exponent == 0x7FFF || (lhs.Top.Exponent == 0 && lhs.Significand == 0) ||
++        (rhs.Top.Exponent == 0 && rhs.Significand == 0)) {
++      return extF80_rem(state, lhs, rhs);
++    }
++
++    // Both finite and nonzero: unbiased exponents of the normalised significands
++    const auto Normalise = [](const X80SoftFloat& v, uint64_t* Sig) {
++      int32_t Exp = (v.Top.Exponent ? v.Top.Exponent : 1) - 16383;
++      uint64_t M = v.Significand;
++      const int Shift = std::countl_zero(M);
++      *Sig = M << Shift;
++      return Exp - Shift;
++    };
++    uint64_t SigA, SigB;
++    const int32_t ExpA = Normalise(lhs, &SigA);
++    const int32_t ExpB = Normalise(rhs, &SigB);
++    const int32_t D = ExpA - ExpB;
++    bool Negate = false;
++    uint64_t Rem;
++    int32_t RemExp; // the remainder is Rem * 2^RemExp
++
++    if (D < 0) {
++      // |ST(0)| < |ST(1)|: Q is 0, or 1 for FPREM1 when |ST(0)| > |ST(1)| / 2
++      if (!RoundNearest || D < -1 || SigA <= SigB) {
++        return lhs;
++      }
++      Rem = SigB - (SigA - SigB); // D == -1: |ST(1)| is 2 * SigB in the units of ST(0)
++      RemExp = ExpA - 63;
++      Negate = true;
++      Info->Quotient = 1;
++    } else {
++      const int32_t N = D < 64 ? D : 32 + D % 32;
++      const unsigned __int128 Dividend = static_cast<unsigned __int128>(SigA) << N;
++      uint64_t Q = static_cast<uint64_t>(Dividend / SigB);
++      Rem = static_cast<uint64_t>(Dividend % SigB);
++      RemExp = ExpB - 63 + (D - N);
++      if (D >= 64) {
++        Info->Partial = true;
++      } else if (RoundNearest && (Rem > SigB - Rem || (Rem == SigB - Rem && (Q & 1)))) {
++        Q += 1;
++        Rem = SigB - Rem;
++        Negate = true;
++      }
++      Info->Quotient = Q & 7;
++    }
++
++    const uint16_t Sign = lhs.Top.Sign ^ (Negate ? 1 : 0);
++    if (Rem == 0) {
++      return X80SoftFloat(lhs.Top.Sign, 0, 0);
++    }
++    const int Shift = std::countl_zero(Rem);
++    int32_t Biased = RemExp + (63 - Shift) + 16383;
++    uint64_t Sig = Rem << Shift;
++    if (Biased <= 0) {
++      // A denormal result, still exact: the remainder is a multiple of the divisor's least significant bit
++      Sig >>= (1 - Biased);
++      Biased = 0;
++    }
++    return X80SoftFloat(Sign, static_cast<uint16_t>(Biased), Sig);
++  }
++
+   FEXCORE_PRESERVE_ALL_ATTR static X80SoftFloat FRNDINT(softfloat_state* state, const X80SoftFloat& lhs) {
+     return extF80_roundToInt(state, lhs, state->roundingMode, false);
+   }
+diff --git a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
+index 67c1ded..a9cfdea 100644
+--- a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
++++ b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
+@@ -68,6 +68,18 @@ FEXCORE_PRESERVE_ALL_ATTR static void HandleX87Exception(const softfloat_state&
+   Flags[FEXCore::X86State::X87FLAG_B_LOC] = Pending != 0;
+ }
+ 
++// FPREM and FPREM1 set the condition codes themselves: C2 for a partial remainder, C0 C3 C1 the quotient's low bits
++FEXCORE_PRESERVE_ALL_ATTR static void SetFPREMFlags(const X80SoftFloat::FPREMInfo& Info, FEXCore::Core::CpuStateFrame* Frame) {
++  auto& Flags = Frame->State.flags;
++  Flags[FEXCore::X86State::X87FLAG_C0_LOC] = (Info.Quotient >> 2) & 1;
++  Flags[FEXCore::X86State::X87FLAG_C3_LOC] = (Info.Quotient >> 1) & 1;
++  Flags[FEXCore::X86State::X87FLAG_C1_LOC] = Info.Quotient & 1;
++  Flags[FEXCore::X86State::X87FLAG_C2_LOC] = Info.Partial;
++  if (Info.DenormalOperand) {
++    Flags[FEXCore::X86State::X87FLAG_DE_LOC] = 1;
++  }
++}
++
+ // Wrapper for SoftFloat state to handle X87 exceptions
+ class ScopedSoftFloatState {
+ public:
+@@ -363,7 +375,10 @@ struct OpHandlers<IR::OP_F80FPREM1> {
+   FEXCORE_PRESERVE_ALL_ATTR static VectorRegType handle(uint16_t FCW, VectorRegType Src1, VectorRegType Src2, FEXCore::Core::CpuStateFrame* Frame) {
+     FEXCORE_PROFILE_INSTANT_INCREMENT(Frame->Thread, AccumulatedFloatFallbackCount, 1);
+     ScopedSoftFloatState State {FCW, Frame, true};
+-    return X80SoftFloat::FREM1(&State.State, Src1, Src2);
++    X80SoftFloat::FPREMInfo Info;
++    const X80SoftFloat Result = X80SoftFloat::FPREM(&State.State, Src1, Src2, true, &Info);
++    SetFPREMFlags(Info, Frame);
++    return Result;
+   }
+ };
+ 
+@@ -372,7 +387,10 @@ struct OpHandlers<IR::OP_F80FPREM> {
+   FEXCORE_PRESERVE_ALL_ATTR static VectorRegType handle(uint16_t FCW, VectorRegType Src1, VectorRegType Src2, FEXCore::Core::CpuStateFrame* Frame) {
+     FEXCORE_PROFILE_INSTANT_INCREMENT(Frame->Thread, AccumulatedFloatFallbackCount, 1);
+     ScopedSoftFloatState State {FCW, Frame, true};
+-    return X80SoftFloat::FREM(&State.State, Src1, Src2);
++    X80SoftFloat::FPREMInfo Info;
++    const X80SoftFloat Result = X80SoftFloat::FPREM(&State.State, Src1, Src2, false, &Info);
++    SetFPREMFlags(Info, Frame);
++    return Result;
+   }
+ };
+ 
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/X87Tables.cpp b/FEXCore/Source/Interface/Core/X86Tables/X87Tables.cpp
+index 4785d59..27883ab 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/X87Tables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/X87Tables.cpp
+@@ -364,10 +364,10 @@ constexpr std::array<DispatchTableEntry, 140> X87F80OpTable = {{
+   {OPD(0xD9, 0xF2), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80PTANSTACK, true>},
+   {OPD(0xD9, 0xF3), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80ATANSTACK, false>},
+   {OPD(0xD9, 0xF4), 1, &OpDispatchBuilder::X87FXTRACT},
+-  {OPD(0xD9, 0xF5), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80FPREM1STACK, true>},
++  {OPD(0xD9, 0xF5), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80FPREM1STACK, false>},
+   {OPD(0xD9, 0xF6), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87ModifySTP, false>},
+   {OPD(0xD9, 0xF7), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87ModifySTP, true>},
+-  {OPD(0xD9, 0xF8), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80FPREMSTACK, true>},
++  {OPD(0xD9, 0xF8), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80FPREMSTACK, false>},
+   {OPD(0xD9, 0xF9), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87FYL2X, true>},
+   {OPD(0xD9, 0xFA), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80SQRTSTACK, false>},
+   {OPD(0xD9, 0xFB), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::X87OpHelper, OP_F80SINCOSSTACK, true>},
+-- 
+2.50.1 (Apple Git-155)
+

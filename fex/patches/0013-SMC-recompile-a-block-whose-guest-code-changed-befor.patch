@@ -1,0 +1,143 @@
+From e49d9eba7555b2ddc33d315a9fbf033f710499bc Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 09:10:05 +0200
+Subject: [PATCH 13/13] SMC: recompile a block whose guest code changed before
+ its page was protected
+
+CompileBlock write-protects a page that holds no compiled code only after decoding it (MarkGuestExecutableRange). A store
+from another thread that landed between the decode and the protection did not fault, so the old instructions were
+compiled and nothing was left to invalidate them: the thread ran the old code for good. A JIT patching a call site that
+another thread is running hits this: in 3000 rounds of a single aligned 32-bit patch, 10 were never seen (500 ms
+timeout), and the cross-thread case of the fidelity tests failed in about 3% of runs on every build.
+
+The decoder now records where each instruction was read from and the bytes it read (ReadData copies immediates into the
+instruction buffer too). When the compilation protected a page, CompileBlock compares them with memory, and if the code
+changed it compiles again, with the protection in place: a store either happened before that decode or faults and waits
+for the compilation, which holds the code invalidation lock. 0 of 6000 patches missed, slowest 19 ms; 0 of 60
+cross-thread runs. Protecting before decoding closes the window as well, but then the writer faults again on every
+recompile of a function it is patching and the two threads livelock.
+---
+ FEXCore/Source/Interface/Core/Core.cpp     | 18 ++++++++++++++++++
+ FEXCore/Source/Interface/Core/Frontend.cpp | 22 ++++++++++++++++++++++
+ FEXCore/Source/Interface/Core/Frontend.h   |  7 +++++++
+ 3 files changed, 47 insertions(+)
+
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 06a1c9e..00d1898 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1006,6 +1006,10 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+     FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedDiskCacheMissCount, 1);
+   }
+ 
++  // See the SMC check below
++  bool SMCRecompiled = false;
++
++RecompileForSMC:
+   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
+   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
+ 
+@@ -1072,11 +1076,25 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+     auto BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
+     CodePages.reserve(BlockInfo->CodePages.size());
+     CodePages.insert(CodePages.end(), BlockInfo->CodePages.begin(), BlockInfo->CodePages.end());
++    bool ProtectedNow = false;
+     for (auto CodePage : BlockInfo->CodePages) {
+       if (Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE)) {
+         SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
++        ProtectedNow = true;
+       }
+     }
++
++    // A page whose SMC protection was put in place just now was decoded unprotected: another thread's writes could
++    // land between the decode and the protection without faulting, and the old instructions would stay compiled with
++    // nothing left to invalidate them. If the guest code changed, compile again: the protection is in place now, so a
++    // write either happened before the decode or faults and waits for this compilation to finish. Protecting before
++    // decoding would close the window too, but the writer then faults again on every recompile and can livelock.
++    if (ProtectedNow && !SMCRecompiled && !Thread->FrontendDecoder->DecodedCodeUnchanged()) {
++      SMCRecompiled = true;
++      Thread->CPUBackend->ClearRelocations();
++      Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
++      goto RecompileForSMC;
++    }
+   }
+ 
+   // Disk Cache
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index 78d5f1a..75f17ce 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -157,6 +157,10 @@ std::pair<uint64_t, bool> Decoder::ReadData(uint8_t Size) {
+     ReadByte();
+   }
+ #else
++  // Keep the instruction's bytes complete (DecodedCodeUnchanged)
++  if (InstructionSize + Size <= Instruction.size()) {
++    std::memcpy(&Instruction[InstructionSize], &Res, Size);
++  }
+   SkipBytes(Size);
+ #endif
+ 
+@@ -1606,7 +1610,12 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
+       }
+ 
+       LastFieldReadSize = 0;
++      const uint8_t* InstBytes = InstStream.AdjustedInstStream;
+       BlockIt->BlockStatus = DecodeInstruction(OpAddress);
++      if (DecodeInst->InstSize) {
++        DecodedCode.emplace_back(InstBytes, DecodeInst->InstSize);
++        DecodedCodeBytes.insert(DecodedCodeBytes.end(), Instruction.begin(), Instruction.begin() + DecodeInst->InstSize);
++      }
+       if (HitBadRelocation) {
+         BlockInfo.TotalInstructionCount = 0;
+         BlockInfo.Blocks = {*BlockIt};
+@@ -1738,8 +1747,21 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
+   }
+ }
+ 
++bool Decoder::DecodedCodeUnchanged() const {
++  const uint8_t* Bytes = DecodedCodeBytes.data();
++  for (const auto& [Code, Size] : DecodedCode) {
++    if (std::memcmp(Code, Bytes, Size) != 0) {
++      return false;
++    }
++    Bytes += Size;
++  }
++  return true;
++}
++
+ void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, uint64_t PC, uint64_t MaxInst) {
+   FEXCORE_PROFILE_SCOPED("DecodeInstructions");
++  DecodedCode.clear();
++  DecodedCodeBytes.clear();
+   BlockInfo.TotalInstructionCount = 0;
+   BlockInfo.Blocks.clear();
+   VisitedBlocks.clear();
+diff --git a/FEXCore/Source/Interface/Core/Frontend.h b/FEXCore/Source/Interface/Core/Frontend.h
+index 1fc0e6e..c12579a 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.h
++++ b/FEXCore/Source/Interface/Core/Frontend.h
+@@ -70,6 +70,9 @@ public:
+     return &BlockInfo;
+   }
+ 
++  // Whether the guest memory still holds the bytes the instructions were decoded from (self-modifying code check)
++  bool DecodedCodeUnchanged() const;
++
+   uint64_t DecodedMinAddress {};
+   uint64_t DecodedMaxAddress {~0ULL};
+ 
+@@ -183,6 +186,10 @@ private:
+   uint8_t InstructionSize {};
+   // Contains the full decoded instruction, unless it is a `Thunk` instruction.
+   std::array<uint8_t, MAX_INST_SIZE> Instruction;
++
++  // Where each decoded instruction was read from and its bytes as they were read, in decode order
++  fextl::vector<std::pair<const uint8_t*, uint8_t>> DecodedCode;
++  fextl::vector<uint8_t> DecodedCodeBytes;
+   uint8_t LastEscapePrefix {};
+   FEXCore::X86Tables::DecodedInst* DecodeInst;
+ 
+-- 
+2.50.1 (Apple Git-155)
+

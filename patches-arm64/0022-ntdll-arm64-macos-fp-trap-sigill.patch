@@ -1,0 +1,79 @@
+--- a/dlls/ntdll/unix/signal_arm64.c
++++ b/dlls/ntdll/unix/signal_arm64.c
+@@ -214,6 +214,15 @@
+ #define ESR_ELx_EC_SOFTSTP_LOW          0x32
+ #define ESR_ELx_EC_SOFTSTP_CUR          0x33
+ #define ESR_ELx_EC_BRK64                0x3c
++#define ESR_ELx_EC_FP_EXC64             0x2c
++#define ESR_ELx_ISS_FP_TFV(esr)         (((esr) >> 23) & 0x01)
++#define ESR_ELx_ISS_FP_IOF              0x01
++#define ESR_ELx_ISS_FP_DZF              0x02
++#define ESR_ELx_ISS_FP_OFF              0x04
++#define ESR_ELx_ISS_FP_UFF              0x08
++#define ESR_ELx_ISS_FP_IXF              0x10
++#define ESR_ELx_ISS_FP_IDF              0x80
++#define FPCR_TRAP_ENABLES               0x9f00  /* IOE DZE OFE UFE IXE IDE */
+ #define ESR_ELx_ISS_DABT_WNR(esr)       (((esr) >> 6) & 0x01)
+ #define ESR_ELx_ISS_BRK_COMMENT(esr)    ((esr) & 0xffff)
+ #define ESR_ELx_ISS_DFSC(esr)           ((esr) & 0x3f)
+@@ -302,6 +311,25 @@
+     sigcontext->uc_mcontext->__ns.__fpcr = context->Fpcr;
+     sigcontext->uc_mcontext->__ns.__fpsr = context->Fpsr;
+     memcpy( sigcontext->uc_mcontext->__ns.__v, context->V, sizeof(context->V) );
++#endif
++}
++
++
++/***********************************************************************
++ *           clear_fpcr_traps
++ *
++ * Clear the floating-point trap enables in a sigcontext, so that the code
++ * the signal returns to (the exception dispatcher) cannot trap. The CONTEXT
++ * keeps the thread's FPCR for NtContinue.
++ */
++static void clear_fpcr_traps( ucontext_t *sigcontext )
++{
++#ifdef linux
++    struct fpsimd_context *fp = get_fpsimd_context( sigcontext );
++
++    if (fp) fp->fpcr &= ~FPCR_TRAP_ENABLES;
++#elif defined(__APPLE__)
++    sigcontext->uc_mcontext->__ns.__fpcr &= ~FPCR_TRAP_ENABLES;
+ #endif
+ }
+ 
+@@ -797,6 +825,7 @@
+     SP_sig(sigcontext) = (ULONG_PTR)stack;
+     PC_sig(sigcontext) = (ULONG_PTR)pKiUserExceptionDispatcher;
+     REGn_sig(18, sigcontext) = (ULONG_PTR)data->teb;
++    clear_fpcr_traps( sigcontext );
+ }
+ 
+ 
+@@ -1185,7 +1214,26 @@
+     CONTEXT context;
+     EXCEPTION_RECORD rec = { .ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION,
+                              .ExceptionAddress = (void *)PC_sig(sigcontext) };
++    DWORD64 esr = get_fault_esr( sigcontext );
+ 
++    /* A trapped floating-point exception (the FPCR trap enables, which Apple
++     * silicon implements) arrives on macOS as SIGILL with ILL_ILLTRP; the
++     * syndrome tells it apart (Linux reports these as SIGFPE, see fpe_handler).
++     * The fault reports the instruction, like a SIMD exception on x86-64. */
++    if (ESR_ELx_EC(esr) == ESR_ELx_EC_FP_EXC64)
++    {
++        if (!ESR_ELx_ISS_FP_TFV(esr) || (esr & ESR_ELx_ISS_FP_IOF)) rec.ExceptionCode = EXCEPTION_FLT_INVALID_OPERATION;
++        else if (esr & ESR_ELx_ISS_FP_DZF) rec.ExceptionCode = EXCEPTION_FLT_DIVIDE_BY_ZERO;
++        else if (esr & ESR_ELx_ISS_FP_OFF) rec.ExceptionCode = EXCEPTION_FLT_OVERFLOW;
++        else if (esr & ESR_ELx_ISS_FP_UFF) rec.ExceptionCode = EXCEPTION_FLT_UNDERFLOW;
++        else if (esr & ESR_ELx_ISS_FP_IXF) rec.ExceptionCode = EXCEPTION_FLT_INEXACT_RESULT;
++        else if (esr & ESR_ELx_ISS_FP_IDF) rec.ExceptionCode = EXCEPTION_FLT_DENORMAL_OPERAND;
++        else rec.ExceptionCode = EXCEPTION_FLT_INVALID_OPERATION;
++        save_context( &context, sigcontext );
++        setup_raise_exception( data, sigcontext, &rec, &context );
++        return;
++    }
++
+     if (!(PSTATE_sig( sigcontext ) & 0x10) && /* AArch64 (not WoW) */
+         !(PC_sig( sigcontext ) & 3))
+     {

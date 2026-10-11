@@ -1,0 +1,428 @@
+From cec94ecd43a0b8b3913f9160d5bf4f0c72588a57 Mon Sep 17 00:00:00 2001
+From: fid <fid@local>
+Date: Sun, 11 Oct 2026 07:06:28 +0200
+Subject: [PATCH 02/13] ARM64EC: raise the guest divide error (#DE) for
+ DIV/IDIV
+
+---
+ FEXCore/Source/Interface/Core/JIT/ALUOps.cpp  | 106 ++++++++++++++++++
+ FEXCore/Source/Interface/Core/JIT/JIT.cpp     |  24 +++-
+ .../Interface/Core/OpcodeDispatcher.cpp       |  10 +-
+ FEXCore/Source/Interface/IR/IR.json           |  12 +-
+ FEXCore/include/FEXCore/Core/HostFeatures.h   |   3 +
+ FEXCore/include/FEXCore/Core/X86Enums.h       |   6 +
+ Source/Windows/ARM64EC/Module.cpp             |  14 +++
+ Source/Windows/Common/CPUFeatures.cpp         |   2 +
+ 8 files changed, 167 insertions(+), 10 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp b/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
+index da361f9..150b0cf 100644
+--- a/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
+@@ -865,6 +865,25 @@ DEF_OP(PExt) {
+   }
+ }
+ 
++// Guest divide error (#DE) checks for DIV/IDIV when HostFeatures::EmitDivideTraps is set. They never touch NZCV:
++// the guest flags may live there and a faulting DIV leaves them unchanged. A failing check branches to a brk that
++// the frontend turns into the guest exception (X86State::DIVIDE_TRAP_*), with the guest registers still holding
++// their values from before the instruction.
++struct DivTraps {
++  ARMEmitter::ForwardLabel Zero {};
++  ARMEmitter::ForwardLabel Overflow {};
++};
++
++static void EmitDivTraps(Arm64JITCore* Core, DivTraps& Traps) {
++  ARMEmitter::ForwardLabel Done {};
++  (void)Core->b(&Done);
++  (void)Core->Bind(&Traps.Zero);
++  Core->brk(X86State::DIVIDE_TRAP_ZERO);
++  (void)Core->Bind(&Traps.Overflow);
++  Core->brk(X86State::DIVIDE_TRAP_OVERFLOW);
++  (void)Core->Bind(&Done);
++}
++
+ DEF_OP(Div) {
+   auto Op = IROp->C<IR::IROp_Div>();
+   const auto OpSize = IROp->Size;
+@@ -874,9 +893,25 @@ DEF_OP(Div) {
+   auto Lower = GetReg(Op->Lower);
+   auto Divisor = GetReg(Op->Divisor);
+ 
++  const bool Trap = Op->TrapBits && CTX->HostFeatures.EmitDivideTraps;
++  DivTraps Traps;
++  if (Trap) {
++    // The divisor is only valid in its low TrapBits bits for a 32-bit divide (the frontend allows garbage above).
++    (void)cbz(Op->TrapBits == 64 ? ARMEmitter::Size::i64Bit : ARMEmitter::Size::i32Bit, Divisor, &Traps.Zero);
++  }
++
+   if (Op->Upper.IsInvalid()) {
+     const auto EmitSize = ConvertSize(IROp);
+ 
++    if (Trap && IR::OpSizeAsBits(OpSize) == Op->TrapBits && OpSize >= IR::OpSize::i32Bit) {
++      // Upper was a sign extension of Lower (dropped by RA): only MIN / -1 overflows
++      const uint64_t Min = OpSize == IR::OpSize::i64Bit ? 0x8000'0000'0000'0000ULL : 0x8000'0000ULL;
++      eor(EmitSize, TMP1, Lower, Min);
++      add(EmitSize, TMP2, Divisor, 1);
++      orr(EmitSize, TMP1, TMP1, TMP2);
++      (void)cbz(EmitSize, TMP1, &Traps.Overflow);
++    }
++
+     if (OpSize == IR::OpSize::i8Bit) {
+       sxtb(EmitSize, TMP1, Lower);
+       sxtb(EmitSize, TMP2, Divisor);
+@@ -892,7 +927,17 @@ DEF_OP(Div) {
+     }
+ 
+     sdiv(EmitSize, Quotient, Lower, Divisor);
++    if (Trap && IR::OpSizeAsBits(OpSize) > Op->TrapBits) {
++      // IDIV r/m8: a 16-bit dividend divided as a 64-bit one, the quotient has to fit in TrapBits bits
++      LOGMAN_THROW_A_FMT(Op->TrapBits == 8, "Unexpected trap width {}", Op->TrapBits);
++      sxtb(ARMEmitter::Size::i64Bit, TMP3, Quotient);
++      eor(ARMEmitter::Size::i64Bit, TMP3, TMP3, Quotient);
++      (void)cbnz(ARMEmitter::Size::i64Bit, TMP3, &Traps.Overflow);
++    }
+     msub(EmitSize, Remainder, Quotient, Divisor, Lower);
++    if (Trap) {
++      EmitDivTraps(this, Traps);
++    }
+     return;
+   }
+ 
+@@ -907,6 +952,12 @@ DEF_OP(Div) {
+     bfi(EmitSize, TMP1, Upper, 16, 16);
+     sxth(EmitSize, TMP2, Divisor);
+     sdiv(EmitSize, Quotient, TMP1, TMP2);
++    if (Trap) {
++      // 32-bit quotient of DX:AX, has to fit in 16 bits (covers INT32_MIN / -1 too)
++      sxth(EmitSize, TMP3, Quotient);
++      eor(EmitSize, TMP3, TMP3, Quotient);
++      (void)cbnz(EmitSize, TMP3, &Traps.Overflow);
++    }
+     msub(EmitSize, Remainder, Quotient, TMP2, TMP1);
+     break;
+   }
+@@ -916,6 +967,12 @@ DEF_OP(Div) {
+     bfi(EmitSize, TMP1, Upper, 32, 32);
+     sxtw(TMP2, Divisor.W());
+     sdiv(EmitSize, Quotient, TMP1, TMP2);
++    if (Trap) {
++      // 64-bit quotient of EDX:EAX, has to fit in 32 bits (covers INT64_MIN / -1 too)
++      sxtw(TMP3, Quotient.W());
++      eor(EmitSize, TMP3, TMP3, Quotient);
++      (void)cbnz(EmitSize, TMP3, &Traps.Overflow);
++    }
+     msub(EmitSize, Remainder, Quotient, TMP2, TMP1);
+     break;
+   }
+@@ -943,6 +1000,12 @@ DEF_OP(Div) {
+       blr(TMP4);
+       ldr<ARMEmitter::IndexType::POST>(ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, 16);
+ 
++      if (Trap) {
++        // The helper returns the divisor as the remainder when the quotient does not fit in 64 bits
++        eor(EmitSize, TMP4, TMP2, Divisor);
++        (void)cbz(EmitSize, TMP4, &Traps.Overflow);
++      }
++
+       // Move results to the destination registers
+       mov(EmitSize, Quotient, TMP1);
+       mov(EmitSize, Remainder, TMP2);
+@@ -954,6 +1017,13 @@ DEF_OP(Div) {
+     (void)Bind(&Only64Bit);
+     // 64-Bit only
+     {
++      if (Trap) {
++        // INT64_MIN / -1
++        eor(EmitSize, TMP1, Lower, 0x8000'0000'0000'0000ULL);
++        add(EmitSize, TMP2, Divisor, 1);
++        orr(EmitSize, TMP1, TMP1, TMP2);
++        (void)cbz(EmitSize, TMP1, &Traps.Overflow);
++      }
+       sdiv(EmitSize, Quotient, Lower, Divisor);
+       msub(EmitSize, Remainder, Quotient, Divisor, Lower);
+     }
+@@ -963,6 +1033,10 @@ DEF_OP(Div) {
+   }
+   default: LOGMAN_MSG_A_FMT("Unknown DIV Size: {}", OpSize); break;
+   }
++
++  if (Trap) {
++    EmitDivTraps(this, Traps);
++  }
+ }
+ 
+ DEF_OP(UDiv) {
+@@ -974,12 +1048,26 @@ DEF_OP(UDiv) {
+   const auto Lower = GetReg(Op->Lower);
+   const auto Divisor = GetReg(Op->Divisor);
+ 
++  const bool Trap = Op->TrapBits && CTX->HostFeatures.EmitDivideTraps;
++  DivTraps Traps;
++  if (Trap) {
++    (void)cbz(Op->TrapBits == 64 ? ARMEmitter::Size::i64Bit : ARMEmitter::Size::i32Bit, Divisor, &Traps.Zero);
++  }
++
+   // Each source is OpSize in size
+   // So you can have up to a 128bit divide from x86-64=
+   if (Op->Upper.IsInvalid()) {
+     const auto EmitSize = ConvertSize(IROp);
+     udiv(EmitSize, Quotient, Lower, Divisor);
++    if (Trap && IR::OpSizeAsBits(OpSize) > Op->TrapBits) {
++      // DIV r/m8 (AX / r/m8) and AAM: the quotient has to fit in TrapBits bits
++      lsr(EmitSize, TMP3, Quotient, Op->TrapBits);
++      (void)cbnz(EmitSize, TMP3, &Traps.Overflow);
++    }
+     msub(EmitSize, Remainder, Quotient, Divisor, Lower);
++    if (Trap) {
++      EmitDivTraps(this, Traps);
++    }
+     return;
+   }
+ 
+@@ -991,6 +1079,10 @@ DEF_OP(UDiv) {
+     uxth(EmitSize, TMP1, Lower);
+     bfi(EmitSize, TMP1, Upper, 16, 16);
+     udiv(EmitSize, Quotient, TMP1, Divisor);
++    if (Trap) {
++      lsr(EmitSize, TMP3, Quotient, 16);
++      (void)cbnz(EmitSize, TMP3, &Traps.Overflow);
++    }
+     msub(EmitSize, Remainder, Quotient, Divisor, TMP1);
+     break;
+   }
+@@ -1003,6 +1095,10 @@ DEF_OP(UDiv) {
+     mov(EmitSize, TMP1, Lower);
+     bfi(EmitSize, TMP1, Upper, 32, 32);
+     udiv(EmitSize, Quotient, TMP1, TMP2);
++    if (Trap) {
++      lsr(EmitSize, TMP3, Quotient, 32);
++      (void)cbnz(EmitSize, TMP3, &Traps.Overflow);
++    }
+     msub(EmitSize, Remainder, Quotient, TMP2, TMP1);
+     break;
+   }
+@@ -1026,6 +1122,12 @@ DEF_OP(UDiv) {
+       blr(TMP4);
+       ldr<ARMEmitter::IndexType::POST>(ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, 16);
+ 
++      if (Trap) {
++        // The helper returns the divisor as the remainder when RDX >= divisor (the quotient does not fit)
++        eor(EmitSize, TMP4, TMP2, Divisor);
++        (void)cbz(EmitSize, TMP4, &Traps.Overflow);
++      }
++
+       // Move results to the destination registers
+       mov(EmitSize, Quotient, TMP1);
+       mov(EmitSize, Remainder, TMP2);
+@@ -1046,6 +1148,10 @@ DEF_OP(UDiv) {
+   }
+   default: LOGMAN_MSG_A_FMT("Unknown LUDIV Size: {}", OpSize); break;
+   }
++
++  if (Trap) {
++    EmitDivTraps(this, Traps);
++  }
+ }
+ 
+ DEF_OP(Not) {
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index cd0e052..a8cc130 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -51,9 +51,19 @@ struct DivRem {
+   uint64_t Remainder;
+ };
+ 
++// 128 / 64-bit divides for DIV/IDIV r/m64. When the quotient does not fit in 64 bits (x86 raises #DE) the
++// remainder returned is the divisor itself, which no valid result has; the JIT checks for it when divide traps
++// are enabled. A zero divisor never reaches here with traps enabled; without them the result is unspecified.
+ static struct DivRem LUDIV(uint64_t SrcHigh, uint64_t SrcLow, uint64_t Divisor) {
+   __uint128_t Source = (static_cast<__uint128_t>(SrcHigh) << 64) | SrcLow;
+ 
++  if (Divisor == 0) {
++    return {};
++  }
++  if (SrcHigh >= Divisor) {
++    return {.Quotient = (uint64_t)(Source / Divisor), .Remainder = Divisor};
++  }
++
+   return {
+     .Quotient = (uint64_t)(Source / Divisor),
+     .Remainder = (uint64_t)(Source % Divisor),
+@@ -64,8 +74,20 @@ static struct DivRem
+ LDIV(uint64_t SrcHigh, uint64_t SrcLow, int64_t Divisor) {
+   __int128_t Source = (static_cast<__uint128_t>(SrcHigh) << 64) | SrcLow;
+ 
++  if (Divisor == 0) {
++    return {};
++  }
++  if (Divisor == -1 && Source == static_cast<__int128_t>(static_cast<__uint128_t>(1) << 127)) {
++    return {.Quotient = 0, .Remainder = (uint64_t)Divisor};
++  }
++
++  const __int128_t Quotient = Source / Divisor;
++  if (Quotient != static_cast<int64_t>(Quotient)) {
++    return {.Quotient = (uint64_t)Quotient, .Remainder = (uint64_t)Divisor};
++  }
++
+   return {
+-    .Quotient = (uint64_t)(Source / Divisor),
++    .Quotient = (uint64_t)Quotient,
+     .Remainder = (uint64_t)(Source % Divisor),
+   };
+ }
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 8dc605c..9b03225 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -2935,7 +2935,7 @@ void OpDispatchBuilder::AAMOp(OpcodeArgs) {
+   auto Imm8 = Constant(Op->Src[0].Literal() & 0xFF);
+   Ref Quotient = _AllocateGPR(true);
+   Ref Remainder = _AllocateGPR(true);
+-  _UDiv(OpSize::i64Bit, AL, Invalid(), Imm8, Quotient, Remainder);
++  _UDiv(OpSize::i64Bit, AL, Invalid(), Imm8, 8, Quotient, Remainder);
+   auto Res = _AddShift(OpSize::i64Bit, Remainder, Quotient, ShiftType::LSL, 8);
+   StoreGPRRegister(X86State::REG_RAX, Res, OpSize::i16Bit);
+ 
+@@ -3734,7 +3734,7 @@ void OpDispatchBuilder::DIVOp(OpcodeArgs) {
+   if (Size == OpSize::i8Bit) {
+     Ref Src1 = LoadGPRRegister(X86State::REG_RAX, OpSize::i16Bit);
+ 
+-    _UDiv(OpSize::i16Bit, Src1, Invalid(), Divisor, Quotient, Remainder);
++    _UDiv(OpSize::i16Bit, Src1, Invalid(), Divisor, 8, Quotient, Remainder);
+ 
+     // AX[15:0] = concat<URem[7:0]:UDiv[7:0]>
+     auto ResultAX = _Bfi(GPRSize, 8, 8, Quotient, Remainder);
+@@ -3743,7 +3743,7 @@ void OpDispatchBuilder::DIVOp(OpcodeArgs) {
+     Ref Src1 = LoadGPRRegister(X86State::REG_RAX);
+     Ref Src2 = LoadGPRRegister(X86State::REG_RDX);
+ 
+-    _UDiv(Size, Src1, Src2, Divisor, Quotient, Remainder);
++    _UDiv(Size, Src1, Src2, Divisor, IR::OpSizeAsBits(Size), Quotient, Remainder);
+ 
+     if (Size == OpSize::i32Bit) {
+       Quotient = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Quotient);
+@@ -3777,7 +3777,7 @@ void OpDispatchBuilder::IDIVOp(OpcodeArgs) {
+     Src1 = _Sbfe(OpSize::i64Bit, 16, 0, Src1);
+     Divisor = _Sbfe(OpSize::i64Bit, 8, 0, Divisor);
+ 
+-    _Div(OpSize::i64Bit, Src1, Invalid(), Divisor, Quotient, Remainder);
++    _Div(OpSize::i64Bit, Src1, Invalid(), Divisor, 8, Quotient, Remainder);
+ 
+     // AX[15:0] = concat<URem[7:0]:UDiv[7:0]>
+     auto ResultAX = _Bfi(GPRSize, 8, 8, Quotient, Remainder);
+@@ -3786,7 +3786,7 @@ void OpDispatchBuilder::IDIVOp(OpcodeArgs) {
+     Ref Src1 = LoadGPRRegister(X86State::REG_RAX);
+     Ref Src2 = LoadGPRRegister(X86State::REG_RDX);
+ 
+-    _Div(Size, Src1, Src2, Divisor, Quotient, Remainder);
++    _Div(Size, Src1, Src2, Divisor, IR::OpSizeAsBits(Size), Quotient, Remainder);
+ 
+     if (Size == OpSize::i32Bit) {
+       Quotient = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Quotient);
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index 16954a0..1523415 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -1610,20 +1610,24 @@
+         ]
+       },
+ 
+-      "GPR:$Quotient, GPR:$Remainder = Div OpSize:#Size, GPR:$Lower, GPR:$Upper, GPR:$Divisor": {
++      "GPR:$Quotient, GPR:$Remainder = Div OpSize:#Size, GPR:$Lower, GPR:$Upper, GPR:$Divisor, u8:$TrapBits": {
+         "Desc": ["Integer long signed division returning lower bits",
+                  "The Lower and Upper registers will be concated together to generate a dividend twice the size",
+                  "Then the divisor divides the temporary dividend and returns the results in the original sized register",
+-                 "If Upper is invalid, this is a non-long division."
++                 "If Upper is invalid, this is a non-long division.",
++                 "TrapBits, when not zero, is the width of the x86 quotient: with divide traps enabled the backend raises",
++                 "the guest's divide error for a zero divisor or a quotient that does not fit in TrapBits bits."
+                 ],
+         "DestSize": "Size",
+         "HasSideEffects": true
+       },
+-      "GPR:$Quotient, GPR:$Remainder = UDiv OpSize:#Size, GPR:$Lower, GPR:$Upper, GPR:$Divisor": {
++      "GPR:$Quotient, GPR:$Remainder = UDiv OpSize:#Size, GPR:$Lower, GPR:$Upper, GPR:$Divisor, u8:$TrapBits": {
+         "Desc": ["Integer long unsigned division returning lower bits",
+                  "The Lower and Upper registers will be concated together to generate a dividend twice the size",
+                  "Then the divisor divides the temporary dividend and returns the results in the original sized register",
+-                 "If Upper is invalid, this is a non-long division."
++                 "If Upper is invalid, this is a non-long division.",
++                 "TrapBits, when not zero, is the width of the x86 quotient: with divide traps enabled the backend raises",
++                 "the guest's divide error for a zero divisor or a quotient that does not fit in TrapBits bits."
+                 ],
+         "DestSize": "Size",
+         "HasSideEffects": true
+diff --git a/FEXCore/include/FEXCore/Core/HostFeatures.h b/FEXCore/include/FEXCore/Core/HostFeatures.h
+index 9708cd9..089734b 100644
+--- a/FEXCore/include/FEXCore/Core/HostFeatures.h
++++ b/FEXCore/include/FEXCore/Core/HostFeatures.h
+@@ -89,6 +89,9 @@ struct HostFeatures {
+ 
+   // This affects codegen, but it isn't machine state
+   HostTypeEnum HostType {};
++  // Integer DIV/IDIV raise the guest divide error (#DE) for a zero divisor or an overflowing quotient
++  // (AArch64 division never traps). Needs a frontend that maps X86State::DIVIDE_TRAP_* to its exception.
++  bool EmitDivideTraps {};
+ 
+   // MIDR information
+   // Also used for determining number of CPU cores for CPUID
+diff --git a/FEXCore/include/FEXCore/Core/X86Enums.h b/FEXCore/include/FEXCore/Core/X86Enums.h
+index 8c3b1c9..6c361bc 100644
+--- a/FEXCore/include/FEXCore/Core/X86Enums.h
++++ b/FEXCore/include/FEXCore/Core/X86Enums.h
+@@ -128,6 +128,12 @@ enum X86TrapNo : uint32_t {
+   X86_TRAPNO_IRET = 32,     // IRET exception
+ };
+ 
++// brk immediates the JIT executes for a guest divide error (#DE) when HostFeatures::EmitDivideTraps is set, at the
++// host PC of the faulting DIV/IDIV with the guest state untouched. The frontend raises its own exception for them
++// (Windows: STATUS_INTEGER_DIVIDE_BY_ZERO for a zero divisor, STATUS_INTEGER_OVERFLOW for a quotient that does not fit).
++constexpr uint16_t DIVIDE_TRAP_ZERO = 0xDE00;
++constexpr uint16_t DIVIDE_TRAP_OVERFLOW = 0xDE01;
++
+ // X86 page fault error code bits
+ // Populates siginfo gregs[REG_ERR]
+ enum X86PageFaultBit : uint32_t {
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index d031d77..3f5e23e 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -848,6 +848,20 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+     return true;
+   }
+ 
++  // Guest divide errors (EmitDivideTraps): the JIT stopped at a brk before the DIV/IDIV wrote anything, so the
++  // reconstructed state is the one from before the instruction, as with a real #DE. Windows reports a zero divisor
++  // as STATUS_INTEGER_DIVIDE_BY_ZERO and a quotient that does not fit as STATUS_INTEGER_OVERFLOW.
++  static constexpr uint32_t DivideZeroTrapMagic {0xD4200000 | (FEXCore::X86State::DIVIDE_TRAP_ZERO << 5)};
++  static constexpr uint32_t DivideOverflowTrapMagic {0xD4200000 | (FEXCore::X86State::DIVIDE_TRAP_OVERFLOW << 5)};
++  if (Exception->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION && IsJIT) {
++    const uint32_t Instr = *reinterpret_cast<uint32_t*>(NativeContext->Pc);
++    if (Instr == DivideZeroTrapMagic || Instr == DivideOverflowTrapMagic) {
++      Exception->ExceptionCode = Instr == DivideZeroTrapMagic ? EXCEPTION_INT_DIVIDE_BY_ZERO : EXCEPTION_INT_OVERFLOW;
++      Exception->ExceptionFlags = 0;
++      Exception->NumberParameters = 0;
++    }
++  }
++
+   if (IsEmulatorStackAddress(CPUArea, reinterpret_cast<uint64_t>(__builtin_frame_address(0)))) {
+     Exception::RethrowGuestException(*Exception, *NativeContext);
+     LogMan::Msg::DFmt("Rethrowing onto guest stack: {:X}", NativeContext->Sp);
+diff --git a/Source/Windows/Common/CPUFeatures.cpp b/Source/Windows/Common/CPUFeatures.cpp
+index c033db8..35a70b3 100644
+--- a/Source/Windows/Common/CPUFeatures.cpp
++++ b/Source/Windows/Common/CPUFeatures.cpp
+@@ -85,6 +85,8 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
+ 
+   HostFeatures.HostType = HostType;
+   HostFeatures.ProcessPID = ProcessPID;
++  // The ARM64EC frontend maps the JIT's divide traps to STATUS_INTEGER_DIVIDE_BY_ZERO/OVERFLOW
++  HostFeatures.EmitDivideTraps = HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec;
+ 
+   if (HostType == FEXCore::HostFeatures::HostTypeEnum::Wow64) {
+     // AVX is unsupported for WOW64
+-- 
+2.50.1 (Apple Git-155)
+

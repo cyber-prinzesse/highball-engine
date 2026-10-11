@@ -1,0 +1,235 @@
+From a3da045f8ff2596e10773db33f9630014343c3af Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 08:05:45 +0200
+Subject: [PATCH 05/13] REP MOVS/STOS: a fault part way through resumes at the
+ iteration the loop reached
+
+MemCpy and MemSet run the whole instruction as one loop over copies of RCX, RSI and RDI, so a fault inside it left the guest registers at the first iteration and a handler that continued (a page committed on demand, a guard page) restarted the copy from the start. For an overlapping copy (memmove) that reads source bytes the first pass already overwrote: 2047 of 4096 bytes came out wrong in the reproducer. x86 reports the faulting iteration and continues from there.
+
+RestoreStringOpProgressFromHostPC recognises the loop's loads and stores at the fault PC (DecodeStringLoopAccess, next to the emitters), checks that the guest instruction is REP MOVS or STOS, and moves RCX, RSI and RDI to the element or 32-byte block the loop reached; the continued instruction redoes that block, which is harmless because the block loops only run when |dst - src| >= 32. ARM64EC's ReconstructThreadState applies it for guest exceptions and for inline self-modifying code. The fault address stays the host one, in the same page as the x86 one. MOPS forms are left alone.
+---
+ FEXCore/Source/Interface/Context/Context.h    |  1 +
+ FEXCore/Source/Interface/Core/Core.cpp        | 65 +++++++++++++++++++
+ FEXCore/Source/Interface/Core/JIT/JITClass.h  |  9 +++
+ .../Source/Interface/Core/JIT/MemoryOps.cpp   | 52 +++++++++++++++
+ FEXCore/include/FEXCore/Core/Context.h        |  4 ++
+ Source/Windows/ARM64EC/Module.cpp             |  3 +
+ 6 files changed, 134 insertions(+)
+
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 9f427da..10fe6c6 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -152,6 +152,7 @@ public:
+   uint64_t GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thread) override;
+ 
+   uint64_t RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) override;
++  bool RestoreStringOpProgressFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, const uint64_t* HostGPRs) override;
+   uint32_t ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, bool WasInJIT, const uint64_t* HostGPRs, uint64_t PSTATE) override;
+   void SetFlagsFromCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, uint32_t EFLAGS) override;
+ 
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 9f0c0af..06a1c9e 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -204,6 +204,71 @@ uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* T
+   return Frame->State.rip;
+ }
+ 
++bool ContextImpl::RestoreStringOpProgressFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, const uint64_t* HostGPRs) {
++  // REP MOVS/STOS run as one loop over copies of RCX/RSI/RDI, which only change once it ends, so a fault part way
++  // through finds them at the first iteration. x86 reports the iteration that faulted and continues from there; a
++  // restart from the first one would redo an overlapping copy (memmove) from source bytes it already overwrote. The
++  // loop's destination pointer gives the iteration it reached: the faulting element, or the start of the faulting
++  // 32-byte block, which the continued instruction redoes (the block loops only run when |dst - src| >= 32).
++  const auto Frame = Thread->CurrentFrame;
++  auto [InlineHeader, InlineTail] = GetFrameBlockInfo(Frame);
++  const uint64_t BlockBegin = Frame->State.InlineJITBlockHeader;
++  if (!InlineHeader || HostPC < BlockBegin || HostPC >= BlockBegin + InlineTail->Size || (HostPC & 3)) {
++    return false;
++  }
++
++  const auto Access = CPU::DecodeStringLoopAccess(reinterpret_cast<const uint32_t*>(HostPC));
++  if (!Access) {
++    return false;
++  }
++
++  // The guest instruction: legacy prefixes (REP/REPNE required, no address size override), REX, then MOVS or STOS
++  auto& State = Frame->State;
++  const auto* Code = reinterpret_cast<const uint8_t*>(State.rip);
++  bool Rep = false, OpSize16 = false, RexW = false;
++  size_t i = 0;
++  for (; i < 14; ++i) {
++    const uint8_t Byte = Code[i];
++    if (Byte == 0xf2 || Byte == 0xf3) {
++      Rep = true;
++    } else if (Byte == 0x66) {
++      OpSize16 = true;
++    } else if (Byte != 0x26 && Byte != 0x2e && Byte != 0x36 && Byte != 0x3e && Byte != 0x64 && Byte != 0x65) {
++      break;
++    }
++  }
++  if ((Code[i] & 0xf0) == 0x40) {
++    RexW = Code[i] & 8;
++    ++i;
++  }
++  const uint8_t Opcode = Code[i];
++  if (!Rep || (Opcode != 0xa4 && Opcode != 0xa5 && Opcode != 0xaa && Opcode != 0xab)) {
++    return false;
++  }
++  const bool Movs = Opcode == 0xa4 || Opcode == 0xa5;
++  const uint64_t ElementSize = (Opcode & 1) ? (RexW ? 8 : OpSize16 ? 2 : 4) : 1;
++  if ((!Movs && !Access->Store) || (!Access->Block && Access->AccessSize != ElementSize)) {
++    return false;
++  }
++
++  const uint64_t Dst = HostGPRs[CPU::TMP2.Idx()];
++  const uint64_t Current = Access->Block && Access->Direction < 0 ? Dst + 32 - ElementSize : Dst;
++  auto& RCX = State.gregs[X86State::REG_RCX];
++  auto& RSI = State.gregs[X86State::REG_RSI];
++  auto& RDI = State.gregs[X86State::REG_RDI];
++  const uint64_t Done = Access->Direction > 0 ? Current - RDI : RDI - Current;
++  if (Done % ElementSize || Done / ElementSize > RCX) {
++    return false;
++  }
++
++  RCX -= Done / ElementSize;
++  RDI = Access->Direction > 0 ? RDI + Done : RDI - Done;
++  if (Movs) {
++    RSI = Access->Direction > 0 ? RSI + Done : RSI - Done;
++  }
++  return true;
++}
++
+ uint32_t ContextImpl::ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, bool WasInJIT, const uint64_t* HostGPRs,
+                                                  uint64_t PSTATE) {
+   const auto Frame = Thread->CurrentFrame;
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index e3f9093..f9ffb11 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -45,6 +45,15 @@ class RegisterAllocationPass;
+ }
+ 
+ namespace FEXCore::CPU {
++// One load or store of the REP MOVS/STOS loops (MemCpy and MemSet in MemoryOps.cpp), recognised by its encoding. The
++// loops work on copies of RCX/RSI/RDI: TMP2 walks the destination, TMP3 the source.
++struct StringLoopAccess {
++  bool Store;          // the store through TMP2, else the load through TMP3
++  bool Block;          // a 32-byte block of the unrolled loops (TMP2 is 32 - element size below the element when backwards)
++  int Direction;       // 1 forwards, -1 backwards
++  uint32_t AccessSize; // 32 for a block, else the element size
++};
++std::optional<StringLoopAccess> DecodeStringLoopAccess(const uint32_t* HostPC);
+ class Arm64JITCore final : public CPUBackend, public Arm64Emitter {
+ public:
+   explicit Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::InternalThreadState* Thread);
+diff --git a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+index d7b716c..af418f9 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MemoryOps.cpp
+@@ -1901,6 +1901,7 @@ DEF_OP(MemSet) {
+     (void)tbnz(DirectionReg, 1, &BackwardImpl);
+   }
+ 
++  // DecodeStringLoopAccess recognises the stores below: keep the two in sync
+   auto MemStore = [this](auto Value, uint32_t OpSize, int32_t Size) {
+     switch (OpSize) {
+     case 1: strb<ARMEmitter::IndexType::POST>(Value.W(), TMP2, Size); break;
+@@ -2140,6 +2141,7 @@ DEF_OP(MemCpy) {
+     (void)tbnz(DirectionReg, 1, &BackwardImpl);
+   }
+ 
++  // DecodeStringLoopAccess recognises the loads and stores below: keep the two in sync
+   auto MemCpy = [this](uint32_t OpSize, int32_t Size) {
+     switch (OpSize) {
+     case 1:
+@@ -2401,6 +2403,56 @@ DEF_OP(MemCpy) {
+   }
+ }
+ 
++// Recognises the loads and stores MemCpy and MemSet emit for REP MOVS/STOS (keep in sync with them), so that an
++// exception or SMC fault inside the loop can resume the instruction at the iteration it reached
++// (ContextImpl::RestoreStringOpProgressFromHostPC) instead of the first one. The MOPS forms are not recognised.
++std::optional<StringLoopAccess> DecodeStringLoopAccess(const uint32_t* HostPC) {
++  const uint32_t Instr = HostPC[0];
++  const uint32_t Rn = (Instr >> 5) & 31;
++  const auto SignExtend = [](uint32_t Value, int Bits) {
++    return static_cast<int32_t>(Value << (32 - Bits)) >> (32 - Bits);
++  };
++
++  // ldp/stp q, q, [Rn], #+-32 (post-index)
++  if ((Instr >> 23) == 0x159) {
++    const bool Store = !((Instr >> 22) & 1);
++    const int32_t Offset = SignExtend((Instr >> 15) & 0x7f, 7) * 16;
++    if ((Offset == 32 || Offset == -32) && Rn == (Store ? TMP2 : TMP3).Idx()) {
++      return StringLoopAccess {Store, true, Offset > 0 ? 1 : -1, 32};
++    }
++    return std::nullopt;
++  }
++
++  // ldrb/ldrh/ldr and strb/strh/str [Rn], #+-size (post-index)
++  if ((Instr & 0x3f200c00) == 0x38000400) {
++    const uint32_t Opc = (Instr >> 22) & 3;
++    const uint32_t Size = 1U << (Instr >> 30);
++    const int32_t Offset = SignExtend((Instr >> 12) & 0x1ff, 9);
++    if (Opc <= 1 && (Offset == static_cast<int32_t>(Size) || Offset == -static_cast<int32_t>(Size)) && Rn == (Opc == 0 ? TMP2 : TMP3).Idx()) {
++      return StringLoopAccess {Opc == 0, false, Offset > 0 ? 1 : -1, Size};
++    }
++    return std::nullopt;
++  }
++
++  // The TSO element loops: ldapr*/ldar* [TMP3] or stlr* [TMP2], the pointer moves in an add/sub after the store
++  const bool LoadAcquire = (Instr & 0x3ffffc00) == 0x38bfc000 || (Instr & 0x3ffffc00) == 0x08dffc00;
++  const bool StoreRelease = (Instr & 0x3ffffc00) == 0x089ffc00;
++  if ((LoadAcquire && Rn == TMP3.Idx()) || (StoreRelease && Rn == TMP2.Idx())) {
++    const uint32_t Size = 1U << (Instr >> 30);
++    const uint32_t PtrUpdate = (Size << 10) | (TMP2.Idx() << 5) | TMP2.Idx();
++    for (int i = 1; i <= 8; ++i) {
++      if (HostPC[i] == (0x91000000 | PtrUpdate)) {
++        return StringLoopAccess {StoreRelease, false, 1, Size};
++      }
++      if (HostPC[i] == (0xd1000000 | PtrUpdate)) {
++        return StringLoopAccess {StoreRelease, false, -1, Size};
++      }
++    }
++  }
++
++  return std::nullopt;
++}
++
+ DEF_OP(CacheLineClear) {
+   if (!CTX->HostFeatures.SupportsCacheMaintenanceOps) {
+     dmb(ARMEmitter::BarrierScope::SY);
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index 8aa448e..63dc7a1 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -86,6 +86,10 @@ public:
+   ///< State reconstruction helpers
+   ///< Reconstructs the guest RIP from the passed in thread context and related Host PC.
+   FEX_DEFAULT_VISIBILITY virtual uint64_t RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC) = 0;
++  ///< After RestoreRIPFromHostPC and the GPRs: a REP MOVS/STOS stopped at HostPC inside its copy loop moves RCX/RSI/RDI
++  ///< to the iteration the loop reached (x86 resumes it there). HostGPRs are the host X0-X30. Returns true if it did.
++  FEX_DEFAULT_VISIBILITY virtual bool
++  RestoreStringOpProgressFromHostPC(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, const uint64_t* HostGPRs) = 0;
+   /**
+    * @brief Reconstructs a compacted EFLAGS from FEX's internal EFLAG representation.
+    *
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 521fc20..c4cadef 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -522,6 +522,9 @@ static void ReconstructThreadState(FEXCore::Core::InternalThreadState* Thread, A
+     State.gregs[i] = Context.X[Config.SRAGPRMapping[i]];
+   }
+ 
++  // A REP MOVS/STOS stopped inside its copy loop continues from the iteration it reached, as on x86
++  CTX->RestoreStringOpProgressFromHostPC(Thread, Context.Pc, Context.X);
++
+   // Spill all SRA FPRs
+   for (size_t i = 0; i < Config.SRAFPRCount; i++) {
+     memcpy(State.xmm.sse.data[i], &Context.V[Config.SRAFPRMapping[i]], sizeof(__uint128_t));
+-- 
+2.50.1 (Apple Git-155)
+

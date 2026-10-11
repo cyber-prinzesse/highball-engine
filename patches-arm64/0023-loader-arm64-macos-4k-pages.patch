@@ -1,0 +1,35 @@
+--- a/dlls/ntdll/unix/loader.c	2026-10-10 02:20:45
++++ b/dlls/ntdll/unix/loader.c	2026-10-10 02:20:46
+@@ -435,9 +435,32 @@
+     return ret;
+ }
+ 
++
++#if defined(__APPLE__) && defined(__aarch64__)
++/* Highball: macOS 26 lets an entitled loader run with 4 KB pages (posix_spawnattr_set_4k_page_size_np, the
++ * com.apple.developer.cross-architecture-support entitlement). Windows code assumes 4 KB protection granularity
++ * (guard pages, SMC detection), so every Wine process re-execs itself with the attribute. HB_NO_4K_PAGES=1 disables. */
++extern int posix_spawnattr_set_4k_page_size_np( const posix_spawnattr_t * ) __attribute__((weak_import));
++static void exec_with_4k_pages( char **argv )
++{
++    posix_spawnattr_t attr;
++    int ret;
+ 
++    if (getenv( "HB_NO_4K_PAGES" ) || !posix_spawnattr_set_4k_page_size_np) return;
++    posix_spawnattr_init( &attr );
++    posix_spawnattr_setflags( &attr, POSIX_SPAWN_SETEXEC | _POSIX_SPAWN_DISABLE_ASLR );
++    if (!(ret = posix_spawnattr_set_4k_page_size_np( &attr )))
++        ret = posix_spawn( NULL, argv[0], NULL, &attr, argv, *_NSGetEnviron() );  /* returns only on failure */
++    posix_spawnattr_destroy( &attr );
++    fprintf( stderr, "wine: 4 KB page exec of %s failed: %d (%s), continuing with host pages\n", argv[0], ret, strerror(ret) );
++}
++#endif
++
+ static void preloader_exec( char **argv )
+ {
++#if defined(__APPLE__) && defined(__aarch64__)
++    exec_with_4k_pages( argv + 1 );
++#endif
+ #ifdef HAVE_WINE_PRELOADER
+     asprintf( &argv[0], "%s-preloader", argv[1] );
+ #ifdef __APPLE__

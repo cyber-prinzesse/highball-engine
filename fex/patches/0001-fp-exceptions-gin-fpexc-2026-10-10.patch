@@ -1,0 +1,1084 @@
+From a1fb2e2dada75c19b5ca8b170bd148a44e6e80ab Mon Sep 17 00:00:00 2001
+From: fid <fid@local>
+Date: Sun, 11 Oct 2026 06:58:24 +0200
+Subject: [PATCH 01/13] fp-exceptions (gin-fpexc, 2026-10-10)
+
+---
+ CodeEmitter/CodeEmitter/Emitter.h             |  1 +
+ CodeEmitter/CodeEmitter/ScalarOps.inl         | 12 +++
+ .../Source/Interface/Config/Config.json.in    |  2 +
+ .../Core/ArchHelpers/Arm64Emitter.cpp         | 33 +++++++-
+ FEXCore/Source/Interface/Core/Core.cpp        | 27 ++++++-
+ .../Core/Interpreter/Fallbacks/F80Fallbacks.h | 41 +++++++++-
+ FEXCore/Source/Interface/Core/JIT/ALUOps.cpp  |  6 +-
+ FEXCore/Source/Interface/Core/JIT/JIT.cpp     |  1 +
+ FEXCore/Source/Interface/Core/JIT/JITClass.h  | 26 ++++++
+ FEXCore/Source/Interface/Core/JIT/MiscOps.cpp | 40 +++++++++
+ .../Source/Interface/Core/JIT/VectorOps.cpp   | 18 +++++
+ .../Source/Interface/Core/OpcodeDispatcher.h  | 13 +--
+ .../Core/OpcodeDispatcher/AVX_128.cpp         |  4 +-
+ .../Core/OpcodeDispatcher/BaseTables.h        |  2 +-
+ .../Core/OpcodeDispatcher/SecondaryTables.h   |  6 +-
+ .../Core/OpcodeDispatcher/Vector.cpp          | 18 ++---
+ .../Interface/Core/OpcodeDispatcher/X87.cpp   | 81 ++++++++++++++++++-
+ .../Interface/Core/X86Tables/VEXTables.cpp    | 16 ++--
+ FEXCore/Source/Interface/IR/IR.json           |  9 ++-
+ .../include/FEXCore/Core/SignalDelegator.h    |  2 +
+ Source/Common/HostFeatures.cpp                |  7 +-
+ Source/Windows/ARM64EC/Module.S               |  2 +
+ Source/Windows/ARM64EC/Module.cpp             | 64 ++++++++++++---
+ Source/Windows/Common/Exception.h             | 53 +++++++++++-
+ Source/Windows/WOW64/Module.cpp               |  3 +-
+ 25 files changed, 436 insertions(+), 51 deletions(-)
+
+diff --git a/CodeEmitter/CodeEmitter/Emitter.h b/CodeEmitter/CodeEmitter/Emitter.h
+index 001adcb..207890d 100644
+--- a/CodeEmitter/CodeEmitter/Emitter.h
++++ b/CodeEmitter/CodeEmitter/Emitter.h
+@@ -361,6 +361,7 @@ enum class SystemRegister : uint32_t {
+   RNDRRS = GenSystemReg<0b11, 0b011, 0b0010, 0b0100, 0b001>,
+   NZCV = GenSystemReg<0b11, 0b011, 0b0100, 0b0010, 0b000>,
+   FPCR = GenSystemReg<0b11, 0b011, 0b0100, 0b0100, 0b000>,
++  FPSR = GenSystemReg<0b11, 0b011, 0b0100, 0b0100, 0b001>,
+   TPIDRRO_EL0 = GenSystemReg<0b11, 0b011, 0b1101, 0b0000, 0b011>,
+   CNTFRQ_EL0 = GenSystemReg<0b11, 0b011, 0b1110, 0b0000, 0b000>,
+   CNTVCT_EL0 = GenSystemReg<0b11, 0b011, 0b1110, 0b0000, 0b010>,
+diff --git a/CodeEmitter/CodeEmitter/ScalarOps.inl b/CodeEmitter/CodeEmitter/ScalarOps.inl
+index 504ad81..e530512 100644
+--- a/CodeEmitter/CodeEmitter/ScalarOps.inl
++++ b/CodeEmitter/CodeEmitter/ScalarOps.inl
+@@ -1004,6 +1004,18 @@ public:
+   void fcmp(SRegister rn, SRegister rm) {
+     FloatCompare(0, 0, 0b00, 0b00, 0b00000, rn.V(), rm.V());
+   }
++
++  // Floating-point signalling compare: a quiet NaN operand raises Invalid Operation too (x86 COMISS/COMISD)
++  void fcmpe(ScalarRegSize Size, VRegister rn, VRegister rm) {
++    LOGMAN_THROW_A_FMT(Size != ScalarRegSize::i8Bit, "8-bit destination not supported");
++
++    const auto ConvertedSize = Size == ARMEmitter::ScalarRegSize::i64Bit ? 0b01 :
++                               Size == ARMEmitter::ScalarRegSize::i32Bit ? 0b00 :
++                               Size == ARMEmitter::ScalarRegSize::i16Bit ? 0b11 :
++                                                                           0;
++
++    FloatCompare(0, 0, ConvertedSize, 0b00, 0b10000, rn, rm);
++  }
+   ///< Compare to #0.0
+   void fcmp(SRegister rn) {
+     FloatCompare(0, 0, 0b00, 0b00, 0b01000, rn.V(), VReg::v0);
+diff --git a/FEXCore/Source/Interface/Config/Config.json.in b/FEXCore/Source/Interface/Config/Config.json.in
+index 938377f..a71854b 100644
+--- a/FEXCore/Source/Interface/Config/Config.json.in
++++ b/FEXCore/Source/Interface/Config/Config.json.in
+@@ -54,6 +54,8 @@
+           "DISABLEAVX": "disableavx",
+           "ENABLEAFP": "enableafp",
+           "DISABLEAFP": "disableafp",
++          "ENABLEFLOATEXCEPTIONS": "enablefloatexceptions",
++          "DISABLEFLOATEXCEPTIONS": "disablefloatexceptions",
+           "ENABLELRCPC": "enablelrcpc",
+           "DISABLELRCPC": "disablelrcpc",
+           "ENABLELRCPC2": "enablelrcpc2",
+diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+index 3ebadb5..d4bfc23 100644
+--- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
++++ b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+@@ -636,10 +636,14 @@ void Arm64Emitter::PopCalleeSavedRegisters() {
+ 
+ void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Register TmpReg2, const FillSpecialRegsOptions& Options) {
+ #ifndef VIXL_SIMULATOR
+-  if (EmitterCTX->HostFeatures.SupportsAFP) {
+-    // Enable AFP features when filling JIT state.
++  const bool SupportsAFP = EmitterCTX->HostFeatures.SupportsAFP;
++  const bool SupportsFloatExceptions = EmitterCTX->HostFeatures.SupportsFloatExceptions;
++  if (SupportsAFP || SupportsFloatExceptions) {
+     mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
++  }
+ 
++  if (SupportsAFP) {
++    // Enable AFP features when filling JIT state.
+     // Enable FPCR.NEP and FPCR.AH
+     // NEP(2): Changes ASIMD scalar instructions to insert in to the lower bits of the destination.
+     // AH(1):  Changes NaN behaviour in some instructions. Specifically fmin, fmax.
+@@ -655,7 +659,22 @@ void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Regi
+       ldr(TmpReg2.W(), STATE.R(), offsetof(FEXCore::Core::CPUState, mxcsr));
+       bfxil(ARMEmitter::Size::i64Bit, TmpReg, TmpReg2, 6, 1);
+     }
++  }
+ 
++  if (SupportsFloatExceptions) {
++    // Arm the FPCR trap enables from the guest's MXCSR exception masks (SpillStaticRegs clears them, host code must
++    // never trap). MXCSR IM(7) DM(8) ZM(9) OM(10) UM(11) PM(12) (1 = masked) -> FPCR IOE(8) IDE(15) DZE(9) OFE(10) UFE(11) IXE(12)
++    ldr(TmpReg2.W(), STATE.R(), offsetof(FEXCore::Core::CPUState, mxcsr));
++    mvn(ARMEmitter::Size::i32Bit, TmpReg2, TmpReg2);
++    lsr(ARMEmitter::Size::i32Bit, TmpReg2, TmpReg2, 7);
++    bfi(ARMEmitter::Size::i64Bit, TmpReg, TmpReg2, 8, 1);
++    lsr(ARMEmitter::Size::i32Bit, TmpReg2, TmpReg2, 1);
++    bfi(ARMEmitter::Size::i64Bit, TmpReg, TmpReg2, 15, 1);
++    lsr(ARMEmitter::Size::i32Bit, TmpReg2, TmpReg2, 1);
++    bfi(ARMEmitter::Size::i64Bit, TmpReg, TmpReg2, 9, 4);
++  }
++
++  if (SupportsAFP || SupportsFloatExceptions) {
+     msr(ARMEmitter::SystemRegister::FPCR, TmpReg);
+   }
+ #endif
+@@ -695,6 +714,16 @@ void Arm64Emitter::SpillStaticRegs(ARMEmitter::Register TmpReg, SpillStaticRegOp
+         (1U << 2) |   // NEP
+           (1U << 1) | // AH
+           (1U << 0)); // FIZ
++    if (EmitterCTX->HostFeatures.SupportsFloatExceptions) {
++      // Leave the JIT with the floating-point trap enables off (IOE DZE OFE UFE IXE, IDE)
++      bic(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, 0x1f00);
++      bic(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, 0x8000);
++    }
++    msr(ARMEmitter::SystemRegister::FPCR, TmpReg);
++  } else if (EmitterCTX->HostFeatures.SupportsFloatExceptions) {
++    mrs(TmpReg, ARMEmitter::SystemRegister::FPCR);
++    bic(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, 0x1f00);
++    bic(ARMEmitter::Size::i64Bit, TmpReg, TmpReg, 0x8000);
+     msr(ARMEmitter::SystemRegister::FPCR, TmpReg);
+   }
+ #endif
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 63280a4..9f0c0af 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -75,9 +75,28 @@ $end_info$
+ #include <type_traits>
+ #include <unistd.h>
+ #include <unordered_map>
++#include <cstring>
+ #include <utility>
+ #include <xxhash.h>
+ 
++// x87 instructions that execute without checking for a pending unmasked exception (the FN* forms and FNOP);
++// every other x87 instruction and FWAIT delivers a pending #MF first
++static bool IsWaitingX87Instruction(const FEXCore::X86Tables::X86InstInfo* Info) {
++  using namespace FEXCore::X86Tables;
++  const bool InX87Table = (Info >= X87F80Ops.data() && Info < X87F80Ops.data() + X87F80Ops.size()) ||
++                          (Info >= X87F64Ops.data() && Info < X87F64Ops.data() + X87F64Ops.size());
++  if (!InX87Table || !Info->Name) {
++    return false;
++  }
++  static constexpr const char* NoWait[] = {"FNSTENV", "FNSTCW", "FNCLEX", "FNINIT", "FNSAVE", "FNSTSW", "FNOP"};
++  for (auto Name : NoWait) {
++    if (!strcmp(Info->Name, Name)) {
++      return false;
++    }
++  }
++  return true;
++}
++
+ namespace FEXCore::Context {
+ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
+   : HostFeatures {Features}
+@@ -637,7 +656,10 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+         // that more explicitly later.
+         Thread->OpDispatcher->FlushRegisterCache(true);
+ 
+-        if (ExtendedDebugInfo || Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo)) {
++        // An unmasked SSE/AVX exception traps on the host in the middle of the instruction's code and the fault's RIP
++        // is reconstructed from these markers, so every XMM instruction gets one when the traps can be armed
++        const bool MayTrapFP = HostFeatures.SupportsFloatExceptions && TableInfo && (TableInfo->Flags & X86Tables::InstFlags::FLAGS_XMM_FLAGS);
++        if (ExtendedDebugInfo || MayTrapFP || Thread->OpDispatcher->CanHaveSideEffects(TableInfo, DecodedInfo)) {
+           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
+         }
+ 
+@@ -689,6 +711,9 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+           }
+ 
+           Thread->OpDispatcher->SetForceTSO(ForceTSO);
++          if (IsWaitingX87Instruction(TableInfo)) {
++            Thread->OpDispatcher->X87CheckPendingException(DecodedInfo);
++          }
+           std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
+           if (Thread->OpDispatcher->HadDecodeFailure()) {
+             HadDispatchError = true;
+diff --git a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
+index 5c0e656..67c1ded 100644
+--- a/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
++++ b/FEXCore/Source/Interface/Core/Interpreter/Fallbacks/F80Fallbacks.h
+@@ -2,6 +2,8 @@
+ #pragma once
+ #include "Common/SoftFloat.h"
+ 
++#include <cstring>
++
+ #include "Interface/Core/Interpreter/Fallbacks/FallbackOpHandler.h"
+ #include "Interface/IR/IR.h"
+ 
+@@ -37,10 +39,33 @@ FEXCORE_PRESERVE_ALL_ATTR static softfloat_state SoftFloatStateFromFCW(uint16_t
+ }
+ 
+ FEXCORE_PRESERVE_ALL_ATTR static void HandleX87Exception(const softfloat_state& State, FEXCore::Core::CpuStateFrame* Frame) {
+-  // Check for Invalid Operation exception (bit 0 of X87 status word)
++  // The x87 status word's sticky exception flags from the SoftFloat result (IE ZE OE UE PE; SoftFloat does not
++  // report denormal operands, so DE stays clear)
++  auto& Flags = Frame->State.flags;
+   if (State.exceptionFlags & softfloat_flag_invalid) {
+-    Frame->State.flags[FEXCore::X86State::X87FLAG_IE_LOC] = 1;
++    Flags[FEXCore::X86State::X87FLAG_IE_LOC] = 1;
++  }
++  if (State.exceptionFlags & softfloat_flag_infinite) {
++    Flags[FEXCore::X86State::X87FLAG_ZE_LOC] = 1;
++  }
++  if (State.exceptionFlags & softfloat_flag_overflow) {
++    Flags[FEXCore::X86State::X87FLAG_OE_LOC] = 1;
++  }
++  if (State.exceptionFlags & softfloat_flag_underflow) {
++    Flags[FEXCore::X86State::X87FLAG_UE_LOC] = 1;
+   }
++  if (State.exceptionFlags & softfloat_flag_inexact) {
++    Flags[FEXCore::X86State::X87FLAG_PE_LOC] = 1;
++  }
++  // ES (mirrored by B): a flagged exception whose mask is clear is pending; it is delivered as #MF before the next
++  // waiting x87 instruction or FWAIT (X87CheckPendingException)
++  uint32_t Pending = 0;
++  for (int i = 0; i < 6; ++i) {
++    Pending |= (Flags[FEXCore::X86State::X87FLAG_IE_LOC + i] & 1) << i;
++  }
++  Pending &= ~Frame->State.FCW & 0x3f;
++  Flags[FEXCore::X86State::X87FLAG_ES_LOC] = Pending != 0;
++  Flags[FEXCore::X86State::X87FLAG_B_LOC] = Pending != 0;
+ }
+ 
+ // Wrapper for SoftFloat state to handle X87 exceptions
+@@ -71,12 +96,24 @@ struct OpHandlers<IR::OP_F80CVTTO> {
+   FEXCORE_PRESERVE_ALL_ATTR static VectorRegType handle4(uint16_t FCW, float src, FEXCore::Core::CpuStateFrame* Frame) {
+     FEXCORE_PROFILE_INSTANT_INCREMENT(Frame->Thread, AccumulatedFloatFallbackCount, 1);
+     ScopedSoftFloatState State {FCW, Frame};
++    // FLD m32fp of a denormal: the denormal-operand exception (the extended format normalises it, so SoftFloat sees nothing)
++    uint32_t Bits;
++    memcpy(&Bits, &src, sizeof(Bits));
++    if ((Bits & 0x7f800000u) == 0 && (Bits & 0x007fffffu) != 0) {
++      Frame->State.flags[FEXCore::X86State::X87FLAG_DE_LOC] = 1;
++    }
+     return X80SoftFloat(&State.State, src);
+   }
+ 
+   FEXCORE_PRESERVE_ALL_ATTR static VectorRegType handle8(uint16_t FCW, double src, FEXCore::Core::CpuStateFrame* Frame) {
+     FEXCORE_PROFILE_INSTANT_INCREMENT(Frame->Thread, AccumulatedFloatFallbackCount, 1);
+     ScopedSoftFloatState State {FCW, Frame};
++    // FLD m64fp of a denormal: the denormal-operand exception
++    uint64_t Bits;
++    memcpy(&Bits, &src, sizeof(Bits));
++    if ((Bits & 0x7ff0000000000000ull) == 0 && (Bits & 0x000fffffffffffffull) != 0) {
++      Frame->State.flags[FEXCore::X86State::X87FLAG_DE_LOC] = 1;
++    }
+     return X80SoftFloat(&State.State, src);
+   }
+ };
+diff --git a/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp b/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
+index b65bf80..da361f9 100644
+--- a/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/ALUOps.cpp
+@@ -1501,7 +1501,11 @@ DEF_OP(FCmp) {
+   ARMEmitter::VRegister Scalar1 = GetVReg(Op->Scalar1);
+   ARMEmitter::VRegister Scalar2 = GetVReg(Op->Scalar2);
+ 
+-  fcmp(EmitSubSize, Scalar1, Scalar2);
++  if (Op->Signalling) {
++    fcmpe(EmitSubSize, Scalar1, Scalar2);
++  } else {
++    fcmp(EmitSubSize, Scalar1, Scalar2);
++  }
+ }
+ 
+ } // namespace FEXCore::CPU
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index ef7e332..cd0e052 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -656,6 +656,7 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
+   , HostSupportsAVX256 {ctx->HostFeatures.SupportsAVX && ctx->HostFeatures.SupportsSVE256}
+   , HostSupportsRPRES {ctx->HostFeatures.SupportsRPRES != 0}
+   , HostSupportsAFP {ctx->HostFeatures.SupportsAFP != 0}
++  , HostSupportsFloatExceptions {ctx->HostFeatures.SupportsFloatExceptions != 0}
+   , CTX {ctx}
+   , TempCodeBufferAllocator(ctx->CPUBackendAllocator, 0) {
+ 
+diff --git a/FEXCore/Source/Interface/Core/JIT/JITClass.h b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+index 17e7691..e3f9093 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JITClass.h
++++ b/FEXCore/Source/Interface/Core/JIT/JITClass.h
+@@ -69,6 +69,32 @@ private:
+   const bool HostSupportsAVX256 {};
+   const bool HostSupportsRPRES {};
+   const bool HostSupportsAFP {};
++  const bool HostSupportsFloatExceptions {};
++
++  // x86 RCP*/RSQRT* never raise exceptions, but their host lowering (frecpe, frsqrte, fdiv, fsqrt) traps with the
++  // guest's exception masks armed in FPCR. Bracket them: TMP1 keeps the FPCR, TMP2 is scratch.
++  void FPTrapsOff(ARMEmitter::ForwardLabel* Skip) {
++    if (!HostSupportsFloatExceptions) return;
++    mrs(TMP1, ARMEmitter::SystemRegister::FPCR);
++    // Skip the FPCR write when no trap enable is armed (IOE DZE OFE UFE IXE in bits 8-12, IDE in bit 15)
++    ubfx(ARMEmitter::Size::i64Bit, TMP2, TMP1, 8, 5);
++    ubfx(ARMEmitter::Size::i64Bit, TMP3, TMP1, 15, 1);
++    orr(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP3);
++    (void)cbz(ARMEmitter::Size::i64Bit, TMP2, Skip);
++    bic(ARMEmitter::Size::i64Bit, TMP2, TMP1, 0x1f00);
++    bic(ARMEmitter::Size::i64Bit, TMP2, TMP2, 0x8000);
++    msr(ARMEmitter::SystemRegister::FPCR, TMP2);
++    (void)Bind(Skip);
++  }
++  void FPTrapsRestore(ARMEmitter::ForwardLabel* Skip) {
++    if (!HostSupportsFloatExceptions) return;
++    ubfx(ARMEmitter::Size::i64Bit, TMP2, TMP1, 8, 5);
++    ubfx(ARMEmitter::Size::i64Bit, TMP3, TMP1, 15, 1);
++    orr(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP3);
++    (void)cbz(ARMEmitter::Size::i64Bit, TMP2, Skip);
++    msr(ARMEmitter::SystemRegister::FPCR, TMP1);
++    (void)Bind(Skip);
++  }
+ 
+   struct RestartOptions {
+     enum class Control : uint64_t {
+diff --git a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+index 6e8df95..20300fd 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+@@ -89,6 +89,11 @@ DEF_OP(Break) {
+     ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.GuestSignal_SIGSEGV));
+     br(TMP1);
+     break;
++  case Core::FAULT_SIGFPE:
++    // x87 #MF: raised through the trap trampoline, the frontend reads the reason from SynchronousFaultData
++    ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.GuestSignal_SIGTRAP));
++    br(TMP1);
++    break;
+   default:
+     ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.GuestSignal_SIGTRAP));
+     br(TMP1);
+@@ -117,11 +122,33 @@ DEF_OP(GetRoundingMode) {
+   bfi(ARMEmitter::Size::i64Bit, Dst, TMP1, 30, 2);
+ }
+ 
++DEF_OP(GetFPExceptionFlags) {
++  auto Dst = GetReg(Node);
++  // FPSR IOC(0) DZC(1) OFC(2) UFC(3) IXC(4) IDC(7) -> MXCSR IE(0) DE(1) ZE(2) OE(3) UE(4) PE(5)
++  mrs(TMP1, ARMEmitter::SystemRegister::FPSR);
++  and_(ARMEmitter::Size::i32Bit, Dst, TMP1, 1);
++  ubfx(ARMEmitter::Size::i32Bit, TMP2, TMP1, 1, 4);
++  orr(ARMEmitter::Size::i32Bit, Dst, Dst, TMP2, ARMEmitter::ShiftType::LSL, 2);
++  ubfx(ARMEmitter::Size::i32Bit, TMP2, TMP1, 7, 1);
++  orr(ARMEmitter::Size::i32Bit, Dst, Dst, TMP2, ARMEmitter::ShiftType::LSL, 1);
++}
++
+ DEF_OP(SetRoundingMode) {
+   auto Op = IROp->C<IR::IROp_SetRoundingMode>();
+   auto Src = GetReg(Op->RoundMode);
+   auto MXCSR = GetReg(Op->MXCSR);
+ 
++  if (Op->SetDAZ) {
++    // A full MXCSR load (LDMXCSR, FXRSTOR, XRSTOR): the six status flags live in the host FPSR cumulative bits while
++    // the JIT runs, as on ARM64EC Windows. MXCSR IE(0) DE(1) ZE(2) OE(3) UE(4) PE(5) -> FPSR IOC(0) IDC(7) DZC(1) OFC(2) UFC(3) IXC(4)
++    and_(ARMEmitter::Size::i32Bit, TMP1, MXCSR, 1);
++    ubfx(ARMEmitter::Size::i32Bit, TMP2, MXCSR, 2, 4);
++    orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, TMP2, ARMEmitter::ShiftType::LSL, 1);
++    ubfx(ARMEmitter::Size::i32Bit, TMP2, MXCSR, 1, 1);
++    orr(ARMEmitter::Size::i32Bit, TMP1, TMP1, TMP2, ARMEmitter::ShiftType::LSL, 7);
++    msr(ARMEmitter::SystemRegister::FPSR, TMP1);
++  }
++
+   // As above, setup the rounding flags in [31:30]
+   rbit(ARMEmitter::Size::i32Bit, TMP2, Src);
+   // and extract
+@@ -144,6 +171,19 @@ DEF_OP(SetRoundingMode) {
+     bfxil(ARMEmitter::Size::i64Bit, TMP1, MXCSR, 6, 1);
+   }
+ 
++  if (Op->SetDAZ && HostSupportsFloatExceptions) {
++    // The six exception masks arm the FPCR trap enables, so an unmasked SSE exception traps on the host and is
++    // delivered as the guest's #XM. MXCSR IM(7) DM(8) ZM(9) OM(10) UM(11) PM(12) (1 = masked)
++    // -> FPCR IOE(8) IDE(15) DZE(9) OFE(10) UFE(11) IXE(12) (1 = trap)
++    mvn(ARMEmitter::Size::i32Bit, TMP2, MXCSR);
++    lsr(ARMEmitter::Size::i32Bit, TMP2, TMP2, 7);
++    bfi(ARMEmitter::Size::i64Bit, TMP1, TMP2, 8, 1);
++    lsr(ARMEmitter::Size::i32Bit, TMP2, TMP2, 1);
++    bfi(ARMEmitter::Size::i64Bit, TMP1, TMP2, 15, 1);
++    lsr(ARMEmitter::Size::i32Bit, TMP2, TMP2, 1);
++    bfi(ARMEmitter::Size::i64Bit, TMP1, TMP2, 9, 4);
++  }
++
+   // Now save the new FPCR
+   msr(ARMEmitter::SystemRegister::FPCR, TMP1);
+ }
+diff --git a/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp b/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
+index 43e38d8..c6d8c28 100644
+--- a/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/VectorOps.cpp
+@@ -513,6 +513,8 @@ DEF_OP(VFSqrtScalarInsert) {
+ 
+ DEF_OP(VFRSqrtScalarInsert) {
+   const auto Op = IROp->C<IR::IROp_VFRSqrtScalarInsert>();
++  ARMEmitter::ForwardLabel TrapsOffSkip, TrapsRestoreSkip;
++  FPTrapsOff(&TrapsOffSkip);
+   const auto ElementSize = Op->Header.ElementSize;
+   const auto SubRegSize = ConvertSubRegSizePair248(IROp);
+ 
+@@ -547,10 +549,13 @@ DEF_OP(VFRSqrtScalarInsert) {
+   const auto Vector2 = GetVReg(Op->Vector2);
+ 
+   VFScalarUnaryOperation(IROp->Size, ElementSize, Op->ZeroUpperBits, Handlers[HandlerIndex], Dst, Vector1, Vector2);
++  FPTrapsRestore(&TrapsRestoreSkip);
+ }
+ 
+ DEF_OP(VFRecpScalarInsert) {
+   const auto Op = IROp->C<IR::IROp_VFRecpScalarInsert>();
++  ARMEmitter::ForwardLabel TrapsOffSkip, TrapsRestoreSkip;
++  FPTrapsOff(&TrapsOffSkip);
+   const auto ElementSize = Op->Header.ElementSize;
+   const auto SubRegSize = ConvertSubRegSizePair248(IROp);
+ 
+@@ -584,6 +589,7 @@ DEF_OP(VFRecpScalarInsert) {
+   const auto Vector2 = GetVReg(Op->Vector2);
+ 
+   VFScalarUnaryOperation(IROp->Size, ElementSize, Op->ZeroUpperBits, Handlers[HandlerIndex], Dst, Vector1, Vector2);
++  FPTrapsRestore(&TrapsRestoreSkip);
+ }
+ 
+ DEF_OP(VFToFScalarInsert) {
+@@ -1527,6 +1533,8 @@ DEF_OP(VFMax) {
+ 
+ DEF_OP(VFRecp) {
+   const auto Op = IROp->C<IR::IROp_VFRecp>();
++  ARMEmitter::ForwardLabel TrapsOffSkip, TrapsRestoreSkip;
++  FPTrapsOff(&TrapsOffSkip);
+   const auto OpSize = IROp->Size;
+ 
+   const auto ElementSize = Op->Header.ElementSize;
+@@ -1597,10 +1605,13 @@ DEF_OP(VFRecp) {
+       fdiv(SubRegSize.Vector, Dst.Q(), VTMP1.Q(), Vector.Q());
+     }
+   }
++  FPTrapsRestore(&TrapsRestoreSkip);
+ }
+ 
+ DEF_OP(VFRecpPrecision) {
+   const auto Op = IROp->C<IR::IROp_VFRecpPrecision>();
++  ARMEmitter::ForwardLabel TrapsOffSkip, TrapsRestoreSkip;
++  FPTrapsOff(&TrapsOffSkip);
+   const auto OpSize = IROp->Size;
+   const auto ElementSize = Op->Header.ElementSize;
+ 
+@@ -1637,10 +1648,13 @@ DEF_OP(VFRecpPrecision) {
+     fmov(SubRegSize.Vector, VTMP1.Q(), 1.0f);
+     fdiv(SubRegSize.Vector, Dst.Q(), VTMP1.Q(), Vector.Q());
+   }
++  FPTrapsRestore(&TrapsRestoreSkip);
+ }
+ 
+ DEF_OP(VFRSqrt) {
+   const auto Op = IROp->C<IR::IROp_VFRSqrt>();
++  ARMEmitter::ForwardLabel TrapsOffSkip, TrapsRestoreSkip;
++  FPTrapsOff(&TrapsOffSkip);
+   const auto OpSize = IROp->Size;
+ 
+   const auto ElementSize = Op->Header.ElementSize;
+@@ -1706,10 +1720,13 @@ DEF_OP(VFRSqrt) {
+       fdiv(SubRegSize.Vector, Dst.Q(), VTMP1.Q(), VTMP2.Q());
+     }
+   }
++  FPTrapsRestore(&TrapsRestoreSkip);
+ }
+ 
+ DEF_OP(VFRSqrtPrecision) {
+   const auto Op = IROp->C<IR::IROp_VFRSqrtPrecision>();
++  ARMEmitter::ForwardLabel TrapsOffSkip, TrapsRestoreSkip;
++  FPTrapsOff(&TrapsOffSkip);
+   const auto OpSize = IROp->Size;
+   const auto ElementSize = Op->Header.ElementSize;
+ 
+@@ -1750,6 +1767,7 @@ DEF_OP(VFRSqrtPrecision) {
+     fsqrt(SubRegSize.Vector, VTMP2.Q(), Vector.Q());
+     fdiv(SubRegSize.Vector, Dst.Q(), VTMP1.Q(), VTMP2.Q());
+   }
++  FPTrapsRestore(&TrapsRestoreSkip);
+ }
+ 
+ DEF_OP(VNot) {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index 71766e0..14044cc 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -746,6 +746,9 @@ public:
+   void X87FLDCW(OpcodeArgs);
+   void X87FNSAVE(OpcodeArgs);
+   void X87FNSTENV(OpcodeArgs);
++  void X87FWAIT(OpcodeArgs);
++  void X87CheckPendingException(OpcodeArgs);
++  void X87UpdateErrorSummary(Ref FCW);
+   void X87FNSTSW(OpcodeArgs, bool DestRAX);
+   void X87FRSTOR(OpcodeArgs);
+   void X87FSTCW(OpcodeArgs);
+@@ -786,7 +789,7 @@ public:
+   void XSaveOp(OpcodeArgs);
+ 
+   void PAlignrOp(OpcodeArgs);
+-  void UCOMISxOp(OpcodeArgs, IR::OpSize ElementSize);
++  void UCOMISxOp(OpcodeArgs, IR::OpSize ElementSize, bool Signalling);
+   void LDMXCSR(OpcodeArgs);
+   void STMXCSR(OpcodeArgs);
+ 
+@@ -969,7 +972,7 @@ public:
+   void AVX128_VPACKUS(OpcodeArgs, IR::OpSize ElementSize);
+   Ref AVX128_PSIGNImpl(IR::OpSize ElementSize, Ref Src1, Ref Src2);
+   void AVX128_VPSIGN(OpcodeArgs, IR::OpSize ElementSize);
+-  void AVX128_UCOMISx(OpcodeArgs, IR::OpSize ElementSize);
++  void AVX128_UCOMISx(OpcodeArgs, IR::OpSize ElementSize, bool Signalling);
+   void AVX128_VectorScalarInsertALU(OpcodeArgs, FEXCore::IR::IROps IROp, IR::OpSize ElementSize);
+   void AVX128_VFCMP(OpcodeArgs, IR::OpSize ElementSize);
+   void AVX128_InsertScalarFCMP(OpcodeArgs, IR::OpSize ElementSize);
+@@ -2183,10 +2186,10 @@ private:
+   }
+ 
+   // Compares two floats and sets flags for a COMISS instruction
+-  void Comiss(IR::OpSize ElementSize, Ref Src1, Ref Src2) {
+-    // First, set flags according to Arm FCMP.
++  void Comiss(IR::OpSize ElementSize, Ref Src1, Ref Src2, bool Signalling = false) {
++    // First, set flags according to Arm FCMP (FCMPE for COMISS, which signals on a quiet NaN).
+     HandleNZCVWrite();
+-    _FCmp(ElementSize, Src1, Src2);
++    _FCmp(ElementSize, Src1, Src2, Signalling);
+     CFInverted = false;
+     ComissFlags();
+   }
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
+index 0079f63..82ca74d 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/AVX_128.cpp
+@@ -629,7 +629,7 @@ void OpDispatchBuilder::AVX128_VPSIGN(OpcodeArgs, IR::OpSize ElementSize) {
+                           [this](IR::OpSize _ElementSize, Ref Src1, Ref Src2) { return AVX128_PSIGNImpl(_ElementSize, Src1, Src2); });
+ }
+ 
+-void OpDispatchBuilder::AVX128_UCOMISx(OpcodeArgs, IR::OpSize ElementSize) {
++void OpDispatchBuilder::AVX128_UCOMISx(OpcodeArgs, IR::OpSize ElementSize, bool Signalling) {
+   const auto SrcSize = Op->Src[0].IsGPR() ? OpSize::i128Bit : ElementSize;
+ 
+   auto Src1 = AVX128_LoadSource_WithOpSize(Op, Op->Dest, Op->Flags, false);
+@@ -644,7 +644,7 @@ void OpDispatchBuilder::AVX128_UCOMISx(OpcodeArgs, IR::OpSize ElementSize) {
+     Src2.Low = LoadSourceFPR_WithOpSize(Op, Op->Src[0], SrcSize, Op->Flags);
+   }
+ 
+-  Comiss(ElementSize, Src1.Low, Src2.Low);
++  Comiss(ElementSize, Src1.Low, Src2.Low, Signalling);
+ }
+ 
+ void OpDispatchBuilder::AVX128_VectorScalarInsertALU(OpcodeArgs, FEXCore::IR::IROps IROp, IR::OpSize ElementSize) {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/BaseTables.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher/BaseTables.h
+index e328c40..0049361 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/BaseTables.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/BaseTables.h
+@@ -50,7 +50,7 @@ constexpr inline DispatchTableEntry OpDispatch_BaseOpTable[] = {
+ 
+   {0x98, 1, &OpDispatchBuilder::CDQOp},
+   {0x99, 1, &OpDispatchBuilder::CQOOp},
+-  {0x9B, 1, &OpDispatchBuilder::NOPOp},
++  {0x9B, 1, &OpDispatchBuilder::X87FWAIT},
+   {0x9C, 1, &OpDispatchBuilder::PUSHFOp},
+   {0x9D, 1, &OpDispatchBuilder::POPFOp},
+   {0x9E, 1, &OpDispatchBuilder::SAHFOp},
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryTables.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryTables.h
+index c2affd4..f4dfe89 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryTables.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/SecondaryTables.h
+@@ -58,7 +58,8 @@ constexpr DispatchTableEntry OpDispatch_TwoByteOpTable[] = {
+   {0x2B, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::MOVVectorNTOp, false>},
+   {0x2C, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::XMM_To_MMX_Vector_CVT_Float_To_Int, OpSize::i32Bit, false>},
+   {0x2D, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::XMM_To_MMX_Vector_CVT_Float_To_Int, OpSize::i32Bit, true>},
+-  {0x2E, 2, &OpDispatchBuilder::Bind<&OpDispatchBuilder::UCOMISxOp, OpSize::i32Bit>},
++  {0x2E, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::UCOMISxOp, OpSize::i32Bit, false>},
++  {0x2F, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::UCOMISxOp, OpSize::i32Bit, true>},
+   {0x50, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::MOVMSKOp, OpSize::i32Bit>},
+   {0x51, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::VectorUnaryOp, IR::OP_VFSQRT, OpSize::i32Bit>},
+   {0x52, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::VectorUnaryOp, IR::OP_VFRSQRT, OpSize::i32Bit>},
+@@ -219,7 +220,8 @@ constexpr DispatchTableEntry OpDispatch_SecondaryOpSizeModTables[] = {
+   {0x2B, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::MOVVectorNTOp, false>},
+   {0x2C, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::XMM_To_MMX_Vector_CVT_Float_To_Int, OpSize::i64Bit, false>},
+   {0x2D, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::XMM_To_MMX_Vector_CVT_Float_To_Int, OpSize::i64Bit, true>},
+-  {0x2E, 2, &OpDispatchBuilder::Bind<&OpDispatchBuilder::UCOMISxOp, OpSize::i64Bit>},
++  {0x2E, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::UCOMISxOp, OpSize::i64Bit, false>},
++  {0x2F, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::UCOMISxOp, OpSize::i64Bit, true>},
+ 
+   {0x50, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::MOVMSKOp, OpSize::i64Bit>},
+   {0x51, 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::VectorUnaryOp, IR::OP_VFSQRT, OpSize::i64Bit>},
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+index 37de3a0..89771fb 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Vector.cpp
+@@ -3164,10 +3164,10 @@ void OpDispatchBuilder::SaveAVXState(Ref MemBase) {
+ 
+ Ref OpDispatchBuilder::GetMXCSR() {
+   Ref MXCSR = _LoadContextGPR(OpSize::i32Bit, offsetof(FEXCore::Core::CPUState, mxcsr));
+-  // Mask out unsupported bits
+-  // Keeps FZ, RC, exception masks, and DAZ
++  // The context keeps FZ, RC, the exception masks and DAZ. The six status flags are the host FPSR cumulative bits
++  // (set by the host instructions as they execute, loaded by LDMXCSR), like MXCSR on ARM64EC Windows.
+   MXCSR = _And(OpSize::i32Bit, MXCSR, Constant(0xFFC0));
+-  return MXCSR;
++  return _Or(OpSize::i32Bit, MXCSR, _GetFPExceptionFlags());
+ }
+ 
+ void OpDispatchBuilder::FXRStoreOp(OpcodeArgs) {
+@@ -3292,11 +3292,9 @@ void OpDispatchBuilder::RestoreSSEState(Ref MemBase) {
+ }
+ 
+ void OpDispatchBuilder::RestoreMXCSRState(Ref MXCSR) {
+-  // Mask out unsupported bits
+-  MXCSR = _And(OpSize::i32Bit, MXCSR, Constant(0xFFC0));
+-
+-  _StoreContextGPR(OpSize::i32Bit, MXCSR, offsetof(FEXCore::Core::CPUState, mxcsr));
+-  // We only support the rounding mode and FTZ bit being set
++  MXCSR = _And(OpSize::i32Bit, MXCSR, Constant(0xFFFF));
++  // The context keeps the control bits; the status flags and the exception masks go to FPSR/FPCR in SetRoundingMode
++  _StoreContextGPR(OpSize::i32Bit, _And(OpSize::i32Bit, MXCSR, Constant(0xFFC0)), offsetof(FEXCore::Core::CPUState, mxcsr));
+   Ref RoundingMode = _Bfe(OpSize::i32Bit, 3, 13, MXCSR);
+   _SetRoundingMode(RoundingMode, true, MXCSR);
+ }
+@@ -3391,12 +3389,12 @@ void OpDispatchBuilder::VPALIGNROp(OpcodeArgs) {
+   StoreResultFPR(Op, Result);
+ }
+ 
+-void OpDispatchBuilder::UCOMISxOp(OpcodeArgs, IR::OpSize ElementSize) {
++void OpDispatchBuilder::UCOMISxOp(OpcodeArgs, IR::OpSize ElementSize, bool Signalling) {
+   const auto SrcSize = Op->Src[0].IsGPR() ? OpSize::i128Bit : ElementSize;
+   Ref Src1 = LoadSourceFPR_WithOpSize(Op, Op->Dest, OpSize::i128Bit, Op->Flags);
+   Ref Src2 = LoadSourceFPR_WithOpSize(Op, Op->Src[0], SrcSize, Op->Flags);
+ 
+-  Comiss(ElementSize, Src1, Src2);
++  Comiss(ElementSize, Src1, Src2, Signalling);
+ }
+ 
+ void OpDispatchBuilder::LDMXCSR(OpcodeArgs) {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+index 1c3d690..cb8d757 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/X87.cpp
+@@ -432,6 +432,14 @@ Ref OpDispatchBuilder::ReconstructX87StateFromFSW_Helper(Ref FSW) {
+   SetRFLAG<FEXCore::X86State::X87FLAG_C2_LOC>(C2);
+   SetRFLAG<FEXCore::X86State::X87FLAG_C3_LOC>(C3);
+   SetRFLAG<FEXCore::X86State::X87FLAG_IE_LOC>(IE);
++  SetRFLAG<FEXCore::X86State::X87FLAG_DE_LOC>(_Bfe(OpSize::i32Bit, 1, 1, FSW));
++  SetRFLAG<FEXCore::X86State::X87FLAG_ZE_LOC>(_Bfe(OpSize::i32Bit, 1, 2, FSW));
++  SetRFLAG<FEXCore::X86State::X87FLAG_OE_LOC>(_Bfe(OpSize::i32Bit, 1, 3, FSW));
++  SetRFLAG<FEXCore::X86State::X87FLAG_UE_LOC>(_Bfe(OpSize::i32Bit, 1, 4, FSW));
++  SetRFLAG<FEXCore::X86State::X87FLAG_PE_LOC>(_Bfe(OpSize::i32Bit, 1, 5, FSW));
++  SetRFLAG<FEXCore::X86State::X87FLAG_SF_LOC>(_Bfe(OpSize::i32Bit, 1, 6, FSW));
++  // ES is taken from the image as the hardware does: a loaded ES with an unmasked flag is pending
++  SetRFLAG<FEXCore::X86State::X87FLAG_ES_LOC>(_Bfe(OpSize::i32Bit, 1, 7, FSW));
+   return Top;
+ }
+ 
+@@ -610,6 +618,8 @@ void OpDispatchBuilder::X87FLDCW(OpcodeArgs) {
+   _StackForceSlow();
+   Ref NewFCW = LoadSourceGPR(Op, Op->Src[0], Op->Flags);
+   _StoreContextGPR(OpSize::i16Bit, NewFCW, offsetof(FEXCore::Core::CPUState, FCW));
++  // Clearing a mask makes an already flagged exception pending
++  X87UpdateErrorSummary(NewFCW);
+ }
+ 
+ void OpDispatchBuilder::FXCH(OpcodeArgs) {
+@@ -762,9 +772,61 @@ Ref OpDispatchBuilder::ReconstructFSW_Helper(Ref T) {
+   auto IE = GetRFLAG(FEXCore::X86State::X87FLAG_IE_LOC);
+   FSW = _Or(OpSize::i64Bit, FSW, IE);
+ 
++  // The other exception flags, the stack fault bit, the error summary and the busy bit (which mirrors ES)
++  FSW = _Orlshl(OpSize::i64Bit, FSW, GetRFLAG(FEXCore::X86State::X87FLAG_DE_LOC), 1);
++  FSW = _Orlshl(OpSize::i64Bit, FSW, GetRFLAG(FEXCore::X86State::X87FLAG_ZE_LOC), 2);
++  FSW = _Orlshl(OpSize::i64Bit, FSW, GetRFLAG(FEXCore::X86State::X87FLAG_OE_LOC), 3);
++  FSW = _Orlshl(OpSize::i64Bit, FSW, GetRFLAG(FEXCore::X86State::X87FLAG_UE_LOC), 4);
++  FSW = _Orlshl(OpSize::i64Bit, FSW, GetRFLAG(FEXCore::X86State::X87FLAG_PE_LOC), 5);
++  FSW = _Orlshl(OpSize::i64Bit, FSW, GetRFLAG(FEXCore::X86State::X87FLAG_SF_LOC), 6);
++  FSW = _Orlshl(OpSize::i64Bit, FSW, GetRFLAG(FEXCore::X86State::X87FLAG_ES_LOC), 7);
++  FSW = _Orlshl(OpSize::i64Bit, FSW, GetRFLAG(FEXCore::X86State::X87FLAG_ES_LOC), 15);
++
+   return FSW;
+ }
+ 
++// ES/B from the flags and the masks; used when the masks change (FLDCW) and when a status word is loaded
++void OpDispatchBuilder::X87UpdateErrorSummary(Ref FCW) {
++  Ref Flags = GetRFLAG(FEXCore::X86State::X87FLAG_IE_LOC);
++  Flags = _Orlshl(OpSize::i32Bit, Flags, GetRFLAG(FEXCore::X86State::X87FLAG_DE_LOC), 1);
++  Flags = _Orlshl(OpSize::i32Bit, Flags, GetRFLAG(FEXCore::X86State::X87FLAG_ZE_LOC), 2);
++  Flags = _Orlshl(OpSize::i32Bit, Flags, GetRFLAG(FEXCore::X86State::X87FLAG_OE_LOC), 3);
++  Flags = _Orlshl(OpSize::i32Bit, Flags, GetRFLAG(FEXCore::X86State::X87FLAG_UE_LOC), 4);
++  Flags = _Orlshl(OpSize::i32Bit, Flags, GetRFLAG(FEXCore::X86State::X87FLAG_PE_LOC), 5);
++  Ref Pending = _And(OpSize::i32Bit, _Andn(OpSize::i32Bit, Flags, FCW), Constant(0x3f));
++  Ref ES = _Select(OpSize::i32Bit, OpSize::i32Bit, CondClass::NEQ, Pending, Constant(0), Constant(1), Constant(0));
++  SetRFLAG<FEXCore::X86State::X87FLAG_ES_LOC>(ES);
++}
++
++// #MF: an unmasked x87 exception flagged by an earlier instruction is delivered before the next waiting x87
++// instruction or FWAIT executes; the fault reports that instruction's address
++void OpDispatchBuilder::X87CheckPendingException(OpcodeArgs) {
++  const auto GPRSize = GetGPROpSize();
++  Ref ES = _LoadContextGPR(OpSize::i8Bit, offsetof(FEXCore::Core::CPUState, flags) + FEXCore::X86State::X87FLAG_ES_LOC);
++  auto Pending = CondJump(ES);
++  auto FaultBlock = CreateNewCodeBlockAtEnd();
++  auto ContinueBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
++  SetTrueJumpTarget(Pending, FaultBlock);
++  SetFalseJumpTarget(Pending, ContinueBlock);
++
++  SetCurrentCodeBlock(FaultBlock);
++  StartNewBlock();
++  _StoreContextGPR(GPRSize, GetRelocatedPC(Op, -Op->InstSize), offsetof(FEXCore::Core::CPUState, rip));
++  Break(FEXCore::IR::BreakDefinition {
++    .ErrorRegister = 0,
++    .Signal = Core::FAULT_SIGFPE,
++    .TrapNumber = X86State::X86_TRAPNO_MF,
++    .si_code = 0,
++  });
++
++  SetCurrentCodeBlock(ContinueBlock);
++  StartNewBlock();
++}
++
++void OpDispatchBuilder::X87FWAIT(OpcodeArgs) {
++  X87CheckPendingException(Op);
++}
++
+ // Store Status Word
+ // There's no load Status Word instruction but you can load it through frstor
+ // or fldenv.
+@@ -779,8 +841,16 @@ void OpDispatchBuilder::X87FNSTSW(OpcodeArgs, bool DestRAX) {
+ }
+ 
+ void OpDispatchBuilder::FNCLEX(OpcodeArgs) {
+-  // Clear the exception flag bit
+-  SetRFLAG<FEXCore::X86State::X87FLAG_IE_LOC>(_Constant(0));
++  // Clear the exception flags, the stack fault bit and the error summary
++  auto Zero = _Constant(0);
++  SetRFLAG<FEXCore::X86State::X87FLAG_IE_LOC>(Zero);
++  SetRFLAG<FEXCore::X86State::X87FLAG_DE_LOC>(Zero);
++  SetRFLAG<FEXCore::X86State::X87FLAG_ZE_LOC>(Zero);
++  SetRFLAG<FEXCore::X86State::X87FLAG_OE_LOC>(Zero);
++  SetRFLAG<FEXCore::X86State::X87FLAG_UE_LOC>(Zero);
++  SetRFLAG<FEXCore::X86State::X87FLAG_PE_LOC>(Zero);
++  SetRFLAG<FEXCore::X86State::X87FLAG_SF_LOC>(Zero);
++  SetRFLAG<FEXCore::X86State::X87FLAG_ES_LOC>(Zero);
+ }
+ 
+ void OpDispatchBuilder::FNINIT(OpcodeArgs) {
+@@ -809,6 +879,13 @@ void OpDispatchBuilder::FNINIT(OpcodeArgs) {
+   SetRFLAG<FEXCore::X86State::X87FLAG_C2_LOC>(Zero);
+   SetRFLAG<FEXCore::X86State::X87FLAG_C3_LOC>(Zero);
+   SetRFLAG<FEXCore::X86State::X87FLAG_IE_LOC>(Zero);
++  SetRFLAG<FEXCore::X86State::X87FLAG_DE_LOC>(Zero);
++  SetRFLAG<FEXCore::X86State::X87FLAG_ZE_LOC>(Zero);
++  SetRFLAG<FEXCore::X86State::X87FLAG_OE_LOC>(Zero);
++  SetRFLAG<FEXCore::X86State::X87FLAG_UE_LOC>(Zero);
++  SetRFLAG<FEXCore::X86State::X87FLAG_PE_LOC>(Zero);
++  SetRFLAG<FEXCore::X86State::X87FLAG_SF_LOC>(Zero);
++  SetRFLAG<FEXCore::X86State::X87FLAG_ES_LOC>(Zero);
+ }
+ 
+ void OpDispatchBuilder::X87FFREE(OpcodeArgs) {
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/VEXTables.cpp b/FEXCore/Source/Interface/Core/X86Tables/VEXTables.cpp
+index 4aa60b4..18e22b3 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/VEXTables.cpp
++++ b/FEXCore/Source/Interface/Core/X86Tables/VEXTables.cpp
+@@ -62,10 +62,10 @@ namespace AVX128 {
+     {OPD(1, 0b10, 0x2D), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_CVTFPR_To_GPR, OpSize::i32Bit, true>},
+     {OPD(1, 0b11, 0x2D), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_CVTFPR_To_GPR, OpSize::i64Bit, true>},
+ 
+-    {OPD(1, 0b00, 0x2E), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_UCOMISx, OpSize::i32Bit>},
+-    {OPD(1, 0b01, 0x2E), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_UCOMISx, OpSize::i64Bit>},
+-    {OPD(1, 0b00, 0x2F), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_UCOMISx, OpSize::i32Bit>},
+-    {OPD(1, 0b01, 0x2F), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_UCOMISx, OpSize::i64Bit>},
++    {OPD(1, 0b00, 0x2E), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_UCOMISx, OpSize::i32Bit, false>},
++    {OPD(1, 0b01, 0x2E), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_UCOMISx, OpSize::i64Bit, false>},
++    {OPD(1, 0b00, 0x2F), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_UCOMISx, OpSize::i32Bit, true>},
++    {OPD(1, 0b01, 0x2F), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_UCOMISx, OpSize::i64Bit, true>},
+ 
+     {OPD(1, 0b00, 0x50), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_MOVMSK, OpSize::i32Bit>},
+     {OPD(1, 0b01, 0x50), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::AVX128_MOVMSK, OpSize::i64Bit>},
+@@ -513,10 +513,10 @@ namespace AVX256 {
+     {OPD(1, 0b10, 0x2D), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::CVTFPR_To_GPR, OpSize::i32Bit, true>},
+     {OPD(1, 0b11, 0x2D), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::CVTFPR_To_GPR, OpSize::i64Bit, true>},
+ 
+-    {OPD(1, 0b00, 0x2E), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::UCOMISxOp, OpSize::i32Bit>},
+-    {OPD(1, 0b01, 0x2E), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::UCOMISxOp, OpSize::i64Bit>},
+-    {OPD(1, 0b00, 0x2F), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::UCOMISxOp, OpSize::i32Bit>},
+-    {OPD(1, 0b01, 0x2F), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::UCOMISxOp, OpSize::i64Bit>},
++    {OPD(1, 0b00, 0x2E), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::UCOMISxOp, OpSize::i32Bit, false>},
++    {OPD(1, 0b01, 0x2E), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::UCOMISxOp, OpSize::i64Bit, false>},
++    {OPD(1, 0b00, 0x2F), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::UCOMISxOp, OpSize::i32Bit, true>},
++    {OPD(1, 0b01, 0x2F), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::UCOMISxOp, OpSize::i64Bit, true>},
+ 
+     {OPD(1, 0b00, 0x50), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::MOVMSKOp, OpSize::i32Bit>},
+     {OPD(1, 0b01, 0x50), 1, &OpDispatchBuilder::Bind<&OpDispatchBuilder::MOVMSKOp, OpSize::i64Bit>},
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index 8805200..16954a0 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -219,6 +219,12 @@
+                 ],
+         "DestSize": "OpSize::i32Bit"
+       },
++      "GPR = GetFPExceptionFlags": {
++        "Desc": ["Reads the host FPSR cumulative exception bits remapped to the MXCSR status flag layout",
++                 "IE(0) DE(1) ZE(2) OE(3) UE(4) PE(5)"
++                ],
++        "DestSize": "OpSize::i32Bit"
++      },
+ 
+       "SetRoundingMode GPR:$RoundMode, i1:$SetDAZ, GPR:$MXCSR": {
+         "Desc": ["Sets the current rounding mode options for the thread"
+@@ -1646,8 +1652,9 @@
+         "DestSize": "DestElementSize"
+       },
+ 
+-      "FCmp OpSize:$ElementSize, FPR:$Scalar1, FPR:$Scalar2": {
++      "FCmp OpSize:$ElementSize, FPR:$Scalar1, FPR:$Scalar2, i1:$Signalling{false}": {
+         "Desc": ["Does a scalar unordered compare and sets NZCV accordingly.",
++                 "Signalling: a quiet NaN operand also raises the invalid-operation exception (COMISS/COMISD).",
+                  "NZCV follows Arm conventions, a separate AXFLAG instruction is required for x86",
+                  "Ordering flag result is true if either float input is NaN"
+                 ],
+diff --git a/FEXCore/include/FEXCore/Core/SignalDelegator.h b/FEXCore/include/FEXCore/Core/SignalDelegator.h
+index 4386f0c..7063b18 100644
+--- a/FEXCore/include/FEXCore/Core/SignalDelegator.h
++++ b/FEXCore/include/FEXCore/Core/SignalDelegator.h
+@@ -14,10 +14,12 @@ namespace Core {
+     FAULT_SIGSEGV = SIGSEGV,
+     FAULT_SIGTRAP = SIGTRAP,
+     FAULT_SIGILL = SIGILL,
++    FAULT_SIGFPE = SIGFPE,
+ #else
+     FAULT_SIGSEGV = 11,
+     FAULT_SIGTRAP = 5,
+     FAULT_SIGILL = 4,
++    FAULT_SIGFPE = 8,
+ #endif
+   };
+ } // namespace Core
+diff --git a/Source/Common/HostFeatures.cpp b/Source/Common/HostFeatures.cpp
+index 858d76d..3b82e2d 100644
+--- a/Source/Common/HostFeatures.cpp
++++ b/Source/Common/HostFeatures.cpp
+@@ -320,12 +320,14 @@ void FEX::CPUFeatures::FillFeatureFlags() {
+ #ifdef ARCHITECTURE_arm64
+ static uint32_t GetFPCR() {
+   uint64_t Result {};
+-  __asm("mrs %[Res], FPCR" : [Res] "=r"(Result));
++  // volatile: the trap-enable probe below reads FPCR twice around a write; without it the compiler may reuse the
++  // first read (no inputs, no side effects as far as it knows) and the probe never sees the bits stick
++  __asm volatile("mrs %[Res], FPCR" : [Res] "=r"(Result));
+   return Result;
+ }
+ 
+ static void SetFPCR(uint64_t Value) {
+-  __asm("msr FPCR, %[Value]" ::[Value] "r"(Value));
++  __asm volatile("msr FPCR, %[Value]" ::[Value] "r"(Value));
+ }
+ 
+ #endif
+@@ -356,6 +358,7 @@ static void OverrideFeatures(FEXCore::HostFeatures* Features, uint64_t ForceSVEW
+   ENABLE_DISABLE_OPTION(SupportsAVX, AVX, AVX);
+   ENABLE_DISABLE_OPTION(SupportsSVE128, SVE, SVE);
+   ENABLE_DISABLE_OPTION(SupportsAFP, AFP, AFP);
++  ENABLE_DISABLE_OPTION(SupportsFloatExceptions, FloatExceptions, FLOATEXCEPTIONS);
+   ENABLE_DISABLE_OPTION(SupportsRCPC, LRCPC, LRCPC);
+   ENABLE_DISABLE_OPTION(SupportsTSOImm9, LRCPC2, LRCPC2);
+   ENABLE_DISABLE_OPTION(SupportsCSSC, CSSC, CSSC);
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index 2489e65..deee6c3 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -58,6 +58,8 @@ ExitFunctionEC:
+   // Clear any the AFP NEP and AH bits in FPCR as native code won't expect their behaviour.
+   mrs x17, fpcr
+   and x17, x17, #~6 // NEP + AH
++  and x17, x17, #~0x1f00 // floating-point trap enables IOE DZE OFE UFE IXE (armed from MXCSR while in the JIT)
++  and x17, x17, #~0x8000 // IDE
+   msr fpcr, x17
+   ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
+   strb wzr, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 633f252..d031d77 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -441,14 +441,27 @@ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, C
+     }
+     memcpy(State.mm, Context.FltSave.FloatRegisters, sizeof(State.mm));
+ 
+-    State.FCW = Context.FltSave.ControlWord;
+-    State.flags[FEXCore::X86State::X87FLAG_IE_LOC] = Context.FltSave.StatusWord & 1;
+-    State.flags[FEXCore::X86State::X87FLAG_C0_LOC] = (Context.FltSave.StatusWord >> 8) & 1;
+-    State.flags[FEXCore::X86State::X87FLAG_C1_LOC] = (Context.FltSave.StatusWord >> 9) & 1;
+-    State.flags[FEXCore::X86State::X87FLAG_C2_LOC] = (Context.FltSave.StatusWord >> 10) & 1;
+-    State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = (Context.FltSave.StatusWord >> 14) & 1;
+-    State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = (Context.FltSave.StatusWord >> 11) & 0b111;
+-    State.AbridgedFTW = Context.FltSave.TagWord;
++    // The MXCSR control bits (masks, rounding, FZ, DAZ) follow the context: an exception handler may change the masks
++    // before continuing. The status flags are in FPSR, which ntdll restores from the same MxCsr.
++    State.mxcsr = Context.MxCsr & 0xFFC0;
++    // ntdll builds these x64 contexts from ARM64 ones, which carry no x87 control, status or tag state: FltSave
++    // arrives zeroed on every system call return and exception continue. A control word of 0 never occurs in practice
++    // (Windows initialises 0x27f), so keep the JIT's x87 state then; a context from NtSetContextThread or an FXSAVE
++    // image always carries a real control word.
++    if (Context.FltSave.ControlWord != 0) {
++      State.FCW = Context.FltSave.ControlWord;
++      const uint16_t FSW = Context.FltSave.StatusWord;
++      for (int i = 0; i < 7; ++i) {
++        State.flags[FEXCore::X86State::X87FLAG_IE_LOC + i] = (FSW >> i) & 1; // IE DE ZE OE UE PE SF
++      }
++      State.flags[FEXCore::X86State::X87FLAG_ES_LOC] = (FSW >> 7) & 1;
++      State.flags[FEXCore::X86State::X87FLAG_C0_LOC] = (FSW >> 8) & 1;
++      State.flags[FEXCore::X86State::X87FLAG_C1_LOC] = (FSW >> 9) & 1;
++      State.flags[FEXCore::X86State::X87FLAG_C2_LOC] = (FSW >> 10) & 1;
++      State.flags[FEXCore::X86State::X87FLAG_C3_LOC] = (FSW >> 14) & 1;
++      State.flags[FEXCore::X86State::X87FLAG_TOP_LOC] = (FSW >> 11) & 0b111;
++      State.AbridgedFTW = Context.FltSave.TagWord;
++    }
+   }
+ }
+ 
+@@ -536,7 +549,15 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
+   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_ZF_RAW_LOC)) ? (1U << 30) : 0;
+   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_SF_RAW_LOC)) ? (1U << 31) : 0;
+ 
+-  ECContext.Fpcr = FPCR;
++  // The FPCR as the guest sees it: the trap enables always follow the MXCSR masks (the JIT exits clear them before
++  // host code runs), DAZ is reported in bit 19 where ntdll's fpcsr_to_mxcsr reads it, NEP/AH/FIZ are JIT-internal.
++  const uint32_t Unmasked = ~State.mxcsr;
++  uint32_t GuestFPCR = FPCR & ~(0x9f00u | (1u << 19) | 0x7u);
++  GuestFPCR |= ((Unmasked >> 7) & 1) << 8;    // IM -> IOE
++  GuestFPCR |= ((Unmasked >> 8) & 1) << 15;   // DM -> IDE
++  GuestFPCR |= ((Unmasked >> 9) & 0xf) << 9;  // ZM OM UM PM -> DZE OFE UFE IXE
++  GuestFPCR |= ((State.mxcsr >> 6) & 1) << 19; // DAZ
++  ECContext.Fpcr = GuestFPCR;
+   ECContext.Fpsr = FPSR;
+ 
+   return ECContext;
+@@ -561,7 +582,18 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
+   CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
+ 
+   BOOL FirstChance = TRUE;
+-  EXCEPTION_RECORD GuestRec = FEX::Windows::HandleGuestException(Fault, Rec, GuestContext.Pc, GuestContext.X8, GuestContext.X0, FirstChance);
++  const bool HostFault = !Fault.FaultToTopAndGeneratedException;
++  EXCEPTION_RECORD GuestRec = FEX::Windows::HandleGuestException(Fault, Rec, GuestContext.Pc, GuestContext.X8, GuestContext.X0, FirstChance,
++                                                                  FEX::Windows::X87PendingExceptions(Thread->CurrentFrame->State));
++  if (const uint32_t Flags = HostFault ? FEX::Windows::MXCSRFlagsForFloatException(GuestRec.ExceptionCode) : 0) {
++    // An unmasked SSE exception trapped on the host (the FPCR trap enables follow the guest's MXCSR masks in JIT
++    // code). Windows x64 reports #XM with the MXCSR, status flag included, in ExceptionInformation[1]; the flag
++    // stays set in FPSR for STMXCSR after the handler continues.
++    GuestContext.Fpsr |= FEX::Windows::FPSRBitsFromMXCSRFlags(Flags);
++    GuestRec.NumberParameters = 2;
++    GuestRec.ExceptionInformation[0] = 0;
++    GuestRec.ExceptionInformation[1] = (Thread->CurrentFrame->State.mxcsr & 0xFFC0) | FEX::Windows::MXCSRFlagsFromFPSR(GuestContext.Fpsr);
++  }
+   if (GuestRec.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+     GuestContext.Cpsr &= ~(1 << 21); // PSTATE.SS
+   } else if (GuestRec.ExceptionCode == EXCEPTION_BREAKPOINT) {
+@@ -788,6 +820,18 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+     return true;
+   }
+ 
++  if (!IsJIT && (NativeContext->Fpcr & 0x9f00) && FEX::Windows::MXCSRFlagsForFloatException(Exception->ExceptionCode) &&
++      RtlIsEcCode(NativeContext->Pc)) {
++    // A floating-point trap in native host code (not the guest exception re-raised below, which ntdll passes through
++    // here again with the guest RIP): the trap enables are armed from the guest's MXCSR masks for JIT code only, but
++    // a context restored by ntdll (NtContinue) carries them until the JIT is entered again. Record the flag as a masked
++    // exception would and continue with the traps off.
++    NativeContext->Fpsr |= FEX::Windows::FPSRBitsFromMXCSRFlags(FEX::Windows::MXCSRFlagsForFloatException(Exception->ExceptionCode));
++    NativeContext->Fpcr &= ~0x9f00u;
++    LogMan::Msg::DFmt("Neutralised a floating-point trap in host code at {:X}", NativeContext->Pc);
++    return true;
++  }
++
+   if (!IsJIT && !IsDispatcherAddress(NativeContext->Pc)) {
+     LogMan::Msg::DFmt("Passing through exception");
+     return false;
+diff --git a/Source/Windows/Common/Exception.h b/Source/Windows/Common/Exception.h
+index 1216223..8821d09 100644
+--- a/Source/Windows/Common/Exception.h
++++ b/Source/Windows/Common/Exception.h
+@@ -9,9 +9,44 @@
+ #include <FEXCore/Debug/InternalThreadState.h>
+ 
+ namespace FEX::Windows {
++// MXCSR status flag(s) implied by a floating-point exception code (overflow and underflow results are also inexact), 0 for other codes
++static inline uint32_t MXCSRFlagsForFloatException(DWORD Code) {
++  switch (static_cast<NTSTATUS>(Code)) {
++  case STATUS_FLOAT_INVALID_OPERATION: return 0x01;
++  case STATUS_FLOAT_DENORMAL_OPERAND: return 0x02;
++  case STATUS_FLOAT_DIVIDE_BY_ZERO: return 0x04;
++  case STATUS_FLOAT_OVERFLOW: return 0x08 | 0x20;
++  case STATUS_FLOAT_UNDERFLOW: return 0x10 | 0x20;
++  case STATUS_FLOAT_INEXACT_RESULT: return 0x20;
++  default: return 0;
++  }
++}
++
++// MXCSR IE(0) DE(1) ZE(2) OE(3) UE(4) PE(5) <-> FPSR IOC(0) IDC(7) DZC(1) OFC(2) UFC(3) IXC(4)
++static inline uint32_t FPSRBitsFromMXCSRFlags(uint32_t Flags) {
++  return (Flags & 1) | ((Flags >> 2) & 0xf) << 1 | ((Flags >> 1) & 1) << 7;
++}
++static inline uint32_t MXCSRFlagsFromFPSR(uint32_t FPSR) {
++  return (FPSR & 1) | ((FPSR >> 1) & 0xf) << 2 | ((FPSR >> 7) & 1) << 1;
++}
++
++// The unmasked pending x87 exception flags (bits 0-5) and the stack fault bit (bit 6) for the #MF decode
++static inline uint32_t X87PendingExceptions(const FEXCore::Core::CPUState& State) {
++  uint32_t Flags = 0;
++  for (int i = 0; i < 6; ++i) {
++    Flags |= (State.flags[FEXCore::X86State::X87FLAG_IE_LOC + i] & 1) << i;
++  }
++  uint32_t Pending = Flags & ~State.FCW & 0x3f;
++  if (State.flags[FEXCore::X86State::X87FLAG_SF_LOC]) {
++    Pending |= 0x40;
++  }
++  return Pending;
++}
++
+ template<typename TReg>
+ static inline EXCEPTION_RECORD HandleGuestException(FEXCore::Core::CpuStateFrame::SynchronousFaultDataStruct& Fault,
+-                                                    const EXCEPTION_RECORD& Src, TReg& Rip, TReg Rax, TReg Cx, BOOL& FirstChance) {
++                                                    const EXCEPTION_RECORD& Src, TReg& Rip, TReg Rax, TReg Cx, BOOL& FirstChance,
++                                                    uint32_t X87Pending = 0) {
+   EXCEPTION_RECORD Dst = Src;
+   Dst.ExceptionAddress = reinterpret_cast<void*>(Rip);
+ 
+@@ -25,6 +60,22 @@ static inline EXCEPTION_RECORD HandleGuestException(FEXCore::Core::CpuStateFrame
+ 
+   switch (Fault.Signal) {
+   case FEXCore::Core::FAULT_SIGILL: Dst.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION; return Dst;
++  case FEXCore::Core::FAULT_SIGFPE:
++    // x87 #MF at a waiting instruction: decoded from the unmasked pending flags in the kernel's priority order
++    if (X87Pending & 0x01) {
++      Dst.ExceptionCode = (X87Pending & 0x40) ? STATUS_FLOAT_STACK_CHECK : STATUS_FLOAT_INVALID_OPERATION;
++    } else if (X87Pending & 0x02) {
++      Dst.ExceptionCode = STATUS_FLOAT_DENORMAL_OPERAND;
++    } else if (X87Pending & 0x04) {
++      Dst.ExceptionCode = STATUS_FLOAT_DIVIDE_BY_ZERO;
++    } else if (X87Pending & 0x08) {
++      Dst.ExceptionCode = STATUS_FLOAT_OVERFLOW;
++    } else if (X87Pending & 0x10) {
++      Dst.ExceptionCode = STATUS_FLOAT_UNDERFLOW;
++    } else {
++      Dst.ExceptionCode = STATUS_FLOAT_INEXACT_RESULT;
++    }
++    return Dst;
+   case FEXCore::Core::FAULT_SIGTRAP:
+     switch (Fault.TrapNo) {
+     case FEXCore::X86State::X86_TRAPNO_DB: Dst.ExceptionCode = EXCEPTION_SINGLE_STEP; return Dst;
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index 8c6b7f7..5c7b6b2 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -792,7 +792,8 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
+   BOOL FirstChance = TRUE;
+   EXCEPTION_RECORD GuestException =
+-    FEX::Windows::HandleGuestException(Fault, *Exception, WowContext->Eip, WowContext->Eax, WowContext->Ecx, FirstChance);
++    FEX::Windows::HandleGuestException(Fault, *Exception, WowContext->Eip, WowContext->Eax, WowContext->Ecx, FirstChance,
++                                       FEX::Windows::X87PendingExceptions(Thread->CurrentFrame->State));
+   if (GuestException.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+     WowContext->EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
+   }
+-- 
+2.50.1 (Apple Git-155)
+
