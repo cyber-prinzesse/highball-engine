@@ -7,6 +7,7 @@
  *   repmovs  std; rep movsb faulting into an uncommitted page, resumed after committing it
  *   strresume rep movs/stos in both directions, overlapping or not, faulting part way through and resumed: the
  *            iterations already done in the handler's context and the memory after the resumed instruction
+ *   strbounds rep movs/stos ending at a page edge next to an uncommitted page: no access outside the operands
  *   nested   an int3 inside the handler of a read fault
  *   repeat   1000 faults of three kinds with changing patterns
  *   seh      frame-based handler + RtlUnwindEx restoring nonvolatile GPRs and XMM6-15
@@ -795,6 +796,80 @@ static void group_strresume(void)
     for (i = 0; i < sizeof(str_cases) / sizeof(str_cases[0]); i++) strresume_case(&str_cases[i]);
 }
 
+/* rep movs/stos whose source or destination ends at a page edge next to the uncommitted page: they touch no byte
+ * outside their operands, so there is no fault at all (an implementation working in blocks must not read or write
+ * past either end) */
+static const strcase strbounds_cases[] =
+{
+    { "strbounds.movsb.fwd.src_end",   0, 0, 0x0c01, 0x2001, 0x03ff },  /* source ends at 0x0fff */
+    { "strbounds.movsb.bwd.src_end",   0, 1, 0x0fff, 0x2fff, 0x03ff },  /* source starts at 0x0fff, downwards */
+    { "strbounds.movsb.fwd.dst_end",   0, 0, 0x2001, 0x0c01, 0x03ff },  /* destination ends at 0x0fff */
+    { "strbounds.movsb.bwd.dst_start", 0, 1, 0x0fff, 0x23fe, 0x03ff },  /* destination ends at 0x2000, downwards */
+    { "strbounds.movsb.bwd.src_start", 0, 1, 0x23fe, 0x0fff, 0x03ff },  /* source ends at 0x2000, downwards */
+    { "strbounds.movsq.fwd.src_end",   1, 0, 0x0c08, 0x2008, 0x007f },
+    { "strbounds.movsq.bwd.src_end",   1, 1, 0x0ff8, 0x2ff8, 0x007f },
+    { "strbounds.movsq.bwd.dst_start", 1, 1, 0x0ff8, 0x23f0, 0x007f },
+    { "strbounds.stosb.fwd.end",       2, 0, 0,      0x0c01, 0x03ff },
+    { "strbounds.stosb.bwd.start",     2, 1, 0,      0x23fe, 0x03ff },
+    { "strbounds.stosq.bwd.start",     3, 1, 0,      0x23f0, 0x007f },
+};
+
+static void strbounds_case(const strcase *c)
+{
+    static const unsigned sizes[4] = { 1, 8, 1, 8 };
+    const unsigned size = sizes[c->op];
+    const int movs = c->op < 2, step = c->df ? -(int)size : (int)size;
+    const uint64_t fill = 0x5a5a5a5a5a5a5a5aull;
+    uint8_t *base = VirtualAlloc(NULL, 0x3000, MEM_RESERVE, PAGE_NOACCESS);
+    uint8_t *model = calloc(1, 0x3000);
+    uint64_t regs[5], i;
+    char name[128];
+    size_t bad = 0, k;
+
+    VirtualAlloc(base, 0x1000, MEM_COMMIT, PAGE_READWRITE);
+    VirtualAlloc(base + 0x2000, 0x1000, MEM_COMMIT, PAGE_READWRITE);
+    for (k = 0; k < 0x3000; k++)
+        if (!in_hole(k)) base[k] = model[k] = (uint8_t)(k * 13 + 7);
+    for (i = 0; i < c->count; i++)
+    {
+        uint64_t s = c->src + (int64_t)i * step, d = c->dst + (int64_t)i * step;
+        if (movs) memmove(model + d, model + s, size);
+        else memcpy(model + d, &fill, size);
+    }
+
+    g_commit_lo = base + 0x1000;
+    g_commit_hi = base + 0x2000;
+    g_mode = MODE_COMMIT;
+    g_resume_rip = str_done;
+    g_calls = 0;
+    g_seen.valid = 0;
+    init_clobber();
+    regs[0] = c->count;
+    regs[1] = (uintptr_t)base + c->src;
+    regs[2] = (uintptr_t)base + c->dst;
+    regs[3] = fill;
+    regs[4] = c->df;
+    g_armed = 1;
+    string_op(regs, c->op);
+    g_armed = 0;
+
+    sprintf(name, "%s.nofault", c->id);
+    fid_check(!g_seen.valid, name, "access violation at %+lld (%s) for an operation inside its operands",
+              g_seen.valid ? (long long)(g_seen.rec.ExceptionInformation[1] - (uintptr_t)base) : 0ll,
+              g_seen.valid && g_seen.rec.ExceptionInformation[0] ? "write" : "read");
+    for (k = 0; k < 0x3000; k++) if (!in_hole(k)) bad += base[k] != model[k];
+    sprintf(name, "%s.data", c->id);
+    fid_check(!bad, name, "%zu bytes differ from a byte by byte execution", bad);
+    VirtualFree(base, 0, MEM_RELEASE);
+    free(model);
+}
+
+static void group_strbounds(void)
+{
+    size_t i;
+    for (i = 0; i < sizeof(strbounds_cases) / sizeof(strbounds_cases[0]); i++) strbounds_case(&strbounds_cases[i]);
+}
+
 static void group_nested(void)
 {
     uint8_t *page = VirtualAlloc(NULL, 0x1000, MEM_RESERVE, PAGE_NOACCESS);
@@ -1202,6 +1277,7 @@ int main(int argc, char **argv)
     if (want_group(groups, "modify")) group_modify();
     if (want_group(groups, "repmovs")) group_repmovs();
     if (want_group(groups, "strresume")) group_strresume();
+    if (want_group(groups, "strbounds")) group_strbounds();
     if (want_group(groups, "nested")) group_nested();
     if (want_group(groups, "repeat")) group_repeat(count);
     if (want_group(groups, "seh")) group_seh();

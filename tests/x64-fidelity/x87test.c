@@ -487,9 +487,11 @@ static void group_pointers(void)
                      : "=m"(e), "=m"(fx) : "m"(d), "m"(FCW_DEFAULT) : "memory");
     fid_info("pointers.fnstenv", "FIP %#x (marker %#x) FOP %#x FDP %#x (&d %#x)", e.fip, (unsigned)(uintptr_t)fip_marker,
              e.fop, e.fdp, (unsigned)(uintptr_t)&d);
-    /* FNSTENV stores the last non-control instruction's address, opcode (DC 05 -> 0x405) and operand */
-    fid_check(e.fip == (uint32_t)(uintptr_t)fip_marker && (e.fop & 0x7ff) == 0x405 && e.fdp == (uint32_t)(uintptr_t)&d,
-              "pointers.fnstenv.values", "FIP %#x FOP %#x FDP %#x", e.fip, e.fop, e.fdp);
+    /* FNSTENV stores the last non-control instruction's address. Its opcode (DC 05 -> 0x405) and operand address
+     * depend on the processor: AMD stores them, Intel processors that update FDP only on exceptions (CPUID.7.0:EBX
+     * bit 6) store 0 for both (Windows Server 2022 runner, Xeon Platinum 8573C) */
+    fid_check(e.fip == (uint32_t)(uintptr_t)fip_marker, "pointers.fnstenv.fip", "FIP %#x want %#x", e.fip,
+              (unsigned)(uintptr_t)fip_marker);
     fid_info("pointers.fxsave", "FOP %#x FIP %#llx FDP %#llx", *(uint16_t *)(fx + 6), (unsigned long long)*(uint64_t *)(fx + 8),
              (unsigned long long)*(uint64_t *)(fx + 16));
 }
