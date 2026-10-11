@@ -72,7 +72,7 @@ boots in 2.4 s with both halves populated, 32-bit and 64-bit x86 programs run wi
 Rosetta on a compute loop, and there is no renderer yet, because DXMT needs the Mac driver's Metal
 glue that only CrossOver's tree has. Since 2026-10-11 the build has Vulkan through MoltenVK and ships
 the host libraries Wine opens by name (MoltenVK, FreeType, GnuTLS, SDL) in `lib/`, so D3D12 and D3D11
-through vkd3d-proton and DXVK work with those placed in a prefix; they are not packaged as an
+through vkd3d-proton and DXVK work with those placed in a prefix. They are not packaged as an
 overlay yet. The decision document and the measurements are in Highball's
 `private/notes/rosetta-transition-plan.md`. The Intel line stays the default for every macOS up to 27.
 
