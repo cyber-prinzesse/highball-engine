@@ -1,0 +1,84 @@
+From 9c8775b2edf04760c05c84d763a901020b90759a Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Mon, 12 Oct 2026 01:47:40 +0200
+Subject: [PATCH] macOS: hardware TSO in every thread
+
+TSOHandlerConfig turns the hardware TSO mode on once, in ProcessInit, and then tells the JIT that the hardware orders
+memory, so the JIT emits no ordering of its own. On Linux the memory model set with prctl carries over to threads
+created later. On macOS thread_set_x86_64_compat only changes the calling thread, so every thread but the first ran
+x86-64 code with Arm weak ordering: a message-passing test (six writer/reader pairs, 20 million rounds each) saw
+between 2,938 and 2,841,851 reorderings per pair. ThreadInit (ARM64EC) and BTCpuThreadInit (WOW64) now turn it on for
+each new thread before it runs guest code, and log an error if that fails. With it the same test sees none (14
+TSOControl calls instead of 1), and takes 27 s instead of 21.
+---
+ Source/Windows/ARM64EC/Module.cpp        |  3 +++
+ Source/Windows/Common/TSOHandlerConfig.h | 11 +++++++++++
+ Source/Windows/WOW64/Module.cpp          |  3 +++
+ 3 files changed, 17 insertions(+)
+
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 5805d39..ba129a8 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -1163,6 +1163,9 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
+ NTSTATUS ThreadInit() {
+   std::scoped_lock Lock(ThreadCreationMutex);
+   FEX::Windows::InitCRTThread();
++  if (Exception::HandlerConfig) {
++    Exception::HandlerConfig->ThreadInit();
++  }
+   const auto CPUArea = GetCPUArea();
+ 
+   static constexpr size_t EmulatorStackSize = 0x40000;
+diff --git a/Source/Windows/Common/TSOHandlerConfig.h b/Source/Windows/Common/TSOHandlerConfig.h
+index f63478d..b675cc7 100644
+--- a/Source/Windows/Common/TSOHandlerConfig.h
++++ b/Source/Windows/Common/TSOHandlerConfig.h
+@@ -19,6 +19,7 @@ public:
+ 
+     if (TSOEnabled() && FEX::Windows::UnixLib::TryEnableHardwareTSO()) {
+       CTX.SetHardwareTSOSupport(true);
++      HardwareTSO = true;
+     }
+ 
+     uint64_t Flags = (StrictInProcessSplitLocks() ? FEX_UNALIGN_ATOMIC_STRICT_SPLIT_LOCKS : 0) |
+@@ -33,6 +34,15 @@ public:
+     return UnalignedHandlerType;
+   }
+ 
++  // The hardware TSO mode is per thread where the host sets it per thread (macOS thread_set_x86_64_compat), so
++  // every new thread enables it again before it runs guest code. The JIT emits no ordering of its own once
++  // ProcessInit found hardware TSO, so a thread without it would run x86 code with weak ordering.
++  void ThreadInit() const {
++    if (HardwareTSO && !FEX::Windows::UnixLib::TryEnableHardwareTSO()) {
++      LogMan::Msg::EFmt("FEX: could not enable hardware TSO for a new thread");
++    }
++  }
++
+ private:
+   FEX_CONFIG_OPT(TSOEnabled, TSOENABLED);
+   FEX_CONFIG_OPT(HalfBarrierTSOEnabled, HALFBARRIERTSOENABLED);
+@@ -40,5 +50,6 @@ private:
+   FEX_CONFIG_OPT(KernelUnalignedAtomicBackpatching, KERNELUNALIGNEDATOMICBACKPATCHING);
+ 
+   FEXCore::ArchHelpers::Arm64::UnalignedHandlerType UnalignedHandlerType {FEXCore::ArchHelpers::Arm64::UnalignedHandlerType::HalfBarrier};
++  bool HardwareTSO {};
+ };
+ } // namespace FEX::Windows
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index ee7bd71..2107e9b 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -674,6 +674,9 @@ void BTCpuThreadInit() {
+   static constexpr size_t DefaultWow64CS {4};
+   std::scoped_lock Lock(ThreadCreationMutex);
+   FEX::Windows::InitCRTThread();
++  if (Context::HandlerConfig) {
++    Context::HandlerConfig->ThreadInit();
++  }
+   auto* Thread = CTX->CreateThread();
+ 
+   // Default segment setup.
+-- 
+2.54.0 (Apple Git-157)
+
