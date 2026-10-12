@@ -161,3 +161,12 @@ with it (MoltenVK and the Vulkan headers from Homebrew).
   uses it for Steam's browser, which under FEX cannot start its GPU child inside Chromium's sandbox: Highball
   writes `--disable-gpu --disable-gpu-compositing --no-sandbox --disable-gpu-sandbox` for steamwebhelper.exe,
   so the browser gets them however Steam was started.
+- `0036-win32u-vulkan-share-memory-through-metal-objects.patch`: VK_KHR_external_memory_win32 on macOS. win32u only
+  had it on top of fd memory, which MoltenVK lacks, so DXVK could not create shared textures and vkd3d-proton could
+  not open them: no video in D3D12 games that decode it through Media Foundation in D3D11 (Microsoft Flight Simulator
+  2024's boot, loading and start screens). The allocation is exported as a Metal object (MTLTexture, MTLBuffer or
+  MTLHeap), kept in a process-local table under the inode of a pipe that stands for the fd inside the D3DKMT resource,
+  and imported with VkImportMemoryMetalHandleInfoEXT. Same process only. Needs MoltenVK patch 0006.
+- `0037-ffmpeg-arm64ec-yuv2rgb-narrow-blue-sums-first.patch`: Wine's ARM64EC port of swscale's yuv2rgb NEON code wrote
+  some outputs (R2 for bgra) into v10/v11 before reading the blue sums kept there, so video converted to BGRA had
+  vertical stripes and wrong colours. The blue sums are narrowed first. Same code in upstream master.

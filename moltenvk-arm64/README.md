@@ -20,6 +20,13 @@ against that tree), and the SPIRV-Cross commits that build carried.
 - `0003` command buffer error messages name the VkDevice (DXVK's and vkd3d-proton's both label theirs "Queue 0-0").
 - `0004` `HB_MVK_TEXTURE_2D_AS_ARRAY=1` creates shader-readable 2D views as one-layer 2D array textures and converts
   shaders with SPIRV-Cross's `texture_2D_as_2D_array` (SPIRV-Cross `0004`). Off unless set.
+- `0005` placement heaps go into the device's residency set. Images placed in a heap had their own texture added,
+  but the textures MoltenVK makes from the heap later (block-texel views of compressed images, 2D views of 3D images)
+  did not, and shader validation reported them used while not resident in three compute pipelines of Microsoft
+  Flight Simulator 2024.
+- `0006` an imported MTLTexture stays the memory of its dedicated image. initExternalMemory(), written for export,
+  replaced it with a new texture, so memory shared between two VkDevices as an MTLTexture never showed the other
+  side's content. Needed by patches-arm64/0036.
 
 ## SPIRV-Cross (6c09849, MoltenVK 1.4.2's pin)
 

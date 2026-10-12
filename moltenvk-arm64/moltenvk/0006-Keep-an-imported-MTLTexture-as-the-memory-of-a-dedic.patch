@@ -1,0 +1,35 @@
+From 77160e32b9e27bc18b5486c1ce007ae2b98d855a Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Mon, 12 Oct 2026 22:53:23 +0200
+Subject: [PATCH] Keep an imported MTLTexture as the memory of a dedicated
+ image
+
+vkAllocateMemory with VkImportMemoryMetalHandleInfoEXT for VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT stored
+the imported texture, then initExternalMemory(), written for export, replaced it with a new texture of the not yet
+bound dedicated image. The image then read and wrote that new, empty texture, so memory shared between two VkDevices
+as an MTLTexture never showed the content of the other device (a D3D11 texture opened in D3D12 through Wine read back
+magenta instead of the cleared color). The export path now runs only when nothing was imported.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm
+index 05c51a1..afeb38c 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm
+@@ -495,8 +495,10 @@
+ 		// cannot be exported as a single MTLTexture, and therefore will have exporting forbidden.
+ 		if (!(xmProps.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) {
+ 			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "vkAllocateMemory(): VkImage's VkFormat does not allow exports."));
+-		} else {
+-			// Make sure allocation happens at creation time since we may need to export the memory before usage
++		} else if ( !_mtlTexture ) {
++			// Make sure allocation happens at creation time since we may need to export the memory before usage.
++			// Highball imported-texture: an imported MTLTexture is the memory, and the dedicated image picks it up when
++			// it is bound. Replacing it here gave the image a new, empty texture.
+ 			_mtlTexture = [dedicatedImage->getMTLTexture() retain];
+ 		}
+ 		requiresDedicated = true;
+-- 
+2.54.0 (Apple Git-157)
+
