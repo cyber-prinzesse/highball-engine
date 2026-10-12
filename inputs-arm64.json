@@ -14,6 +14,13 @@
     "sha256": "52e5f5a7b131021d0c39a37a38fa380a1da7885cd04bd61afd0cd4ecfb8bc1f3",
     "note": "The PE side needs clang for ARM64EC (arm64ec-w64-mingw32-clang) and lld 23 for the ARM64X link; Homebrew's gcc mingw-w64 cannot build either. The i386 half is built with the same toolchain's i686-w64-mingw32-gcc wrapper."
   },
+  "llvm-mingw-renderers": {
+    "name": "llvm-mingw 20250910 (clang 21.1.1, ucrt, macOS universal), for the renderers",
+    "url": "https://github.com/mstorsjo/llvm-mingw/releases/download/20250910/llvm-mingw-20250910-ucrt-macos-universal.tar.xz",
+    "size": 118740040,
+    "sha256": "2419b5a66ceb20ad34ddcf374885df80f013765adff04e92d396c34d0a5dd6be",
+    "note": "The toolchain the MSFS 2024 runs' vkd3d-proton and DXVK were built with. clang 23.1.2 (llvm-mingw 20260922) refuses dxil-spirv's dxbc-spirv small_vector (\"no matching member function for call to 'move'\", build-renderers-arm64 run 38252336750)."
+  },
   "fex": {
     "name": "Hangover 11.16 DLLs: FEX 2608 as libarm64ecfex.dll (x86-64 through ARM64EC) and libwow64fex.dll (x86 through WoW64), MIT, used when build-arm64 is dispatched with fex_build: hangover",
     "url": "https://github.com/AndreRH/hangover/releases/download/hangover-11.16/hangover_11.16_dlls.tar",

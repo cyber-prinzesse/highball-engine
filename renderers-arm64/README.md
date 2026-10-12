@@ -2,7 +2,7 @@
 
 vkd3d-proton (Direct3D 12) and DXVK (DXGI, Direct3D 11 and 10) on Vulkan, at the commits pinned in
 `inputs-arm64.json`, with the patches below. `build-renderers-arm64.yml` cross-compiles them for x86-64 Windows with
-the same llvm-mingw as the engine, marks every DLL as a Wine builtin (Wine 11.18 ignores DLLs in WINEDLLPATH that are
+llvm-mingw 20250910 (clang 21, the toolchain of the tested builds; clang 23 refuses dxil-spirv's dxbc-spirv), marks every DLL as a Wine builtin (Wine 11.18 ignores DLLs in WINEDLLPATH that are
 not), and packages `renderers/vkd3d/wine/aarch64-windows` and `renderers/dxvk/wine/aarch64-windows`, the overlays
 Highball's .vkd3d and .dxvk modes put first in WINEDLLPATH. The DLLs run under FEX like the games that load them.
 
