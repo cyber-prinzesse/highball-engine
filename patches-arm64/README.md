@@ -150,3 +150,9 @@ with it (MoltenVK and the Vulkan headers from Homebrew).
   finds the same address. On an M4: 2440 ms per thread with 4 to 8 GB filled as MSFS 2024 fills it, 0.535 ms with the
   patch, 0.37 ms in a fresh process either way. MSFS 2024 reached its first boot video 38 s after launch instead of
   13 minutes.
+- `0034-advapi32-credenumerate-empty-keychain-is-not-an-error.patch`: the Intel line's 0019. On macOS
+  CredEnumerateW() also asks the Keychain through mountmgr, which answers STATUS_NOT_FOUND when nothing there
+  matches; the call then failed with ERROR_NOT_FOUND and threw away the registry's matches. Xbox's XAL looks up
+  its device key and tokens that way, so every XAL game (Microsoft Flight Simulator 2024 on this line, Forza
+  Horizon 6 on the Intel line) asked for a sign-in at every launch. An empty answer from the host now counts
+  like an unsupported host.
