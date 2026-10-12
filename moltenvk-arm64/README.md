@@ -27,6 +27,9 @@ against that tree), and the SPIRV-Cross commits that build carried.
 - `0006` an imported MTLTexture stays the memory of its dedicated image. initExternalMemory(), written for export,
   replaced it with a new texture, so memory shared between two VkDevices as an MTLTexture never showed the other
   side's content. Needed by patches-arm64/0036.
+- `0007` textures shared with another VkDevice are not compressed (allowGPUOptimizedContents NO). The two devices'
+  queues are not ordered, and a read racing a write of a compressed texture showed whole tiles of magenta in the
+  game's videos. Measured: magenta blocks in 2 of 25 boot screenshots before, 0 of 216 after (one per second).
 
 ## SPIRV-Cross (6c09849, MoltenVK 1.4.2's pin)
 
