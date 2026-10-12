@@ -1,0 +1,179 @@
+From 9027b55aa44792d4953a7a4d267699b2f926ccc4 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Mon, 12 Oct 2026 19:46:35 +0200
+Subject: [PATCH 2/4] Release destroyed Metal objects 3 seconds late
+
+With a residency set (macOS 15 and later), MoltenVK creates command buffers without retained references and takes
+a destroyed buffer or texture out of the residency set at once, while the GPU may still run work submitted before
+the destroy. Windows and Linux keep such memory alive until the GPU is done, D3D12 games rely on it, and
+vkd3d-proton passes the release straight through. Allocations, texture views and samplers now stay retained, and
+allocations resident, for 3 seconds after the destroy. A time limit is crude: releasing when the work already
+submitted completes would be exact.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.h  | 21 +++++++++--
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm | 46 +++++++++++++++++++++++
+ MoltenVK/MoltenVK/GPUObjects/MVKImage.mm  |  6 ++-
+ MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm  |  1 +
+ 4 files changed, 69 insertions(+), 5 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+index 534a414..545b8c3 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+@@ -30,6 +30,7 @@
+ #include <shared_mutex>
+ #include <string>
+ #include <mutex>
++#include <deque>
+ #include <os/lock.h>
+ 
+ #import <Metal/Metal.h>
+@@ -991,14 +992,22 @@ public:
+ #if !MVK_XCODE_16
+ 	void removeResidency(id allocation) {}
+ #else
++	/** Highball: the allocation stays retained and resident a while, see deferRelease(). */
+ 	void removeResidency(id<MTLAllocation> allocation) {
+-		@synchronized(_residencySet) {
+-			[_residencySet removeAllocation:allocation];
+-			[_residencySet commit];
+-		}
++		if (_residencySet) { deferRelease(allocation, true); }
+ 	}
+ #endif
+ 
++	/**
++	 * Highball deferred-release: keeps a Metal object the app just destroyed retained (and resident, if it is in the
++	 * residency set) until the GPU work submitted before the destroy is surely done. The caller still releases its
++	 * own reference.
++	 */
++	void deferRelease(id obj, bool resident = false);
++
++	/** Highball deferred-release: releases what has waited long enough. Called at each present. */
++	void flushDeferredReleases();
++
+ 	void addResidencySet(id<MTLCommandQueue> queue) {
+ #if MVK_XCODE_16
+ 		if (_residencySet) [queue addResidencySet:_residencySet];
+@@ -1105,6 +1114,10 @@ protected:
+ 	MVKSmallVector<MVKVisibilityBuffer> _visibilityBuffers;
+ 	MVKLiveResourceSet _liveResources;
+ 	std::mutex _rezLock;
++	struct MVKDeferredRelease { uint64_t time; id obj; bool resident; };
++	std::deque<MVKDeferredRelease> _deferredReleases;
++	std::mutex _deferredReleaseLock;
++	void flushDeferredReleases(uint64_t now, bool all);
+ 	std::mutex _sem4Lock;
+     std::mutex _perfLock;
+ 	std::mutex _vizLock;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 9772757..b342e01 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -5447,6 +5447,47 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ }
+ 
+ // Create the command queues
++// Highball deferred-release (gin-19 experiment): see MVKDevice::deferRelease() in MVKDevice.h.
++__attribute__((used)) static const char* const kHighballDeferredRelease = "HIGHBALL deferred-release";
++
++void MVKDevice::deferRelease(id obj, bool resident) {
++	if (!obj) { return; }
++	uint64_t now = mvkGetTimestamp();
++	lock_guard<mutex> lock(_deferredReleaseLock);
++	_deferredReleases.push_back({now, [obj retain], resident});
++	flushDeferredReleases(now, false);
++}
++
++void MVKDevice::flushDeferredReleases() {
++	lock_guard<mutex> lock(_deferredReleaseLock);
++	if ( !_deferredReleases.empty() ) { flushDeferredReleases(mvkGetTimestamp(), false); }
++}
++
++// Called with _deferredReleaseLock held.
++void MVKDevice::flushDeferredReleases(uint64_t now, bool all) {
++	static const double kDeferredReleaseMs = 3000.0;
++	size_t n = 0;
++	while (n < _deferredReleases.size() &&
++		   (all || mvkGetElapsedMilliseconds(_deferredReleases[n].time, now) >= kDeferredReleaseMs)) { n++; }
++	if ( !n ) { return; }
++#if MVK_XCODE_16
++	if (_residencySet) {
++		bool removed = false;
++		@synchronized(_residencySet) {
++			for (size_t i = 0; i < n; i++) {
++				if (_deferredReleases[i].resident) {
++					[_residencySet removeAllocation: (id<MTLAllocation>)_deferredReleases[i].obj];
++					removed = true;
++				}
++			}
++			if (removed) { [_residencySet commit]; }
++		}
++	}
++#endif
++	for (size_t i = 0; i < n; i++) { [_deferredReleases[i].obj release]; }
++	_deferredReleases.erase(_deferredReleases.begin(), _deferredReleases.begin() + n);
++}
++
+ void MVKDevice::initQueues(const VkDeviceCreateInfo* pCreateInfo) {
+ #if MVK_XCODE_16
+ 	if (_physicalDevice->_isUsingMetalArgumentBuffers && _physicalDevice->_metalFeatures.residencySets) {
+@@ -5552,6 +5593,11 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 
+ 	for (auto &fences: _barrierFences) for (auto fence: fences) [fence release];
+ 
++	{
++		lock_guard<mutex> lock(_deferredReleaseLock);
++		flushDeferredReleases(0, true);
++	}
++
+ #if MVK_XCODE_16
+ 	[_residencySet release];
+ #endif
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+index ef8ca60..97f7e55 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+@@ -155,6 +155,7 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+ 
+     for (auto& elem : _mtlTextureViews) {
+         live.remove(elem.second);
++        dev->deferRelease(elem.second);
+         [elem.second release];
+     }
+     _mtlTextureViews.clear();
+@@ -2190,6 +2191,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ void MVKImageViewPlane::releaseMTLTexture() {
+ 	if (id<MTLTexture> tex = _mtlTexture) {
+ 		getDevice()->getLiveResources().remove(tex);
++		getDevice()->deferRelease(tex);
+ 		[tex release];
+ 		_mtlTexture = nil;
+ 	}
+@@ -2668,8 +2670,10 @@ static MSLSamplerBorderColor getSpvBorderColorFromVkBorderColor(VkBorderColor vk
+ // Potentially called twice, from destroy() and destructor, so ensure everything is nulled out.
+ void MVKSampler::detachMemory() {
+ 	@synchronized (getMTLDevice()) {
+-		if (_mtlSamplerState)
++		if (_mtlSamplerState) {
+ 			_device->getLiveResources().remove(_mtlSamplerState);
++			_device->deferRelease(_mtlSamplerState);
++		}
+ 		[_mtlSamplerState release];
+ 		_mtlSamplerState = nil;
+ 	}
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
+index dec4b45..bf5d6fa 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
+@@ -146,6 +146,7 @@
+ template VkResult MVKQueue::submit(uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence, MVKCommandUse cmdUse);
+ 
+ VkResult MVKQueue::submit(const VkPresentInfoKHR* pPresentInfo) {
++	getDevice()->flushDeferredReleases();	// Highball deferred-release
+ 	return submit(new MVKQueuePresentSurfaceSubmission(this, pPresentInfo));
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

@@ -80,5 +80,18 @@
     "repo": "https://github.com/doitsujin/dxvk.git",
     "commit": "1cad6cd11d8b0edf89113a0d8e4819ade33fbf9c",
     "note": "\"[dxvk] Rework submission synchronization\": the DXVK master the MSFS 2024 spike built on 2026-10-09 and every arm64 run since used. Highball's changes are renderers-arm64/dxvk."
+  },
+  "moltenvk": {
+    "name": "MoltenVK 1.4.2 (Vulkan on Metal), Apache-2.0",
+    "repo": "https://github.com/KhronosGroup/MoltenVK.git",
+    "tag": "v1.4.2",
+    "commit": "db66022459ffb663aa2b50f6b018bc2e124f5edf",
+    "note": "The base of every MSFS 2024 run on the arm64 engine (the gin19 builds, 2026-10-11 and 12). Highball's changes are moltenvk-arm64/moltenvk, built by build-moltenvk-arm64.yml."
+  },
+  "spirv-cross": {
+    "name": "SPIRV-Cross (SPIR-V to Metal Shading Language, inside MoltenVK), Apache-2.0",
+    "repo": "https://github.com/KhronosGroup/SPIRV-Cross.git",
+    "commit": "6c09849fe88c48eaed08413aa022aaa136a3a057",
+    "note": "MoltenVK 1.4.2's pinned revision. Highball's changes are moltenvk-arm64/spirv-cross."
   }
 }
