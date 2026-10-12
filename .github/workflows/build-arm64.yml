@@ -194,12 +194,16 @@ jobs:
           mkdir -p out/renderers out/frameworks out/tools
           test -f out/engine/bin/wineserver
           # Wine Mono and Gecko, the versions this tree asks for; without them a bottle's first boot
-          # stops at a prompt nothing unattended can answer. Their x86 builds run through FEX.
+          # stops at a prompt nothing unattended can answer. Mono is the arm64 package: wineboot and
+          # Wine's other native arm64 processes register mscoree with its arm64 half, which looks for
+          # bin/libmono-2.0-arm64.dll, and the x86 package has only the x86 and x86_64 builds, so every
+          # new prefix showed the Mono installer (B1, measured 2026-10-12). The arm64 package carries all
+          # three builds and the arm64 support tools. Gecko's x86 builds run through FEX.
           mono=$(sed -n 's/^#define MONO_VERSION "\(.*\)"/\1/p' src/wine-*/dlls/appwiz.cpl/addons.c)
           gecko=$(sed -n 's/^#define GECKO_VERSION "\(.*\)"/\1/p' src/wine-*/dlls/appwiz.cpl/addons.c)
           echo "addons: wine-mono $mono, wine-gecko $gecko"
           mkdir -p out/engine/share/wine/mono out/engine/share/wine/gecko
-          curl -sSfL -o wine-mono.tar.xz "https://dl.winehq.org/wine/wine-mono/${mono}/wine-mono-${mono}-x86.tar.xz"
+          curl -sSfL -o wine-mono.tar.xz "https://dl.winehq.org/wine/wine-mono/${mono}/wine-mono-${mono}-arm64.tar.xz"
           tar -xJf wine-mono.tar.xz -C out/engine/share/wine/mono
           for arch in x86 x86_64; do
             curl -sSfL -o "wine-gecko-${arch}.tar.xz" "https://dl.winehq.org/wine/wine-gecko/${gecko}/wine-gecko-${gecko}-${arch}.tar.xz"
