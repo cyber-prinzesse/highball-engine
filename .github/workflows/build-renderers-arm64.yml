@@ -2,11 +2,12 @@ name: build-renderers-arm64
 
 # The Direct3D-to-Vulkan renderers for the arm64 engine line: vkd3d-proton (Direct3D 12) and DXVK (DXGI, Direct3D 11
 # and 10) at pinned upstream commits plus Highball's patches in renderers-arm64/, cross-compiled for x86-64 Windows
-# with llvm-mingw 20250910, the toolchain of their tested builds. They run under FEX like the games that load them. Each DLL is marked as a
-# Wine builtin: Wine 11.18 ignores DLLs found in WINEDLLPATH that are not ("found in WINEDLLPATH but not a builtin,
-# ignoring"), and Highball's renderers reach a prefix through WINEDLLPATH_PREPEND. Packaged in the layout Highball's
-# engine manifest extracts: renderers/vkd3d/wine/aarch64-windows (vkd3d-proton with DXVK's DXGI and Direct3D 11 beside
-# it, the app's .vkd3d mode) and renderers/dxvk/wine/aarch64-windows (DXVK alone, the app's .dxvk mode).
+# with llvm-mingw 20250910, the toolchain of their tested builds. They run under FEX like the games that load them.
+# Each DLL is marked as a Wine builtin: Wine 11.18 ignores DLLs found in WINEDLLPATH that are not ("found in
+# WINEDLLPATH but not a builtin, ignoring"), and Highball's renderers reach a prefix through WINEDLLPATH_PREPEND.
+# Packaged in the layout Highball's engine manifest extracts: renderers/vkd3d/wine/aarch64-windows (vkd3d-proton with
+# DXVK's DXGI and Direct3D 11 beside it, the app's .vkd3d mode) and renderers/dxvk/wine/aarch64-windows (DXVK alone,
+# the app's .dxvk mode).
 
 on:
   push:

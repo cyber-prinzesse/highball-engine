@@ -2,12 +2,14 @@
 
 vkd3d-proton (Direct3D 12) and DXVK (DXGI, Direct3D 11 and 10) on Vulkan, at the commits pinned in
 `inputs-arm64.json`, with the patches below. `build-renderers-arm64.yml` cross-compiles them for x86-64 Windows with
-llvm-mingw 20250910 (clang 21, the toolchain of the tested builds; clang 23 refuses dxil-spirv's dxbc-spirv), marks every DLL as a Wine builtin (Wine 11.18 ignores DLLs in WINEDLLPATH that are
-not), and packages `renderers/vkd3d/wine/aarch64-windows` and `renderers/dxvk/wine/aarch64-windows`, the overlays
-Highball's .vkd3d and .dxvk modes put first in WINEDLLPATH. The DLLs run under FEX like the games that load them.
+llvm-mingw 20250910 (clang 21, the toolchain of the tested builds; clang 23 refuses dxil-spirv's dxbc-spirv), marks
+every DLL as a Wine builtin (Wine 11.18 ignores DLLs in WINEDLLPATH that are not), and packages
+`renderers/vkd3d/wine/aarch64-windows` and `renderers/dxvk/wine/aarch64-windows`, the overlays Highball's .vkd3d and
+.dxvk modes put first in WINEDLLPATH. The DLLs run under FEX like the games that load them.
 
-Each series is `git format-patch` output against its pinned commit. Applied in order they rebuild, file for file,
-the trees the Microsoft Flight Simulator 2024 runs of 2026-10-11 and 12 were built from (checked on the M4).
+Each series is `git format-patch` output against its pinned commit. Applied in order, vkd3d-proton's 0001 to 0006 and
+DXVK's 0001 to 0003 rebuild, file for file, the trees the Microsoft Flight Simulator 2024 runs of 2026-10-11 and 12
+were built from (checked on the M4). vkd3d-proton's 0007 came after those runs.
 
 ## vkd3d-proton (v3.0.1)
 
@@ -21,6 +23,10 @@ the trees the Microsoft Flight Simulator 2024 runs of 2026-10-11 and 12 were bui
 - `0005` tessellation on MoltenVK (driver ID check): one Location per varying, no Component decorations, which
   SPIRV-Cross cannot translate in tessellation stages.
 - `0006` SV_ShadingRate dropped on devices without primitive fragment shading rate.
+- `0007` `VKD3D_CONFIG=force_native_fp16` reports native 16-bit shader operations on drivers that report neither
+  float16 denorm preservation nor an independent denorm behaviour (MoltenVK and KosmicKrisp on Apple GPUs). Without
+  it, games that use 16-bit operations without checking the cap lose those pipelines (16 compute pipelines per
+  Microsoft Flight Simulator 2024 run). Float16 denormals may flush with it. Off unless the flag is set.
 
 ## DXVK (master of 2026-10-09, 1cad6cd)
 
