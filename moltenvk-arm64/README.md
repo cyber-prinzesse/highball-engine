@@ -30,6 +30,10 @@ against that tree), and the SPIRV-Cross commits that build carried.
 - `0007` textures shared with another VkDevice are not compressed (allowGPUOptimizedContents NO). The two devices'
   queues are not ordered, and a read racing a write of a compressed texture showed whole tiles of magenta in the
   game's videos. Measured: magenta blocks in 2 of 25 boot screenshots before, 0 of 216 after (one per second).
+- `0008` an image bound to imported MTLTexture memory retains the texture. It used the memory's texture without a
+  reference of its own and released it on destroy, so a texture shared between two VkDevices was freed while the
+  other side still used it (crashes in vkDestroyImage/vkDestroyBuffer and a hung game once videos were shared). Ships
+  with 0006 and patches-arm64/0036.
 
 ## SPIRV-Cross (6c09849, MoltenVK 1.4.2's pin)
 
