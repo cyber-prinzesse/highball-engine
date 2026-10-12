@@ -1,0 +1,31 @@
+From 6a084c73c2db1cb50094f6b365ab38d87b2ea814 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Mon, 12 Oct 2026 14:39:28 +0200
+Subject: [PATCH 6/6] SV_ShadingRate dropped on devices without primitive
+ fragment shading rate
+
+Such a device cannot express a per-primitive shading rate output, and the pipeline failed to compile. The output is
+turned into a no-op, as the IGNORE_PRIMITIVE_SHADING_RATE quirk does.
+---
+ libs/vkd3d/device.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 7290f2c..9c10f41 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -3798,6 +3798,11 @@ static void d3d12_device_init_workarounds(struct d3d12_device *device)
+     /* Have a local copy of this since we may need to apply per-device workarounds in shader compiler. */
+     device->workarounds.quirks = vkd3d_shader_quirk_info_template;
+ 
++    /* Highball: without primitive shading rate (MoltenVK) an SV_ShadingRate output cannot be expressed, nop it out
++     * as with faked VRS tier 1 below. */
++    if (!device->device_info.fragment_shading_rate_features.primitiveFragmentShadingRate)
++        device->workarounds.quirks.global_quirks |= VKD3D_SHADER_QUIRK_IGNORE_PRIMITIVE_SHADING_RATE;
++
+     /* If we're faking VRS tier 1, we need to just nop out everything about primitive shading rate. */
+     if ((vkd3d_application_feature_override & VKD3D_APPLICATION_FEATURE_RDNA1_COMPATIBILITY) &&
+         device->device_info.properties2.properties.vendorID == VKD3D_VENDOR_ID_AMD &&
+-- 
+2.54.0 (Apple Git-157)
+

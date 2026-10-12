@@ -61,5 +61,17 @@
     "runner": "macos-26",
     "hostArch": "arm64",
     "note": "Native arm64 Unix side. The loader in the tarball is Wine's own and is replaced at install by Highball's signed one (the app's Contents/Helpers/WineLoader.app), which carries Apple's cross-architecture entitlement; without that entitlement nothing here starts on macOS 26.5 or later."
+  },
+  "vkd3d-proton": {
+    "name": "vkd3d-proton 3.0.1 (Direct3D 12 on Vulkan), LGPL-2.1",
+    "repo": "https://github.com/HansKristian-Work/vkd3d-proton.git",
+    "commit": "3b10bd7a7ec6a7347e616cf8bea59333afec2255",
+    "note": "Tag v3.0.1, the base of every MSFS 2024 run on the arm64 engine (2026-10-11 and 12). Highball's changes are renderers-arm64/vkd3d-proton, built by build-renderers-arm64.yml."
+  },
+  "dxvk": {
+    "name": "DXVK master of 2026-10-09 (DXGI, Direct3D 11 and 10 on Vulkan), zlib",
+    "repo": "https://github.com/doitsujin/dxvk.git",
+    "commit": "1cad6cd11d8b0edf89113a0d8e4819ade33fbf9c",
+    "note": "\"[dxvk] Rework submission synchronization\": the DXVK master the MSFS 2024 spike built on 2026-10-09 and every arm64 run since used. Highball's changes are renderers-arm64/dxvk."
   }
 }
