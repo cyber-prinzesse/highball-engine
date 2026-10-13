@@ -4,13 +4,13 @@ The Wine engine build for [Highball](https://github.com/gauthierpiarrette/highba
 reproducible recipe: pinned upstream sources, a small patch series, and a CI workflow that turns
 them into an engine tarball the app can install.
 
-## Status
+## What ships
 
-In use. Highball ships this build as its opt-in Wine 11 engine (the `x64-crossover26.3-r*`
-revisions in the app's engine manifests), next to the default Sikarugir Wine 10 engine. The
-launchers that need Wine 11 (the EA app among them) and the games whose fixes only exist here
-(The Last Flame, ContractVille) have their recipes name it, and the app offers it on Play. It
-never replaces an environment's engine without the user asking.
+Two engine lines are built here. The Intel line is Highball's opt-in Wine 11 engine (the
+`x64-crossover26.3-r*` revisions in the app's engine manifests), next to the default Wine 10 engine.
+The launchers and games whose recipes need it name it, and the app never moves an environment to it
+without the user asking. The arm64 line (below) is the native Apple silicon engine for the end of
+Rosetta. It is in development and not offered to players yet.
 
 ## What it builds from
 
@@ -56,6 +56,7 @@ are unwelcome by their own policies.
 - MoltenVK must be present at build time (`brew install molten-vk`): configure defines the Vulkan library name from `-lMoltenVK`, and the tree's win32u uses that name unguarded, so without it the compile fails in `dlls/win32u/vulkan.c`. The engine still ships its own libMoltenVK at runtime.
 - Wine Mono and Gecko are unpacked into `share/wine/mono` and `share/wine/gecko` at the versions the tree names in `dlls/appwiz.cpl/addons.c`. Without them a bottle's first boot stops at Wine's "download Mono?" prompt, which no unattended run can answer.
 - The tree's CrossOver hack that names the Windows user "crossover" is reverted by the first patch in the series, so bottles keep `C:\users\<macOS user>` like on the Sikarugir engines.
+- DXMT's `winemetal.dll` is copied into the engine's built-in directories so a prefix carries its placeholder. Without it Wine refuses to load the overlay's copy for DXMT's dxgi.
 
 ## The arm64 line
 
@@ -67,14 +68,18 @@ from source with the series in [`fex/patches/`](fex/patches/) by default, or Han
 dispatched with `fex_build: hangover`, either with a Darwin build of FEX's Unix helper from
 [`fex/`](fex/)), and the series in [`patches-arm64/`](patches-arm64/). It runs only through Highball's signed Wine loader, the helper
 bundle inside Highball.app that carries Apple's cross-architecture entitlement; the loader in the
-tarball is for development. State on 2026-10-04, measured on an M4 running macOS 27.0: a prefix
-boots in 2.4 s with both halves populated, 32-bit and 64-bit x86 programs run within 20 percent of
-Rosetta on a compute loop, and there is no renderer yet, because DXMT needs the Mac driver's Metal
-glue that only CrossOver's tree has. Since 2026-10-11 the build has Vulkan through MoltenVK and ships
-the host libraries Wine opens by name (MoltenVK, FreeType, GnuTLS, SDL) in `lib/`, so D3D12 and D3D11
-through vkd3d-proton and DXVK work with those placed in a prefix. They are not packaged as an
-overlay yet. Games' videos play through Media Foundation with GStreamer, the official macOS framework
-pruned to 46 MB in `frameworks/` (`gstreamer/`). The decision document and the measurements are in Highball's
+tarball is for development. Measured on an M4 under macOS 27: a prefix boots in 2.4 s with both
+halves populated, and 32-bit and 64-bit x86 programs run within 20 percent of Rosetta on a compute
+loop. The build ships the host libraries Wine opens by name (MoltenVK, FreeType, GnuTLS, SDL) in
+`lib/`, and games' videos play through Media Foundation with GStreamer, the official macOS framework
+pruned to 46 MB in `frameworks/` ([`gstreamer/`](gstreamer/)). Direct3D 12, 11 and 10 go through
+vkd3d-proton and DXVK, built with their patches by
+[`build-renderers-arm64.yml`](.github/workflows/build-renderers-arm64.yml) as the overlays
+Highball's vkd3d and DXVK modes load ([`renderers-arm64/`](renderers-arm64/)), on Vulkan through
+MoltenVK with Highball's patches, built by
+[`build-moltenvk-arm64.yml`](.github/workflows/build-moltenvk-arm64.yml)
+([`moltenvk-arm64/`](moltenvk-arm64/)). DXMT is not on this line: it needs the Mac driver's Metal glue
+that only CrossOver's tree has. The decision document and the measurements are in Highball's
 `private/notes/rosetta-transition-plan.md`. The Intel line stays the default for every macOS up to 27.
 
 What an x86-64 program can observe about the CPU and the Windows exception and memory model is
@@ -85,19 +90,4 @@ comes from one of their checks; the READMEs beside the patches say which, and wh
 
 ## Releases
 
-A dispatch with `publish_release=true` creates a GitHub release tagged after the artifact (`engine-wine-<version>-<date>-<note>`) with the tarball and its `.sha256`. Highball's engine manifest (`spike/engines/<id>.json` in the app repository) names the tarball's URL, size and checksum, and extracts its `engine/` subtree; the app never builds anything itself. Current: `engine-wine-11.0-20260904T153322Z-winemetal`, with Wine Mono and Gecko included, patches 0001 to 0003 applied (real user name, OpenGL-first wined3d, WINEDLLPATH_PREPEND) and winemetal.dll shipped as a built-in so DXMT's overlay loads in a fresh prefix.
-- DXMT's `winemetal.dll` is copied into the engine's built-in directories so a prefix carries its placeholder; without it Wine refuses to load the overlay's copy for DXMT's dxgi (found 2026-09-04).
-
-## Status (2026-09-04)
-
-The build runs Wine 11 programs, and DXVK games launched from Steam render on it. It is not
-bundled in Highball yet because Steam's browser under DXMT asks for a swapchain on a window owned
-by another process, which public DXMT refuses; with the browser kept off the GPU
-(`-cef-disable-gpu`) Steam's window stays black and a game launched through that client never
-starts. The fix is a driver change (a Cocoa overlay window for foreign client surfaces in
-winemac.drv, and DXMT reading the layer through it) or a DXMT change CodeWeavers has not
-published. Highball issue #56 tracks the question of Wine 11 support.
-
-- `0005-ntdll-yield-after-auto-event-set.patch`: after an auto-reset event goes 0→1 (msync) or the server reports a 0→1 set (sync=none), yield once so the woken waiter runs before the setter can signal again. Windows boosts the woken thread; without it a job hand-off that signals twice loses the second wake-up (CS:GO legacy's map-load freeze on macOS 26 under Rosetta, reproduced 2026-09-04).
-- `0006-kernelbase-per-exe-command-line-append.patch`: `HKCU\Software\Wine\AppDefaults\<exe>\CommandLineAppend` (REG_SZ) is appended to that executable's command line at CreateProcess. Data-driven per-app switches for programs that never forward them to their subprocesses (a launcher's CEF browser: --log-severity, --log-file, GPU switches). Proton keeps a hard-coded table for the same purpose.
-- `0007-winemac-cross-process-child-swapchains.patch`: implements Wine bug 60263 — a CEF GPU process (Rockstar/Ubisoft/Steam browser) presenting into a child window whose root belongs to another process gets a CAContext-exported offscreen Metal swapchain, hosted in the owning process via CALayerHost (WM_MACDRV_CREATE_REMOTE_LAYER). Supersedes the old 0004 overlay approach. Fixes the blank CEF sign-in / black Steam client.
+A dispatch with `publish_release=true` creates a GitHub release tagged with the artifact's file name (for the Intel line `engine-wine-<version>-<date>-<note>`), with the tarball and its `.sha256`. The arm64 engine, its renderers and its MoltenVK are released by their own workflows the same way. Highball's engine manifests (`spike/engines/<id>.json` in the app repository) name the tarball's URL, size and checksum, and extract its `engine/` subtree; the app never builds anything itself. Nothing is published by a push or a merge.
