@@ -1,0 +1,59 @@
+From bfa45fb4e384b0abf3d9f402d3e5928383c79870 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Tue, 13 Oct 2026 14:16:52 +0200
+Subject: [PATCH] Keep attachment-less render passes within Apple GPUs' size
+ limit
+
+A render pass without attachments takes its size from the render area and its layer count from the
+rendering info. vkd3d-proton renders D3D12 UAV-only draws in such a pass at the device maximums,
+16384x16384 and 2048 layers, and on Apple GPUs every command buffer holding one ends with "Internal
+Error (0000010d:Internal Error)" (IOGPUCommandQueueErrorDomain 269) without running. In Microsoft
+Flight Simulator 2024 that is about 70 command buffers by the end of the world load, each one taking
+the texture streaming work it carried with it: block noise in the PFD terrain, the MFD map and the
+compass minimap, and garbage ground textures.
+
+A Metal-only test (a pass without attachments, one pipeline without color attachment writing an
+R8Uint 2D array from the fragment shader) fails the same way. On an M1 Pro, 16384x16384 fails from
+256 to 512 layers and 8192x8192 at 2048 layers. On an M4, 16384x16384 fails at 2048 layers. The same
+passes work with one layer, and 4096x4096 works with 2048 layers.
+
+The pass now keeps width x height x layers within 2^34 by lowering the layer count. Layers only
+matter to shaders that write a render target array index, and none of the game's do. With the
+change, a full test flight (world load, two minutes parked, takeoff roll) had no failed command
+buffer, against about 70 by Ready to fly in each run before, and the noise in the cockpit displays
+and the ground textures was gone.
+---
+ MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+index 8c24deb..94212e2 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+@@ -827,6 +827,23 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
+         }
+     }
+ 
++	// A render pass without attachments, sized at the device maximums (vkd3d-proton renders D3D12 UAV-only draws in a
++	// 16384x16384 pass of 2048 layers), fails on Apple GPUs: the command buffer ends with "Internal Error
++	// (0000010d:Internal Error)" without running. A Metal-only test fails from 256-512 layers at 16384x16384 on an
++	// M1 Pro and at 2048 layers on an M4, and works with one layer, so width x height x layers is kept within 2^34 by
++	// lowering the layer count. Only shaders that write a render target array index of that many layers need them.
++	if ( !mtlRPDesc.depthAttachment.texture && !mtlRPDesc.stencilAttachment.texture && mtlRPDesc.renderTargetArrayLength > 1 ) {
++		bool hasColor = false;
++		for (uint32_t caIdx = 0; caIdx < kMVKMaxColorAttachmentCount && !hasColor; caIdx++) {
++			hasColor = mtlRPDesc.colorAttachments[caIdx].texture != nil;
++		}
++		const uint64_t maxPixelLayers = 1ull << 34;
++		uint64_t pixels = (uint64_t)mtlRPDesc.renderTargetWidth * (uint64_t)mtlRPDesc.renderTargetHeight;
++		if ( !hasColor && pixels && pixels * mtlRPDesc.renderTargetArrayLength > maxPixelLayers ) {
++			mtlRPDesc.renderTargetArrayLength = (NSUInteger)std::max<uint64_t>(1, maxPixelLayers / pixels);
++		}
++	}
++
+ 	// If programmable sample positions are supported, set them into the render pass descriptor.
+ 	// If no custom sample positions are established, size will be zero,
+ 	// and Metal will default to using default sample postions.
+-- 
+2.54.0 (Apple Git-157)
+

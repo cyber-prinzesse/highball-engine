@@ -8,7 +8,7 @@ MoltenVK is built separately, for x86-64, by the app repository's `Scripts/build
 Each series is `git format-patch` output against its pinned commit. Applied in order, MoltenVK 0001 to 0004 rebuild,
 file for file, the MoltenVK tree of the gin19g build that the Microsoft Flight Simulator 2024 runs of 2026-10-12 used
 (checked on the M4 against that tree), and the SPIRV-Cross series is the commits that build carried. MoltenVK 0005 to
-0010 came from the runs of 2026-10-12 and 13.
+0011 came from the runs of 2026-10-12 and 13.
 
 ## MoltenVK (v1.4.2, db66022)
 
@@ -46,6 +46,12 @@ file for file, the MoltenVK tree of the gin19g build that the Microsoft Flight S
   offsets. The previous sum of standalone level sizes misplaced every level from 2 on of textures whose size is not
   a power of two (6 of 30 levels and layers right in a 520x520 BC7 array), and the game compresses its terrain and
   imagery tiles on the GPU through such views. Measured: all 371 levels and layers tested at the computed offset.
+- `0011` a render pass without attachments keeps width x height x layers within 2^34 by lowering its layer count.
+  vkd3d-proton renders D3D12 UAV-only draws in such a pass at the device maximums (16384x16384, 2048 layers), and on
+  Apple GPUs every command buffer holding one fails with "Internal Error (0000010d)" without running, taking its
+  texture streaming work along (block noise in the cockpit displays, garbage ground textures, about 70 command
+  buffers by Ready to fly). A Metal-only test fails the same way (an M1 Pro from 256-512 layers at 16384x16384, an M4
+  at 2048) and works with one layer. With the patch a full test flight had no failed command buffer.
 
 ## SPIRV-Cross (6c09849, MoltenVK 1.4.2's pin)
 
