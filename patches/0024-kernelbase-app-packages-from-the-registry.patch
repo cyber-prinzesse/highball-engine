@@ -12,7 +12,6 @@ from Proton (ValveSoftware/wine, Paul Gofman, LGPL), with the WCHAR ** parameter
 entries are Proton's. CrossOver 26.3 had neither GetPackagePath nor PackageFullNameFromId.
 
 diff --git a/dlls/kernel32/kernel32.spec b/dlls/kernel32/kernel32.spec
-diff --git a/dlls/kernel32/kernel32.spec b/dlls/kernel32/kernel32.spec
 index 6a35f53..852ee11 100644
 --- a/dlls/kernel32/kernel32.spec
 +++ b/dlls/kernel32/kernel32.spec
