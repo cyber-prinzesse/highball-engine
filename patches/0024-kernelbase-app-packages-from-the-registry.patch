@@ -12,6 +12,7 @@ from Proton (ValveSoftware/wine, Paul Gofman, LGPL), with the WCHAR ** parameter
 entries are Proton's. CrossOver 26.3 had neither GetPackagePath nor PackageFullNameFromId.
 
 diff --git a/dlls/kernel32/kernel32.spec b/dlls/kernel32/kernel32.spec
+diff --git a/dlls/kernel32/kernel32.spec b/dlls/kernel32/kernel32.spec
 index 6a35f53..852ee11 100644
 --- a/dlls/kernel32/kernel32.spec
 +++ b/dlls/kernel32/kernel32.spec
@@ -54,10 +55,18 @@ index 3c880bf..1610ad5 100644
  @ stdcall PackageIdFromFullName(wstr long ptr ptr)
  # @ stub PackageIdFromProductId
 diff --git a/dlls/kernelbase/version.c b/dlls/kernelbase/version.c
-index 495325b..590c91e 100644
+index 495325b..6d09a97 100644
 --- a/dlls/kernelbase/version.c
 +++ b/dlls/kernelbase/version.c
-@@ -44,6 +44,10 @@
+@@ -32,6 +32,7 @@
+ #define WIN32_NO_STATUS
+ #include "windef.h"
+ #include "winbase.h"
++#include "winreg.h"
+ #include "winver.h"
+ #include "winuser.h"
+ #include "winnls.h"
+@@ -44,6 +45,10 @@
  
  WINE_DEFAULT_DEBUG_CHANNEL(ver);
  
@@ -68,7 +77,7 @@ index 495325b..590c91e 100644
  typedef struct
  {
      WORD offset;
-@@ -1647,17 +1651,111 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetPackageFamilyName( HANDLE process, UINT32
+@@ -1647,17 +1652,111 @@ LONG WINAPI /* DECLSPEC_HOTPATCH */ GetPackageFamilyName( HANDLE process, UINT32
  /***********************************************************************
   *         GetPackagesByPackageFamily   (kernelbase.@)
   */
@@ -187,7 +196,7 @@ index 495325b..590c91e 100644
  }
  
  /***********************************************************************
-@@ -1698,6 +1796,16 @@ static UINT32 processor_arch_from_string(const WCHAR *str, unsigned int len)
+@@ -1698,6 +1797,16 @@ static UINT32 processor_arch_from_string(const WCHAR *str, unsigned int len)
      return ~0u;
  }
  
@@ -204,7 +213,7 @@ index 495325b..590c91e 100644
  /***********************************************************************
   *         PackageIdFromFullName   (kernelbase.@)
   */
-@@ -1786,3 +1894,116 @@ LONG WINAPI PackageIdFromFullName(const WCHAR *full_name, UINT32 flags, UINT32 *
+@@ -1786,3 +1895,116 @@ LONG WINAPI PackageIdFromFullName(const WCHAR *full_name, UINT32 flags, UINT32 *
  
      return ERROR_SUCCESS;
  }
