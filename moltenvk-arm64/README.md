@@ -5,9 +5,10 @@ Language translator) at the revision MoltenVK 1.4.2 pins, with Highball's patche
 them for arm64 and packages `lib/libMoltenVK.dylib`, the library the engine's winevulkan opens. The Intel line's
 MoltenVK is built separately, for x86-64, by the app repository's `Scripts/build-moltenvk.sh`.
 
-Each series is `git format-patch` output against its pinned commit. Applied in order they rebuild, file for file, the
-MoltenVK tree of the gin19g build that the Microsoft Flight Simulator 2024 runs of 2026-10-12 used (checked on the M4
-against that tree), and the SPIRV-Cross commits that build carried.
+Each series is `git format-patch` output against its pinned commit. Applied in order, MoltenVK 0001 to 0004 rebuild,
+file for file, the MoltenVK tree of the gin19g build that the Microsoft Flight Simulator 2024 runs of 2026-10-12 used
+(checked on the M4 against that tree), and the SPIRV-Cross series is the commits that build carried. MoltenVK 0005 to
+0010 came from the runs of 2026-10-12 and 13.
 
 ## MoltenVK (v1.4.2, db66022)
 
@@ -34,6 +35,17 @@ against that tree), and the SPIRV-Cross commits that build carried.
   reference of its own and released it on destroy, so a texture shared between two VkDevices was freed while the
   other side still used it (crashes in vkDestroyImage/vkDestroyBuffer and a hung game once videos were shared). Ships
   with 0006 and patches-arm64/0036.
+- `0009` VK_EXT_image_sliced_view_of_3d for one-level 3D images. D3D12 UAVs can cover a range of a 3D texture's
+  slices, and without the extension vkd3d-proton views the whole volume, so a shader writing "its" slice at z 0 wrote
+  slice 0 (the game builds a 64x64x64 volume one slice per UAV). A sliced view is a 3D texture of the slice count
+  placed in the image's heap at the first slice, which works because an uncompressed one-level 3D texture keeps its
+  slices whole at a fixed stride (measured on Apple GPUs for 1 to 16 byte formats, 4x4 to 256x128). With mip levels
+  Metal interleaves the levels, so those images keep the whole-image view. Such images go in a heap uncompressed.
+- `0010` subresource offsets of compressed 2D and 2D array images on Apple GPUs follow the GPU's miptree layout, as
+  Mesa's AGX driver describes it (src/asahi/layout/layout.c, MIT). Block-texel views alias a level and layer at these
+  offsets. The previous sum of standalone level sizes misplaced every level from 2 on of textures whose size is not
+  a power of two (6 of 30 levels and layers right in a 520x520 BC7 array), and the game compresses its terrain and
+  imagery tiles on the GPU through such views. Measured: all 371 levels and layers tested at the computed offset.
 
 ## SPIRV-Cross (6c09849, MoltenVK 1.4.2's pin)
 
