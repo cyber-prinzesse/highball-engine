@@ -1,0 +1,71 @@
+From 974e92f1b7dfda3e36f21005cfb1a38717c9778e Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Mon, 12 Oct 2026 14:40:04 +0200
+Subject: [PATCH 3/3] dxvk: DXVK_RELAX_FEATURES=1 turns missing required
+ features into warnings, geometry shaders optional
+
+Apple GPUs have no geometry shader stage and lack a few other features DXVK requires, so DXVK rejected the device and
+returned zero adapters. Every missing feature is now logged, and DXVK_RELAX_FEATURES=1 creates the device anyway.
+geometryShader is no longer required. From Michael-Liendo's msfs2024-apple-silicon work (highball-db#6).
+---
+ src/dxvk/dxvk_device_info.cpp | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/src/dxvk/dxvk_device_info.cpp b/src/dxvk/dxvk_device_info.cpp
+index 7e3d16a..a4f43ac 100644
+--- a/src/dxvk/dxvk_device_info.cpp
++++ b/src/dxvk/dxvk_device_info.cpp
+@@ -4,6 +4,8 @@
+ #include <sstream>
+ #include <type_traits>
+ 
++#include "../util/util_env.h"
++
+ #include "dxvk_device_info.h"
+ #include "dxvk_instance.h"
+ #include "dxvk_limits.h"
+@@ -775,6 +777,10 @@ namespace dxvk {
+     if (m_queueMapping.graphics.family == VK_QUEUE_FAMILY_IGNORED)
+       return std::string("Device does not have a graphics queue");
+ 
++    /* Report every missing required feature, not only the first; DXVK_RELAX_FEATURES=1 downgrades
++     * them to warnings so a device can be created on MoltenVK (Michael-Liendo, msfs2024-apple-silicon). */
++    std::string missingFeatures;
++
+     for (const auto& f : getFeatureList()) {
+       if (f.featureRequired && !(*f.featureEnabled)) {
+         std::string message = str::format("Device does not support required feature '", f.readableName, "'");
+@@ -782,10 +788,18 @@ namespace dxvk {
+         if (f.extensionEnabled)
+           message += str::format(" (extension: ", f.extensionEnabled->extensionName, ")");
+ 
+-        return message;
++        Logger::warn(message);
++
++        if (!missingFeatures.empty())
++          missingFeatures += ", ";
++
++        missingFeatures += f.readableName;
+       }
+     }
+ 
++    if (!missingFeatures.empty() && env::getEnvVar("DXVK_RELAX_FEATURES") != "1")
++      return str::format("Device does not support required features: ", missingFeatures);
++
+     if (!m_featuresEnabled.extDescriptorHeap.descriptorHeap && m_properties.core.properties.limits.maxPushConstantsSize < MaxTotalPushDataSize)
+       return str::format("Device does not support ", MaxTotalPushDataSize, " of push data");
+ 
+@@ -853,7 +867,9 @@ namespace dxvk {
+       ENABLE_FEATURE(core.features, fillModeNonSolid, true),
+       ENABLE_FEATURE(core.features, fragmentStoresAndAtomics, true),
+       ENABLE_FEATURE(core.features, fullDrawIndexUint32, true),
+-      ENABLE_FEATURE(core.features, geometryShader, true),
++      /* Apple GPUs have no geometry shader stage, so MoltenVK never reports it; requiring it
++       * made DXVK reject the device and return zero adapters (Michael-Liendo, msfs2024-apple-silicon). */
++      ENABLE_FEATURE(core.features, geometryShader, false),
+       ENABLE_FEATURE(core.features, imageCubeArray, true),
+       ENABLE_FEATURE(core.features, independentBlend, true),
+       ENABLE_FEATURE(core.features, largePoints, false),
+-- 
+2.54.0 (Apple Git-157)
+

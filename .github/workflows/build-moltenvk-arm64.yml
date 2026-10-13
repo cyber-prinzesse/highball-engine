@@ -1,0 +1,101 @@
+name: build-moltenvk-arm64
+
+# MoltenVK for the arm64 engine line: v1.4.2 plus Highball's patches in moltenvk-arm64/moltenvk, with SPIRV-Cross (its
+# SPIR-V to Metal Shading Language translator) at MoltenVK's pinned revision plus moltenvk-arm64/spirv-cross, built for
+# arm64. The engine's winevulkan opens the result as libMoltenVK.dylib. fetchDependencies takes the patched
+# SPIRV-Cross through --spirv-cross-root and fetches and builds the other dependencies at MoltenVK's own pins.
+
+on:
+  push:
+    paths:
+      - "moltenvk-arm64/**"
+      - ".github/workflows/build-moltenvk-arm64.yml"
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "publish a GitHub release with the tarball"
+        type: boolean
+        default: false
+      ref_note:
+        description: "short note for the archive name"
+        default: "manual"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: pinned sources
+        run: |
+          set -euo pipefail
+          j() { python3 -c "import json;print(json.load(open('inputs-arm64.json'))['$1']['$2'])"; }
+          git clone -q --depth 1 --branch "$(j moltenvk tag)" "$(j moltenvk repo)" src/MoltenVK
+          test "$(git -C src/MoltenVK rev-parse HEAD)" = "$(j moltenvk commit)"
+          # The SPIRV-Cross base must be the revision this MoltenVK pins: the patches are made against it.
+          pin=$(tr -d '[:space:]' < src/MoltenVK/ExternalRevisions/SPIRV-Cross_repo_revision)
+          test "$pin" = "$(j spirv-cross commit)"
+          git clone -q "$(j spirv-cross repo)" src/SPIRV-Cross
+          git -C src/SPIRV-Cross checkout -q "$pin"
+          echo "MoltenVK $(git -C src/MoltenVK rev-parse HEAD), SPIRV-Cross $pin"
+      - name: apply patch series
+        run: |
+          set -euo pipefail
+          for p in moltenvk-arm64/moltenvk/*.patch; do echo "applying $p"; git -C src/MoltenVK apply "$PWD/$p"; done
+          for p in moltenvk-arm64/spirv-cross/*.patch; do echo "applying $p"; git -C src/SPIRV-Cross apply "$PWD/$p"; done
+      - name: dependencies
+        run: |
+          set -euo pipefail
+          cd src/MoltenVK
+          ./fetchDependencies --macos --spirv-cross-root "$GITHUB_WORKSPACE/src/SPIRV-Cross"
+      - name: build
+        run: |
+          set -euo pipefail
+          cd src/MoltenVK
+          xcodebuild build -project MoltenVKPackaging.xcodeproj -scheme "MoltenVK Package (macOS only)" \
+            -destination "generic/platform=macOS" -configuration Release ARCHS=arm64 ONLY_ACTIVE_ARCH=NO -quiet
+      - name: package
+        run: |
+          set -euo pipefail
+          stamp=$(date -u +%Y%m%dT%H%M%SZ)
+          name="moltenvk-arm64-1.4.2-${stamp}-${{ github.event.inputs.ref_note || 'manual' }}"
+          # The dynamic dylib, explicitly: the package also carries static and xcframework copies.
+          DYLIB=src/MoltenVK/Package/Release/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib
+          test -f "$DYLIB"
+          lipo -archs "$DYLIB"
+          # 0004's switch must be in the binary. Strings go to a file first: `strings | grep -q` under pipefail
+          # fails when grep stops reading early and strings dies of SIGPIPE.
+          strings -a "$DYLIB" > strings.txt
+          grep -q HB_MVK_TEXTURE_2D_AS_ARRAY strings.txt
+          mkdir -p out/lib out/licenses
+          cp "$DYLIB" out/lib/libMoltenVK.dylib
+          cp src/MoltenVK/LICENSE out/licenses/MoltenVK-LICENSE
+          cp src/SPIRV-Cross/LICENSE out/licenses/SPIRV-Cross-LICENSE
+          {
+            echo "MoltenVK $(git -C src/MoltenVK rev-parse HEAD) plus moltenvk-arm64/moltenvk:"
+            ls moltenvk-arm64/moltenvk
+            echo "SPIRV-Cross $(git -C src/SPIRV-Cross rev-parse HEAD) plus moltenvk-arm64/spirv-cross:"
+            ls moltenvk-arm64/spirv-cross
+            echo "built by highball-engine $(git rev-parse HEAD) with $(xcodebuild -version | tr '\n' ' ')"
+          } > out/BUILD.txt
+          (cd out && shasum -a 256 lib/libMoltenVK.dylib) | tee -a out/BUILD.txt
+          tar -czf "$name.tar.gz" -C out .
+          shasum -a 256 "$name.tar.gz" | tee "$name.tar.gz.sha256"
+          echo "ARCHIVE=$name" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moltenvk-arm64
+          path: |
+            ${{ env.ARCHIVE }}.tar.gz
+            ${{ env.ARCHIVE }}.tar.gz.sha256
+          retention-days: 14
+      - name: release
+        if: ${{ github.event.inputs.publish_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$ARCHIVE" "$ARCHIVE.tar.gz" "$ARCHIVE.tar.gz.sha256" --title "$ARCHIVE" \
+            --notes "MoltenVK 1.4.2 for the arm64 engine line, with Highball's MoltenVK and SPIRV-Cross patches. See BUILD.txt inside."

@@ -1,0 +1,57 @@
+From 53741235af002eac43a214c347864ad83dbceb8d Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Mon, 12 Oct 2026 19:46:35 +0200
+Subject: [PATCH 1/4] Bind a descriptor set again after MoltenVK's own helper
+ commands replaced it
+
+MoltenVK's clears, copies and fills bind their own buffers at Metal buffer indices 0 to 5, where descriptor sets'
+argument buffers live, without marking those sets as unbound. The next draw or dispatch then reads the helper's
+buffer as a descriptor set: GPU hangs and garbage in Microsoft Flight Simulator 2024 through vkd3d-proton
+(2026-10-11). Binding anything at a set's index now clears that set's bound mark, so the set is bound again
+before it is used.
+---
+ MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+index 7d16b94..92aa734 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+@@ -188,6 +188,10 @@ static void setSampler(id<MTLComputeCommandEncoder> encoder, id<MTLSamplerState>
+ static void bindBuffer(Encoder encoder, id<MTLBuffer> buffer, VkDeviceSize offset, NSUInteger index,
+                        MVKStageResourceBits& exists, MVKStageResourceBindings& bindings, const Binder& binder) {
+ 	assert(index < kMVKMaxBufferCount);
++	// A descriptor set's argument buffer is bound at the set's index. Anything else bound there (the buffers of
++	// MoltenVK's own clears, copies and fills) replaces it, so the set must be bound again before the next draw
++	// or dispatch that uses it.
++	if (index < kMVKMaxDescriptorSetCount) { exists.descriptorSetData.clear(index); }
+ 	if (buffer) {
+ 		if (!exists.buffers.get(index) || bindings.buffers[index].buffer != buffer) {
+ 			exists.buffers.set(index);
+@@ -207,6 +211,7 @@ static void bindBuffer(Encoder encoder, id<MTLBuffer> buffer, VkDeviceSize offse
+ static void bindBytes(Encoder encoder, const void* data, size_t size, NSUInteger index,
+                       MVKStageResourceBits& exists, MVKStageResourceBindings& bindings, const Binder& binder) {
+ 	assert(index < kMVKMaxBufferCount);
++	if (index < kMVKMaxDescriptorSetCount) { exists.descriptorSetData.clear(index); }  // See bindBuffer().
+ 	exists.buffers.set(index);
+ 	bindings.buffers[index] = MVKStageResourceBindings::InvalidBuffer();
+ 	binder.setBytes(encoder, data, size, index);
+@@ -640,13 +645,14 @@ static void bindMetalResources(id<MTLCommandEncoder> encoder,
+                                const MVKResourceBinder& RESTRICT binder) {
+ 	// Clear descriptor set resource use bitarray for new sets and bind them
+ 	MVKStaticBitSet<kMVKMaxDescriptorSetCount> setsNeeded = resources.resources.descriptorSetData.clearingAllIn(exists.descriptorSetData);
+-	exists.descriptorSetData |= resources.resources.descriptorSetData;
+ 	for (size_t idx : setsNeeded) {
+ 		MVKDescriptorSet* set = common._descriptorSets[idx];
+ 		const MVKDescriptorSetLayout* layout = common._layout->getDescriptorSetLayout(idx);
+ 		bindings.descriptorSetResourceUse[idx].resizeAndClear(layout->bindings().size());
+ 		bindBuffer(encoder, set->gpuBufferObject, set->gpuBufferOffset, idx, exists, bindings, binder);
+ 	}
++	// After the loop, since bindBuffer() clears the bit of the index it binds.
++	exists.descriptorSetData |= resources.resources.descriptorSetData;
+ 
+ 	executeBindOps(encoder, mvkEncoder, common, implicitBufferData, resources.bindScript.ops.contents(), useResourceStage, exists, bindings, binder);
+ 
+-- 
+2.54.0 (Apple Git-157)
+

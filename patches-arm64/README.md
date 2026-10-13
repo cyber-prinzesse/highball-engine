@@ -150,3 +150,23 @@ with it (MoltenVK and the Vulkan headers from Homebrew).
   finds the same address. On an M4: 2440 ms per thread with 4 to 8 GB filled as MSFS 2024 fills it, 0.535 ms with the
   patch, 0.37 ms in a fresh process either way. MSFS 2024 reached its first boot video 38 s after launch instead of
   13 minutes.
+- `0034-advapi32-credenumerate-empty-keychain-is-not-an-error.patch`: the Intel line's 0019. On macOS
+  CredEnumerateW() also asks the Keychain through mountmgr, which answers STATUS_NOT_FOUND when nothing there
+  matches; the call then failed with ERROR_NOT_FOUND and threw away the registry's matches. Xbox's XAL looks up
+  its device key and tokens that way, so every XAL game (Microsoft Flight Simulator 2024 on this line, Forza
+  Horizon 6 on the Intel line) asked for a sign-in at every launch. An empty answer from the host now counts
+  like an unsupported host.
+- `0035-kernelbase-per-exe-command-line-append.patch`: the Intel line's 0006. A new process gets
+  `HKCU\Software\Wine\AppDefaults\<exe>\CommandLineAppend` appended to its command line. The engine's manifest
+  uses it for Steam's browser, which under FEX cannot start its GPU child inside Chromium's sandbox: Highball
+  writes `--disable-gpu --disable-gpu-compositing --no-sandbox --disable-gpu-sandbox` for steamwebhelper.exe,
+  so the browser gets them however Steam was started.
+- `0036-win32u-vulkan-share-memory-through-metal-objects.patch`: VK_KHR_external_memory_win32 on macOS. win32u only
+  had it on top of fd memory, which MoltenVK lacks, so DXVK could not create shared textures and vkd3d-proton could
+  not open them: no video in D3D12 games that decode it through Media Foundation in D3D11 (Microsoft Flight Simulator
+  2024's boot, loading and start screens). The allocation is exported as a Metal object (MTLTexture, MTLBuffer or
+  MTLHeap), kept in a process-local table under the inode of a pipe that stands for the fd inside the D3DKMT resource,
+  and imported with VkImportMemoryMetalHandleInfoEXT. Same process only. Needs MoltenVK patch 0006.
+- `0037-ffmpeg-arm64ec-yuv2rgb-narrow-blue-sums-first.patch`: Wine's ARM64EC port of swscale's yuv2rgb NEON code wrote
+  some outputs (R2 for bgra) into v10/v11 before reading the blue sums kept there, so video converted to BGRA had
+  vertical stripes and wrong colours. The blue sums are narrowed first. Same code in upstream master.

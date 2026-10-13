@@ -1,0 +1,34 @@
+ffmpeg: in the ARM64EC yuv2rgb NEON code, narrow the blue sums before other outputs overwrite them.
+
+Wine's ARM64EC port of swscale's yuv2rgb_neon.S keeps its sums in v10 to v15 (v16 to v31 are not available to
+ARM64EC code), and several output layouts use v10 and v11 as destinations: bgra writes R2 to v10 before B1 is read
+from it, argb and abgr write G2 to v10, gbrp writes R1 and R2 to v10 and v11. The blue of half of every 16 pixels
+came out wrong, so YUV video converted to BGRA (Media Foundation's video processor, msvproc, for an x86-64 program on
+the arm64 engine) showed vertical stripes every 16 pixels and wrong colours. The two blue sums are now narrowed
+first. rgba and rgb24 were already right and are unchanged in effect.
+
+Checked on an M4: the first frame of a 3840x2160 H.264 video through the source reader with video processing to
+RGB32 matches FFmpeg's C path (av_force_cpu_flags(0)) within 2 on every sampled byte and no pixel differs by more
+than 16, where before the image was striped and tinted. Upstream Wine master (11.19) has the same code.
+
+diff -ruN a/libs/ffmpeg/libswscale/arm64ec/yuv2rgb_neon.S b/libs/ffmpeg/libswscale/arm64ec/yuv2rgb_neon.S
+--- a/libs/ffmpeg/libswscale/arm64ec/yuv2rgb_neon.S	2026-10-12 23:18:44
++++ b/libs/ffmpeg/libswscale/arm64ec/yuv2rgb_neon.S	2026-10-12 23:18:44
+@@ -202,12 +202,15 @@
+         add             v15.8h, v5.8h, v15.8h                           // Y2 + G2
+         add             v10.8h, v4.8h, v10.8h                           // Y1 + B1
+         add             v11.8h, v5.8h, v11.8h                           // Y2 + B2
++        // The blue sums live in v10 and v11, which several output layouts also use as destinations
++        // (bgra writes R2 to v10, argb writes G2 to v10, gbrp writes R1/R2 to v10/v11): narrow them
++        // first, before any other output can overwrite them.
++        sqrshrun        \b1, v10.8h, #1                                 // clip_u8((Y1 + B1) >> 1)
++        sqrshrun        \b2, v11.8h, #1                                 // clip_u8((Y2 + B1) >> 1)
+         sqrshrun        \r1, v12.8h, #1                                 // clip_u8((Y1 + R1) >> 1)
+         sqrshrun        \r2, v13.8h, #1                                 // clip_u8((Y2 + R1) >> 1)
+         sqrshrun        \g1, v14.8h, #1                                 // clip_u8((Y1 + G1) >> 1)
+         sqrshrun        \g2, v15.8h, #1                                 // clip_u8((Y2 + G1) >> 1)
+-        sqrshrun        \b1, v10.8h, #1                                 // clip_u8((Y1 + B1) >> 1)
+-        sqrshrun        \b2, v11.8h, #1                                 // clip_u8((Y2 + B1) >> 1)
+ .endm
+ 
+ .macro declare_func ifmt ofmt

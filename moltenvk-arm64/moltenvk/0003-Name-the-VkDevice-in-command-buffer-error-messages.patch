@@ -1,0 +1,29 @@
+From 65b5e23101a079e3353279b416815940fd759768 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Mon, 12 Oct 2026 19:46:36 +0200
+Subject: [PATCH 3/4] Name the VkDevice in command buffer error messages
+
+Two devices in one process (DXVK's and vkd3d-proton's) both label their command buffers "Queue 0-0", so the
+message did not say which device was lost or resumed.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
+index bf5d6fa..742e08a 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKQueue.mm
+@@ -253,8 +253,8 @@
+ 		getDevice()->markLost(markPhysicalDeviceLoss);
+ 	}
+ 	reportResult(vkErr, (markDeviceLoss ? MVK_CONFIG_LOG_LEVEL_ERROR : MVK_CONFIG_LOG_LEVEL_WARNING),
+-				 "%s VkDevice after MTLCommandBuffer \"%s\" execution failed (code %li): %s",
+-				 (markDeviceLoss ? "Lost" : "Resumed"),
++				 "%s VkDevice %p after MTLCommandBuffer \"%s\" execution failed (code %li): %s",
++				 (markDeviceLoss ? "Lost" : "Resumed"), getDevice()->getVkDevice(),
+ 				 (mtlCmdBuff.label ? mtlCmdBuff.label.UTF8String : ""),
+ 				 mtlCmdBuff.error.code, mtlCmdBuff.error.localizedDescription.UTF8String);
+ 
+-- 
+2.54.0 (Apple Git-157)
+

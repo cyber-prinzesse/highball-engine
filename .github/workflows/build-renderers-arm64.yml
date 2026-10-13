@@ -1,0 +1,146 @@
+name: build-renderers-arm64
+
+# The Direct3D-to-Vulkan renderers for the arm64 engine line: vkd3d-proton (Direct3D 12) and DXVK (DXGI, Direct3D 11
+# and 10) at pinned upstream commits plus Highball's patches in renderers-arm64/, cross-compiled for x86-64 Windows
+# with llvm-mingw 20250910, the toolchain of their tested builds. They run under FEX like the games that load them.
+# Each DLL is marked as a Wine builtin: Wine 11.18 ignores DLLs found in WINEDLLPATH that are not ("found in
+# WINEDLLPATH but not a builtin, ignoring"), and Highball's renderers reach a prefix through WINEDLLPATH_PREPEND.
+# Packaged in the layout Highball's engine manifest extracts: renderers/vkd3d/wine/aarch64-windows (vkd3d-proton with
+# DXVK's DXGI and Direct3D 11 beside it, the app's .vkd3d mode) and renderers/dxvk/wine/aarch64-windows (DXVK alone,
+# the app's .dxvk mode).
+
+on:
+  push:
+    paths:
+      - "renderers-arm64/**"
+      - ".github/workflows/build-renderers-arm64.yml"
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "publish a GitHub release with the tarball"
+        type: boolean
+        default: false
+      ref_note:
+        description: "short note for the archive name"
+        default: "manual"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: pinned sources
+        run: |
+          set -euo pipefail
+          j() { python3 -c "import json;print(json.load(open('inputs-arm64.json'))['$1']['$2'])"; }
+          # The renderers' own toolchain (llvm-mingw-renderers): the one their tested builds used. The engine's newer
+          # clang refuses dxil-spirv's dxbc-spirv sources.
+          curl -sSL --retry 3 -o llvm-mingw.tar.xz "$(j llvm-mingw-renderers url)"
+          echo "$(j llvm-mingw-renderers sha256)  llvm-mingw.tar.xz" | shasum -a 256 -c -
+          mkdir -p toolchains/llvm-mingw src
+          tar -xJf llvm-mingw.tar.xz -C toolchains/llvm-mingw --strip-components 1
+          for name in vkd3d-proton dxvk; do
+            git clone -q "$(j $name repo)" "src/$name"
+            git -C "src/$name" checkout -q "$(j $name commit)"
+            git -C "src/$name" submodule update -q --init --recursive
+            echo "$name at $(git -C "src/$name" rev-parse HEAD)"
+          done
+      - name: apply patch series
+        run: |
+          set -euo pipefail
+          for name in vkd3d-proton dxvk; do
+            for p in renderers-arm64/$name/*.patch; do echo "applying $p"; git -C "src/$name" apply "$PWD/$p"; done
+          done
+      - name: tools
+        run: |
+          set -euo pipefail
+          brew install meson ninja glslang > /dev/null
+          glslangValidator --version | head -1
+          T="$PWD/toolchains/llvm-mingw/bin"
+          cat > cross-x86_64.txt <<EOF
+          [binaries]
+          c = '$T/x86_64-w64-mingw32-clang'
+          cpp = '$T/x86_64-w64-mingw32-clang++'
+          ar = '$T/x86_64-w64-mingw32-ar'
+          strip = '$T/x86_64-w64-mingw32-strip'
+          windres = '$T/x86_64-w64-mingw32-windres'
+          widl = '$T/x86_64-w64-mingw32-widl'
+
+          [properties]
+          needs_exe_wrapper = true
+
+          [host_machine]
+          system = 'windows'
+          cpu_family = 'x86_64'
+          cpu = 'x86_64'
+          endian = 'little'
+          EOF
+          "$T/x86_64-w64-mingw32-clang" --version | head -1
+      - name: build vkd3d-proton
+        run: |
+          set -euo pipefail
+          cd src/vkd3d-proton
+          meson setup build --cross-file ../../cross-x86_64.txt --buildtype release -Denable_extras=false
+          ninja -C build
+      - name: build DXVK
+        run: |
+          set -euo pipefail
+          cd src/dxvk
+          meson setup build --cross-file ../../cross-x86_64.txt --buildtype release -Denable_d3d9=false -Denable_d3d8=false
+          ninja -C build
+      - name: package
+        run: |
+          set -euo pipefail
+          stamp=$(date -u +%Y%m%dT%H%M%SZ)
+          name="renderers-arm64-${stamp}-${{ github.event.inputs.ref_note || 'manual' }}"
+          V=out/renderers/vkd3d/wine/aarch64-windows
+          D=out/renderers/dxvk/wine/aarch64-windows
+          mkdir -p "$V" "$D" out/licenses
+          cp src/vkd3d-proton/build/libs/d3d12/d3d12.dll src/vkd3d-proton/build/libs/d3d12core/d3d12core.dll "$V/"
+          for f in src/dxvk/build/src/dxgi/dxgi.dll src/dxvk/build/src/d3d11/d3d11.dll src/dxvk/build/src/d3d10/d3d10core.dll; do
+            cp "$f" "$V/"; cp "$f" "$D/"
+          done
+          # The signature winebuild --builtin writes: 32 bytes after the DOS header (byte-identical to winebuild's
+          # output, checked on the M4 2026-10-12).
+          python3 - out/renderers/*/wine/aarch64-windows/*.dll <<'EOF'
+          import struct, sys
+          sig = b"Wine builtin DLL".ljust(32, b"\0")
+          for f in sys.argv[1:]:
+              b = bytearray(open(f, "rb").read())
+              assert b[:2] == b"MZ", f
+              assert struct.unpack_from("<I", b, 0x3C)[0] >= 0x40 + len(sig), f
+              b[0x40:0x40 + len(sig)] = sig
+              open(f, "wb").write(b)
+              print("builtin:", f)
+          EOF
+          cp src/vkd3d-proton/COPYING out/licenses/vkd3d-proton-COPYING
+          cp src/dxvk/LICENSE out/licenses/dxvk-LICENSE
+          {
+            echo "vkd3d-proton $(git -C src/vkd3d-proton rev-parse HEAD) plus renderers-arm64/vkd3d-proton:"
+            ls renderers-arm64/vkd3d-proton
+            echo "DXVK $(git -C src/dxvk rev-parse HEAD) plus renderers-arm64/dxvk:"
+            ls renderers-arm64/dxvk
+            echo "built by highball-engine $(git rev-parse HEAD) with $(toolchains/llvm-mingw/bin/x86_64-w64-mingw32-clang --version | head -1)"
+          } > out/BUILD.txt
+          (cd out && shasum -a 256 renderers/*/wine/aarch64-windows/*.dll) | tee -a out/BUILD.txt
+          tar -czf "$name.tar.gz" -C out .
+          shasum -a 256 "$name.tar.gz" | tee "$name.tar.gz.sha256"
+          echo "ARCHIVE=$name" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: renderers-arm64
+          path: |
+            ${{ env.ARCHIVE }}.tar.gz
+            ${{ env.ARCHIVE }}.tar.gz.sha256
+          retention-days: 14
+      - name: release
+        if: ${{ github.event.inputs.publish_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$ARCHIVE" "$ARCHIVE.tar.gz" "$ARCHIVE.tar.gz.sha256" --title "$ARCHIVE" \
+            --notes "vkd3d-proton and DXVK for the arm64 engine line, x86-64 DLLs marked as Wine builtins. See BUILD.txt inside."

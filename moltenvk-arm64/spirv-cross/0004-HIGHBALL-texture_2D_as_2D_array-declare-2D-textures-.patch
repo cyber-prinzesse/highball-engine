@@ -1,0 +1,89 @@
+From 5476224062b9cbfa12e46ef21b0746f752a6605a Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Mon, 12 Oct 2026 11:28:00 +0200
+Subject: [PATCH 4/4] HIGHBALL: texture_2D_as_2D_array, declare 2D textures as
+ 2D arrays and read layer 0
+
+---
+ spirv_msl.cpp | 13 +++++++++++--
+ spirv_msl.hpp |  5 +++++
+ 2 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index a4ba4515..ee2e8247 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -11496,6 +11496,8 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
+ 			}
+ 			else if (ptr_type.storage == StorageClassImage && res_type->image.dim == Dim1D && msl_options.texture_1D_as_2D)
+ 				exp += join("uint2(", coord, ", 0)");
++			else if (ptr_type.storage == StorageClassImage && is_forced_2d_array(res_type->image))
++				exp += join(coord, ", 0u");
+ 			else
+ 				exp += coord;
+ 		}
+@@ -12740,6 +12742,8 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool
+ 			else if (msl_options.arrayed_subpass_input)
+ 				farg_str += ", gl_Layer";
+ 		}
++		else if (is_forced_2d_array(imgtype.image))
++			farg_str += ", 0u";
+ 	}
+ 
+ 	// Depth compare reference value
+@@ -17390,6 +17394,11 @@ std::string CompilerMSL::sampler_type(const SPIRType &type, uint32_t id, bool me
+ }
+ 
+ // Returns an MSL string describing the SPIR-V image type
++bool CompilerMSL::is_forced_2d_array(const SPIRType::ImageType &image) const
++{
++	return msl_options.texture_2D_as_2D_array && image.dim == Dim2D && !image.arrayed && !image.ms;
++}
++
+ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id, bool member)
+ {
+ 	auto *var = maybe_get<SPIRVariable>(id);
+@@ -17471,7 +17480,7 @@ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id, bool memb
+ 			}
+ 			else if (img_type.ms)
+ 				img_type_name += "depth2d_ms";
+-			else if (img_type.arrayed)
++			else if (img_type.arrayed || is_forced_2d_array(img_type))
+ 				img_type_name += "depth2d_array";
+ 			else
+ 				img_type_name += "depth2d";
+@@ -17535,7 +17544,7 @@ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id, bool memb
+ 			}
+ 			else if (img_type.ms)
+ 				img_type_name += "texture2d_ms";
+-			else if (img_type.arrayed || subpass_array)
++			else if (img_type.arrayed || subpass_array || is_forced_2d_array(img_type))
+ 				img_type_name += "texture2d_array";
+ 			else
+ 				img_type_name += "texture2d";
+diff --git a/spirv_msl.hpp b/spirv_msl.hpp
+index de8608f6..2bb70001 100644
+--- a/spirv_msl.hpp
++++ b/spirv_msl.hpp
+@@ -340,6 +340,10 @@ public:
+ 		bool view_index_from_device_index = false;
+ 		bool dispatch_base = false;
+ 		bool texture_1D_as_2D = false;
++
++		// HIGHBALL: declare non-multisampled 2D textures as 2D arrays and read layer 0, so a descriptor can hold
++		// either a 2D or a 2D array texture (D3D12 bindless heaps).
++		bool texture_2D_as_2D_array = false;
+ 		bool emulate_reversed_depth_viewport = false;
+ 
+ 		// Enable use of Metal argument buffers.
+@@ -951,6 +955,7 @@ protected:
+ 	std::string variable_decl(const SPIRType &type, const std::string &name, uint32_t id = 0) override;
+ 
+ 	std::string image_type_glsl(const SPIRType &type, uint32_t id, bool member) override;
++	bool is_forced_2d_array(const SPIRType::ImageType &image) const;
+ 	std::string sampler_type(const SPIRType &type, uint32_t id, bool member);
+ 	std::string builtin_to_glsl(BuiltIn builtin, StorageClass storage) override;
+ 	std::string to_func_call_arg(const SPIRFunction::Parameter &arg, uint32_t id) override;
+-- 
+2.54.0 (Apple Git-157)
+

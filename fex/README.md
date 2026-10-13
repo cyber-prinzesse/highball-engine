@@ -60,5 +60,17 @@ them. That is the default since 2026-10-11. Dispatched with `fex_build: hangover
   64-bit and for a 32-bit program, which differ (drtest), from this thread or from another process
   (drdbg).
 
+- `0018` hardware TSO in every thread on macOS. TSOHandlerConfig turned Apple's TSO mode on once, in
+  ProcessInit, and then told the JIT the hardware orders memory, so the JIT emits no ordering of its own.
+  `thread_set_x86_64_compat` changes only the calling thread on macOS (Linux's prctl carries over to new
+  threads), so every thread but the first ran x86-64 code with Arm's weak ordering, in every program on the
+  arm64 line. ThreadInit (ARM64EC) and BTCpuThreadInit (WoW64) now turn it on for each thread before it runs
+  guest code. Measured on the M4 (2026-10-12) with the message-passing test that became
+  `tests/x64-fidelity/ordertest`, 6 pairs of 20,000,000 rounds: 2,938 to 2,841,851 reorderings per pair
+  before, none after, 27 s instead of 21. `ordertest` at its defaults on the CI engine (M4, 2026-10-12):
+  without 0018 all four pairs fail in 64-bit (356,151 to 1,227,594 reorderings) and in 32-bit through
+  WoW64 (427,248 to 3,036,629); with it all pass in both. Found while Microsoft Flight Simulator 2024
+  crashed in a game thread during loading.
+
 32-bit programs were measured with the engine built by CI (it has the i386 half): x87test32 120/128,
 the same eight x87 gaps as the 64-bit build; the string resume and the code patching probe pass.

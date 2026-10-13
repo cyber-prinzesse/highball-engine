@@ -1,0 +1,34 @@
+From 9b7a88ae99d822df70d43e6ff57e271769ab6632 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Mon, 12 Oct 2026 23:35:18 +0200
+Subject: [PATCH] Do not compress textures shared with another VkDevice
+
+An image created with external memory handle types is used by two VkDevices, and so by two Metal queues that nothing
+orders against each other (a D3D11 device writing a video frame, a D3D12 device reading it, through Wine). With lossless
+compression, a read that raced the other side's write showed whole tiles of garbage: magenta blocks flickering in
+Microsoft Flight Simulator 2024's videos. Such textures now set allowGPUOptimizedContents to NO, like the view-compatible
+images that already did, so a racing read shows old or new pixels instead.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKImage.mm | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+index 2f9e370..87895fd 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+@@ -180,7 +180,11 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+     mtlTexDesc.cpuCacheMode = _image->getMTLCPUCacheMode();
+     // For 2D views of 3D and block texel views, we alias the underlying memory.
+     // Ensure that it remains consistent by disabling GPU layout optimization.
+-    mtlTexDesc.allowGPUOptimizedContents = !_image->_is2DViewOn3DImageCompatible && !_image->_isBlockTexelViewCompatible;
++    // Highball shared-texture: a texture another VkDevice also uses (another Metal queue) is not compressed. The two
++    // sides are not ordered, and a read racing a write of a compressed texture showed whole tiles of garbage (magenta
++    // blocks in Microsoft Flight Simulator 2024's videos, written through D3D11 and read through D3D12).
++    bool isShared = _image->getMemoryBinding(_planeIndex)->_externalMemoryHandleTypes != 0;
++    mtlTexDesc.allowGPUOptimizedContents = !_image->_is2DViewOn3DImageCompatible && !_image->_isBlockTexelViewCompatible && !isShared;
+ 
+     return mtlTexDesc;
+ }
+-- 
+2.54.0 (Apple Git-157)
+

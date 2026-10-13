@@ -1,0 +1,42 @@
+From 74e790dcc1f35a30fd4c083ceabe5188e5a9a823 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 23:47:01 +0200
+Subject: [PATCH 2/4] HIGHBALL: restrict on the element pointer of buffer
+ arrays passed by reference
+
+---
+ spirv_msl.cpp | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 93d24e08..1b97e5c0 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -16426,12 +16426,23 @@ string CompilerMSL::argument_decl(const SPIRFunction::Parameter &arg)
+ 		else
+ 		{
+ 			auto array_size_decl = type_to_array_glsl(type, name_id);
++			const char *restrict_kw = to_restrict(name_id, true);
++
++			// HIGHBALL: an argument buffer declares a restrict buffer array as "device T* __restrict m[N]", so a
++			// function taking it by reference needs __restrict on the element pointer, not on the reference, or the
++			// call has no matching function (tessellation patch_main taking vkd3d-proton's bindless buffers).
++			auto star = decl.rfind('*');
++			if (*restrict_kw && !array_size_decl.empty() && star != string::npos)
++			{
++				decl.insert(star + 1, " __restrict");
++				restrict_kw = "";
++			}
++
+ 			if (array_size_decl.empty())
+ 				decl += "& ";
+ 			else
+ 				decl += " (&";
+ 
+-			const char *restrict_kw = to_restrict(name_id, true);
+ 			if (*restrict_kw)
+ 			{
+ 				decl += " ";
+-- 
+2.54.0 (Apple Git-157)
+

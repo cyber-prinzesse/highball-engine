@@ -1,0 +1,144 @@
+From 70ac4f0da2ecd50b98213d6290d60c19cf6aabe8 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Tue, 13 Oct 2026 04:03:54 +0200
+Subject: [PATCH] Place mip levels of compressed images where Apple GPUs put
+ them
+
+MVKImagePlane::initSubresources() computes where each level and layer of an optimally tiled image sits in its heap
+memory, which a block-texel view uses to alias one level and layer as an uncompressed texture. It added up the sizes
+Metal reports for each level as a standalone texture, plus a corner-tile guess. Inside a miptree the levels are
+laid out differently, so for images whose size is not a power of two every level from 2 on was misplaced: in a
+520x520 BC7 array of 3 layers, 6 of 30 levels and layers were where MoltenVK expected them. Microsoft Flight
+Simulator 2024 compresses its terrain and imagery tiles on the GPU through such views, so their smaller levels went
+to the wrong memory and the right ones stayed stale.
+
+For compressed 2D and 2D array images on Apple GPUs, the level offsets now follow the GPU's layout as Mesa's AGX
+driver describes it (src/asahi/layout/layout.c, ail_initialize_gpu_tiled, MIT, Copyright 2022 Alyssa Rosenzweig):
+the levels that still cover a 16 KB tile in both directions are whole tiles with left, bottom and corner padding,
+the rest is a power-of-two tail, and offsets are 128-byte aligned. The layer stride is what Metal reports for one
+more layer. Measured on an M4 by aliasing a buffer over the texture's memory: all 371 levels and layers of BC1, BC7,
+RGBA8, RGBA16F and R32 textures from 64x64 to 4096x4096, power-of-two or not, 1 to 6 layers, sit at the computed
+offset. Other images keep the previous computation.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKImage.mm | 98 +++++++++++++++++++++++-
+ 1 file changed, 97 insertions(+), 1 deletion(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+index 95fd94b..ad07eb2 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+@@ -201,6 +201,66 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+     return mtlTexDesc;
+ }
+ 
++// Highball apple-miptree: level offsets within one layer of a GPU-tiled texture on Apple GPUs. A port of Mesa's
++// ail_initialize_gpu_tiled (src/asahi/layout/layout.c, MIT, Copyright 2022 Alyssa Rosenzweig): levels that still
++// span a full 16 KB tile in both directions form the large miptree, in whole tiles with left, bottom and corner
++// padding; the rest is a power-of-two tail. Offsets are aligned to 128 bytes. Measured against Metal on an M4 for
++// BC1, BC7, RGBA8, RGBA16F and R32 textures of power-of-two and other sizes, 1 to 6 layers: every level and layer
++// at the predicted offset. levelOffsets gets levels + 1 entries, the last one being the end of the layer.
++static void mvkAppleGPULevelOffsets(uint32_t widthPx, uint32_t heightPx, uint32_t blockWidthPx, uint32_t blockHeightPx,
++									uint32_t blockBytes, bool isCompressed, uint32_t levels, VkDeviceSize* levelOffsets) {
++	uint32_t tileWidthEl, tileHeightEl;
++	switch (blockBytes) {
++		case 1:  tileWidthEl = 128; tileHeightEl = 128; break;
++		case 2:  tileWidthEl = 128; tileHeightEl = 64;  break;
++		case 4:  tileWidthEl = 64;  tileHeightEl = 64;  break;
++		case 8:  tileWidthEl = 64;  tileHeightEl = 32;  break;
++		case 16: tileWidthEl = 32;  tileHeightEl = 32;  break;
++		case 32: tileWidthEl = 32;  tileHeightEl = 16;  break;
++		default: tileWidthEl = 16;  tileHeightEl = 16;  break;
++	}
++	auto minify = [](uint32_t x, uint32_t l) { uint32_t r = x >> l; return r ? r : 1u; };
++	auto nextPOT = [](uint32_t x) { uint32_t p = 1; while (p < x) { p <<= 1; } return p; };
++	uint32_t widthEl = mvkCeilingDivide(widthPx, blockWidthPx);
++	uint32_t heightEl = mvkCeilingDivide(heightPx, blockHeightPx);
++	uint32_t tilesX = mvkCeilingDivide(widthEl, tileWidthEl);
++	uint32_t tilesY = mvkCeilingDivide(heightEl, tileHeightEl);
++	uint32_t tilesArea = tilesX * tilesY;
++
++	// The power-of-two tail starts at the first level narrower or shorter than one tile.
++	uint32_t potLevel = 0;
++	uint32_t potWidthPx = blockWidthPx * widthEl, potHeightPx = blockHeightPx * heightEl;
++	while (mvkCeilingDivide(potWidthPx, blockWidthPx) >= tileWidthEl && mvkCeilingDivide(potHeightPx, blockHeightPx) >= tileHeightEl) {
++		potWidthPx = minify(potWidthPx, 1);
++		potHeightPx = minify(potHeightPx, 1);
++		potLevel++;
++	}
++
++	VkDeviceSize offset = 0;
++	for (uint32_t l = 0; l < std::min(potLevel, levels); l++) {
++		uint32_t tiles = tilesArea >> (2 * l);
++		uint32_t mask = (1u << l) - 1;
++		bool padLeft = (tilesX & mask) != 0;
++		bool padBottom = (tilesY & mask) != 0;
++		if (padLeft) { tiles += tilesY >> l; }
++		if (padBottom) { tiles += tilesX >> l; }
++		if (padLeft && padBottom) { tiles += 1; }
++		levelOffsets[l] = offset;
++		offset = mvkAlignByteRef(offset + (VkDeviceSize)blockBytes * tiles * tileWidthEl * tileHeightEl, 128);
++	}
++
++	// Compressed formats round to a power of two, then minify; others minify, then round.
++	uint32_t potWidthEl = isCompressed ? minify(nextPOT(widthEl), potLevel) : nextPOT(minify(widthEl, potLevel));
++	uint32_t potHeightEl = isCompressed ? minify(nextPOT(heightEl), potLevel) : nextPOT(minify(heightEl, potLevel));
++	for (uint32_t l = potLevel; l < levels; l++) {
++		levelOffsets[l] = offset;
++		offset = mvkAlignByteRef(offset + (VkDeviceSize)blockBytes * potWidthEl * potHeightEl, 128);
++		potWidthEl = minify(potWidthEl, 1);
++		potHeightEl = minify(potHeightEl, 1);
++	}
++	levelOffsets[levels] = offset;
++}
++
+ // Initializes the subresource definitions.
+ void MVKImagePlane::initSubresources(const VkImageCreateInfo* pCreateInfo) {
+     _subresources.reserve(_image->_mipLevels * _image->_arrayLayers);
+@@ -214,7 +274,43 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+     // Calculation method depends on whether the resource is optimally tiled in a heap or not.
+     // Note: vkGetImageSubresourceLayout is not allowed for optimal tiling, and vkGetImageSubresourceLayout2 is undefined.
+     // However, this information is still needed for other uses within MoltenVK, such as texture memory aliasing.
+-    if (!_image->_isLinear && !_image->_isLinearForAtomics && _image->getMetalFeatures().placementHeaps) {
++    MVKPixelFormats* hbPixFmts = _image->getPixelFormats();
++    if (_image->isAppleGPU() && _planeIndex == 0 && _image->getMemoryBindingCount() == 1 &&
++        !_image->_isLinear && !_image->_isLinearForAtomics && _image->getMetalFeatures().placementHeaps &&
++        _image->getImageType() == VK_IMAGE_TYPE_2D && _image->_samples == VK_SAMPLE_COUNT_1_BIT &&
++        _image->_mtlTextureType != MTLTextureTypeCube && _image->_mtlTextureType != MTLTextureTypeCubeArray &&
++        hbPixFmts->getFormatType(_image->getVkFormat()) == kMVKFormatCompressed) {
++        // Highball apple-miptree: a compressed 2D (array) image, the one kind MoltenVK aliases at a level and layer
++        // (block-texel views). Levels sit where the GPU puts them; the layer stride is what Metal adds for one more
++        // layer. The single-level sizes this used to add up are not the sizes of levels inside a miptree, which
++        // misplaced every level from 2 on of textures whose size is not a power of two.
++        MTLTextureDescriptor* mtlTexDesc = newMTLTextureDescriptor(); // temp retain
++        if (mtlTexDesc.textureType == MTLTextureType2D) { mtlTexDesc.textureType = MTLTextureType2DArray; }
++        mtlTexDesc.arrayLength = 1;
++        NSUInteger oneLayer = [_image->getMTLDevice() heapTextureSizeAndAlignWithDescriptor: mtlTexDesc].size;
++        mtlTexDesc.arrayLength = 2;
++        NSUInteger layerStride = [_image->getMTLDevice() heapTextureSizeAndAlignWithDescriptor: mtlTexDesc].size - oneLayer;
++        [mtlTexDesc release]; // temp release
++
++        const VkExtent2D blockSize = hbPixFmts->getBlockTexelSize(_image->getVkFormat());
++        std::vector<VkDeviceSize> levelOffsets(_image->_mipLevels + 1);
++        mvkAppleGPULevelOffsets(_image->_extent.width, _image->_extent.height, blockSize.width, blockSize.height,
++                                hbPixFmts->getBytesPerBlock(_image->getVkFormat()), true, _image->_mipLevels, levelOffsets.data());
++
++        for (uint32_t mipLvl = 0; mipLvl < _image->_mipLevels; mipLvl++) {
++            subRez.subresource.mipLevel = mipLvl;
++            const VkExtent3D mipExtent = _image->getExtent3D(_planeIndex, mipLvl);
++            for (uint32_t layer = 0; layer < _image->_arrayLayers; layer++) {
++                subRez.subresource.arrayLayer = layer;
++                VkSubresourceLayout& layout = subRez.layout;
++                layout.offset = layer * layerStride + levelOffsets[mipLvl];
++                layout.size = levelOffsets[mipLvl + 1] - levelOffsets[mipLvl];
++                layout.rowPitch = layout.size / mipExtent.height / mipExtent.depth;
++                layout.depthPitch = layout.size / mipExtent.depth;
++                _subresources.push_back(subRez);
++            }
++        }
++    } else if (!_image->_isLinear && !_image->_isLinearForAtomics && _image->getMetalFeatures().placementHeaps) {
+         MTLTextureDescriptor* mtlTexDesc = newMTLTextureDescriptor(); // temp retain
+ 
+         if (_planeIndex > 0 && _image->getMemoryBindingCount() == 1) {
+-- 
+2.54.0 (Apple Git-157)
+

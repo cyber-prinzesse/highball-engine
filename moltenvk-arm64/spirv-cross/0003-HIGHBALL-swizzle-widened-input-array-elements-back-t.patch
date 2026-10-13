@@ -1,0 +1,43 @@
+From 86882aefd7d01ea9b38d9e626d0aa76e0d752344 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 23:58:03 +0200
+Subject: [PATCH 3/4] HIGHBALL: swizzle widened input array elements back to
+ their size
+
+---
+ spirv_msl.cpp | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 1b97e5c0..a4ba4515 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -3169,6 +3169,16 @@ void CompilerMSL::add_composite_variable_to_interface_block(StorageClass storage
+ 
+ 		set_extended_member_decoration(ib_type.self, ib_mbr_idx, SPIRVCrossDecorationInterfaceOrigID, var.self);
+ 
++		// HIGHBALL: ensure_correct_input_type() can widen the member to the previous stage's vector size (a float3
++		// element read as float4), so the copy back into the array element needs a swizzle down to its size.
++		string mbr_swizzle;
++		if (storage == StorageClassInput && !pull_model_inputs.count(var.self))
++		{
++			auto &widened = get<SPIRType>(ib_type.member_types[ib_mbr_idx]);
++			if (usable_type->columns == 1 && widened.columns == 1 && widened.vecsize > usable_type->vecsize)
++				mbr_swizzle = vector_swizzle(usable_type->vecsize, 0);
++		}
++
+ 		// Only flatten/unflatten IO composites for non-tessellation cases where arrays are not stripped.
+ 		if (!meta.strip_array)
+ 		{
+@@ -3189,7 +3199,7 @@ void CompilerMSL::add_composite_variable_to_interface_block(StorageClass storage
+ 					}
+ 					else
+ 					{
+-						statement(to_name(var.self), "[", i, "] = ", ib_var_ref, ".", mbr_name, ";");
++						statement(to_name(var.self), "[", i, "] = ", ib_var_ref, ".", mbr_name, mbr_swizzle, ";");
+ 					}
+ 				});
+ 				break;
+-- 
+2.54.0 (Apple Git-157)
+

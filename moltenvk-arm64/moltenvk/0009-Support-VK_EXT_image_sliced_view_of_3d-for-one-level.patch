@@ -1,0 +1,272 @@
+From 341d513a8e49dc68f8b895d3d03dae4f2cdcf579 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Tue, 13 Oct 2026 03:47:55 +0200
+Subject: [PATCH] Support VK_EXT_image_sliced_view_of_3d for one-level 3D
+ images
+
+D3D12 lets a UAV cover a range of a 3D texture's depth slices (FirstWSlice, WSize). vkd3d-proton maps that to
+VK_EXT_image_sliced_view_of_3d and, without it, views the whole volume, so a shader that writes "its" slice at z 0
+writes slice 0. Microsoft Flight Simulator 2024 builds 32-slice volumes one slice per UAV: slice 0 ended up with the
+last slice's data and the others were never written, which drew hard-edged slabs of light and haze over the scene
+(blue ones on taxiways at night, a pale block over the cockpit at dusk).
+
+Metal has no sliced views of 3D textures, but an uncompressed one-level 3D texture keeps each slice whole at a fixed
+stride, the size of two slices less one. Measured on Apple GPUs for R8, RGBA16, R32, RG32 and RGBA32 from 4x4x8 to
+256x128x32 and 160x90x64: a 3D texture placed in the same heap at slice k reads and writes exactly slices k and up,
+and every such offset meets the placement alignment. With mip levels Metal interleaves the levels, so this only
+covers one-level images.
+
+So a one-level 3D image with storage usage now goes in a placement heap, uncompressed, like a 2D-view-compatible
+one, and a sliced view of it is a 3D texture of sliceCount slices placed at sliceOffset. The view keeps that texture
+while the image's texture is unchanged: remaking it on each request would leave descriptors that hold the old one
+pointing at a released texture. Other images keep the whole-image view. Each image shape that gets sliced views
+is logged once.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm     |  6 ++
+ .../GPUObjects/MVKDeviceFeatureStructs.def    |  1 +
+ MoltenVK/MoltenVK/GPUObjects/MVKImage.h       |  5 ++
+ MoltenVK/MoltenVK/GPUObjects/MVKImage.mm      | 84 ++++++++++++++++++-
+ MoltenVK/MoltenVK/Layers/MVKExtensions.def    |  1 +
+ 5 files changed, 95 insertions(+), 2 deletions(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index b342e01..3099676 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -742,6 +742,11 @@
+ 				extFeatures->sampler2DViewOf3D = _metalFeatures.placementHeaps;
+ 				break;
+ 			}
++			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_SLICED_VIEW_OF_3D_FEATURES_EXT: {
++				auto* extFeatures = (VkPhysicalDeviceImageSlicedViewOf3DFeaturesEXT*)next;
++				extFeatures->imageSlicedViewOf3D = _metalFeatures.placementHeaps;
++				break;
++			}
+ 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LEGACY_DITHERING_FEATURES_EXT: {
+ 				auto* legacyDitheringFeatures = (VkPhysicalDeviceLegacyDitheringFeaturesEXT*)next;
+ 				legacyDitheringFeatures->legacyDithering = getMVKConfig().useMetalPrivateAPI;
+@@ -3554,6 +3559,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 	}
+ 	if (!_metalFeatures.placementHeaps) {
+ 		pWritableExtns->vk_EXT_image_2d_view_of_3d.enabled = false;
++		pWritableExtns->vk_EXT_image_sliced_view_of_3d.enabled = false;
+ 	}
+ 	if (!_gpuCapabilities.supportsSamplerReduction) {
+ 		pWritableExtns->vk_EXT_sampler_filter_minmax.enabled = false;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
+index e82eabf..82f6115 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceFeatureStructs.def
+@@ -103,6 +103,7 @@ MVK_DEVICE_FEATURE_EXTN(ExtendedDynamicState2,            EXTENDED_DYNAMIC_STATE
+ MVK_DEVICE_FEATURE_EXTN(ExtendedDynamicState3,            EXTENDED_DYNAMIC_STATE_3,             EXT,  31)
+ MVK_DEVICE_FEATURE_EXTN(FragmentShaderInterlock,          FRAGMENT_SHADER_INTERLOCK,            EXT,   3)
+ MVK_DEVICE_FEATURE_EXTN(Image2DViewOf3D,                  IMAGE_2D_VIEW_OF_3D,                  EXT,   2)
++MVK_DEVICE_FEATURE_EXTN(ImageSlicedViewOf3D,              IMAGE_SLICED_VIEW_OF_3D,              EXT,   1)
+ MVK_DEVICE_FEATURE_EXTN(LegacyDithering,                  LEGACY_DITHERING,                     EXT,   1)
+ MVK_DEVICE_FEATURE_EXTN(NonSeamlessCubeMap,               NON_SEAMLESS_CUBE_MAP,                EXT,   1)
+ MVK_DEVICE_FEATURE_EXTN(PrimitiveTopologyListRestart,     PRIMITIVE_TOPOLOGY_LIST_RESTART,      EXT,   2)
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.h b/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
+index 45ddd3a..7ba0c1d 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.h
+@@ -402,6 +402,7 @@ protected:
+ 	bool _isLinearForAtomics;
+ 	bool _is2DViewOn3DImageCompatible = false;
+ 	bool _isBlockTexelViewCompatible = false;
++	bool _isSlicedViewOf3DCompatible = false;
+ };
+ 
+ 
+@@ -576,6 +577,7 @@ protected:
+     bool _useMTLTextureView;
+ 	bool _useNativeSwizzle;
+ 	bool _useShaderSwizzle;
++	id<MTLTexture> _aliasedBaseMTLTexture = nil;	// Highball sliced-view-of-3d: compared, not retained.
+ };
+ 
+ 
+@@ -661,6 +663,9 @@ protected:
+     VkImageUsageFlags _usage;
+ 	std::mutex _lock;
+ 	MTLTextureType _mtlTextureType;
++	uint32_t _sliceOffset = 0;
++	uint32_t _sliceCount = 0;
++	bool _isSlicedViewOf3D = false;
+ };
+ 
+ 
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+index 62dc89c..95fd94b 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+@@ -25,6 +25,10 @@
+ #include "MVKFoundation.h"
+ #include "MVKOSExtensions.h"
+ #include "MVKCodec.h"
++#include <atomic>
++#include <mutex>
++#include <string>
++#include <unordered_set>
+ 
+ #import "MTLSamplerDescriptor+MoltenVK.h"
+ #import "CAMetalLayer+MoltenVK.h"
+@@ -70,6 +74,11 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+         if (_image->_is2DViewOn3DImageCompatible || _image->_isBlockTexelViewCompatible) {
+             dvcMem->ensureMTLHeap();
+         }
++        // Highball sliced-view-of-3d: sliced views are textures placed in the image's heap too. Without a heap they
++        // fall back to a view of every slice.
++        if (_image->_isSlicedViewOf3DCompatible && dvcMem) {
++            dvcMem->ensureMTLHeap();
++        }
+         if (_image->_is2DViewOn3DImageCompatible && !dvcMem->getMTLHeap()) {
+             MVKAssert(0, "Creating a 2D view of a 3D texture currently requires a placement heap, which is not available.");
+         }
+@@ -186,7 +195,8 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+     // sides are not ordered, and a read racing a write of a compressed texture showed whole tiles of garbage (magenta
+     // blocks in Microsoft Flight Simulator 2024's videos, written through D3D11 and read through D3D12).
+     bool isShared = _image->getMemoryBinding(_planeIndex)->_externalMemoryHandleTypes != 0;
+-    mtlTexDesc.allowGPUOptimizedContents = !_image->_is2DViewOn3DImageCompatible && !_image->_isBlockTexelViewCompatible && !isShared;
++    mtlTexDesc.allowGPUOptimizedContents = !_image->_is2DViewOn3DImageCompatible && !_image->_isBlockTexelViewCompatible &&
++                                           !_image->_isSlicedViewOf3DCompatible && !isShared;
+ 
+     return mtlTexDesc;
+ }
+@@ -1247,6 +1257,13 @@ static MTLRegion getMTLRegion(const ImgRgn& imgRgn) {
+ 	_hasMutableFormat = mvkIsAnyFlagEnabled(pCreateInfo->flags, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT);
+ 	_hasExtendedUsage = mvkIsAnyFlagEnabled(pCreateInfo->flags, VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
+ 
++	// Highball sliced-view-of-3d: VK_EXT_image_sliced_view_of_3d has no creation flag, so every one-level 3D image that
++	// shaders can write may get sliced views. Its texture goes in a heap, uncompressed, like a 2D-view-compatible one.
++	// Set before the planes size their memory with the texture descriptor.
++	_isSlicedViewOf3DCompatible = (pCreateInfo->imageType == VK_IMAGE_TYPE_3D && _mipLevels == 1 &&
++								   mvkIsAnyFlagEnabled(pCreateInfo->usage, VK_IMAGE_USAGE_STORAGE_BIT) &&
++								   getEnabledImageSlicedViewOf3DFeatures().imageSlicedViewOf3D);
++
+     // If this is a storage image of format R32_UINT or R32_SINT, or MUTABLE_FORMAT is set
+     // and R32_UINT is in the set of possible view formats, then we must use a texel buffer,
+     // or image atomics won't work.
+@@ -1909,6 +1926,10 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ }
+ 
+ bool MVKImageViewPlane::matchesMTLTextureViewBase(id<MTLTexture> mtlTexture) {
++    // Highball sliced-view-of-3d: a sliced view's root is its alias, made for this base texture. Remaking it on every
++    // call would leave descriptors that hold the old one pointing at a released texture.
++    if (_aliasedBaseMTLTexture) { return _aliasedBaseMTLTexture == mtlTexture; }
++
+     id<MTLTexture> cachedBaseMTLTexture = mvkGetBaseMTLTexture(_mtlTexture);
+     if (cachedBaseMTLTexture == mtlTexture) { return true; }
+ 
+@@ -1947,6 +1968,20 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+     return newMTLTextureFromBaseMTLTexture(_imageView->_image->getMTLTexture(_planeIndex));
+ }
+ 
++// Highball sliced-view-of-3d: each image shape with sliced views goes to the log once, with whether its views got their
++// own texture.
++static void mvkHighballLogSlicedView(MVKImage* image, uint32_t sliceOffset, uint32_t sliceCount, bool served) {
++    static std::mutex lock;
++    static std::unordered_set<std::string> seen;
++    VkExtent3D extent = image->getExtent3D(0, 0);
++    char key[160];
++    snprintf(key, sizeof(key), "%s: %ux%ux%u, %u levels, format %d", served ? "served" : "whole image",
++             extent.width, extent.height, extent.depth, image->getMipLevelCount(), image->getVkFormat());
++    std::lock_guard<std::mutex> guard(lock);
++    if ( !seen.insert(key).second ) { return; }
++    fprintf(stderr, "[hb-sliced3d] %s (first view: slices %u to %u)\n", key, sliceOffset, sliceOffset + sliceCount - 1);
++}
++
+ id<MTLTexture> MVKImageViewPlane::newMTLTextureFromBaseMTLTexture(id<MTLTexture> baseMTLTexture) {
+     MVKAssert(baseMTLTexture, "Attempting to create an MTLTexture view from a nil base texture.");
+     if ( !baseMTLTexture ) { return nil; }
+@@ -1964,6 +1999,35 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+     const bool viewCompressed = getPixelFormats()->getFormatType(_mtlPixFmt) == kMVKFormatCompressed;
+     const bool isBlockTexelView = image->_isBlockTexelViewCompatible && imageCompressed && !viewCompressed;
+ 
++    // Highball sliced-view-of-3d: the view of slices [offset, offset + count) of a one-level 3D image is a 3D texture of
++    // count slices placed in the image's heap at the first one. Uncompressed one-level 3D textures keep each slice
++    // whole at a fixed stride, the size of two slices less one (measured on Apple GPUs, 1 to 16 byte formats, 4x4 to
++    // 256x128, every slice offset aligned). With mip levels Metal interleaves the levels, so those keep every slice.
++    if (_imageView->_isSlicedViewOf3D) {
++        _aliasedBaseMTLTexture = nil;
++        const auto heapAllocation = image->getHeapAllocation(_planeIndex);
++        if (image->_isSlicedViewOf3DCompatible && heapAllocation) {
++            MTLTextureDescriptor* mtlTexDesc = image->newMTLTextureDescriptor(_planeIndex); // temp retain
++            id<MTLDevice> mtlDev = image->getMTLDevice();
++            mtlTexDesc.depth = 1;
++            NSUInteger oneSlice = [mtlDev heapTextureSizeAndAlignWithDescriptor: mtlTexDesc].size;
++            mtlTexDesc.depth = 2;
++            NSUInteger sliceStride = [mtlDev heapTextureSizeAndAlignWithDescriptor: mtlTexDesc].size - oneSlice;
++            mtlTexDesc.depth = _imageView->_sliceCount;
++            NSUInteger align = [mtlDev heapTextureSizeAndAlignWithDescriptor: mtlTexDesc].align;
++            NSUInteger offset = heapAllocation->offset + _imageView->_sliceOffset * sliceStride;
++            if (align && (offset % align) == 0) {
++                aliasTex = [heapAllocation->heap newTextureWithDescriptor: mtlTexDesc offset: offset];
++            }
++            [mtlTexDesc release]; // temp release
++        }
++        if (aliasTex) {
++            mtlTex = aliasTex;
++            _aliasedBaseMTLTexture = baseMTLTexture;
++        }
++        mvkHighballLogSlicedView(image, _imageView->_sliceOffset, _imageView->_sliceCount, aliasTex != nil);
++    }
++
+     if (is2dViewOf3d || isBlockTexelView) {
+         const auto heapAllocation = image->getHeapAllocation(_planeIndex);
+         MVKAssert(heapAllocation, "Attempting to create a memory-aliased texture without a placement heap");
+@@ -2049,7 +2113,7 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+             _imageView->_subresourceRange.levelCount == _imageView->_image->_mipLevels &&
+             (_imageView->_mtlTextureType == MTLTextureType3D ||
+              _imageView->_subresourceRange.layerCount == _imageView->_image->_arrayLayers) &&
+-            !_useNativeSwizzle) {
++            !_useNativeSwizzle && !_imageView->_isSlicedViewOf3D) {
+             _useMTLTextureView = false;
+         }
+     } else {
+@@ -2282,8 +2346,12 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 	// Image views can't be used in transfer commands.
+ 	mvkDisableFlags(_usage, (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT));
+ 
++	const VkImageViewSlicedCreateInfoEXT* pSlicedInfo = nullptr;
+ 	for (const auto* next = (VkBaseInStructure*)pCreateInfo->pNext; next; next = next->pNext) {
+ 		switch (next->sType) {
++			case VK_STRUCTURE_TYPE_IMAGE_VIEW_SLICED_CREATE_INFO_EXT:
++				pSlicedInfo = (const VkImageViewSlicedCreateInfoEXT*)next;
++				break;
+ 			case VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO: {
+ 				auto* pViewUsageInfo = (VkImageViewUsageCreateInfo*)next;
+ 				VkImageUsageFlags newUsage = pViewUsageInfo->usage;
+@@ -2334,6 +2402,18 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 		_subresourceRange.layerCount = imgLayerCnt - _subresourceRange.baseArrayLayer;
+ 	}
+ 
++	// Highball sliced-view-of-3d: remember a slice range that is not the whole 3D image.
++	if (pSlicedInfo && pCreateInfo->viewType == VK_IMAGE_VIEW_TYPE_3D && _image->getImageType() == VK_IMAGE_TYPE_3D) {
++		uint32_t depth = _image->getExtent3D(0, _subresourceRange.baseMipLevel).depth;
++		uint32_t sliceCount = (pSlicedInfo->sliceCount == VK_REMAINING_3D_SLICES_EXT
++							   ? depth - pSlicedInfo->sliceOffset : pSlicedInfo->sliceCount);
++		if (pSlicedInfo->sliceOffset != 0 || sliceCount != depth) {
++			_isSlicedViewOf3D = true;
++			_sliceOffset = pSlicedInfo->sliceOffset;
++			_sliceCount = sliceCount;
++		}
++	}
++
+ 	auto& mtlFeats = getMetalFeatures();
+ 	bool isAttachment = mvkIsAnyFlagEnabled(_usage, (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+ 													 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+diff --git a/MoltenVK/MoltenVK/Layers/MVKExtensions.def b/MoltenVK/MoltenVK/Layers/MVKExtensions.def
+index 6bc4186..916efc0 100644
+--- a/MoltenVK/MoltenVK/Layers/MVKExtensions.def
++++ b/MoltenVK/MoltenVK/Layers/MVKExtensions.def
+@@ -151,6 +151,7 @@ MVK_EXTENSION(EXT_host_image_copy,                      EXT_HOST_IMAGE_COPY,
+ MVK_EXTENSION(EXT_host_query_reset,                     EXT_HOST_QUERY_RESET,                     DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(EXT_image_2d_view_of_3d,                  EXT_IMAGE_2D_VIEW_OF_3D,                  DEVICE,   10.15, 13.0,  1.0)
+ MVK_EXTENSION(EXT_image_robustness,                     EXT_IMAGE_ROBUSTNESS,                     DEVICE,   10.11,  8.0,  1.0)
++MVK_EXTENSION(EXT_image_sliced_view_of_3d,              EXT_IMAGE_SLICED_VIEW_OF_3D,              DEVICE,   10.15, 13.0,  1.0)
+ MVK_EXTENSION(EXT_index_type_uint8,                     EXT_INDEX_TYPE_UINT8,                     DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(EXT_inline_uniform_block,                 EXT_INLINE_UNIFORM_BLOCK,                 DEVICE,   10.11,  8.0,  1.0)
+ MVK_EXTENSION(EXT_layer_settings,                       EXT_LAYER_SETTINGS,                       INSTANCE, 10.11,  8.0,  1.0)
+-- 
+2.54.0 (Apple Git-157)
+

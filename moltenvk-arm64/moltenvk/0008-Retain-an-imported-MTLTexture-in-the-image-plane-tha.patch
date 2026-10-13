@@ -1,0 +1,33 @@
+From 12bbb2d60d4d22245b46053f45269db85510177f Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Tue, 13 Oct 2026 00:34:15 +0200
+Subject: [PATCH] Retain an imported MTLTexture in the image plane that uses it
+
+MVKImagePlane::getMTLTexture() took the MTLTexture of memory imported with VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT
+without retaining it, while releaseMTLTexture() releases the plane's texture in every case. Destroying the image
+released a reference the memory still counted on, so a texture shared between two VkDevices was freed while the other
+device's image still used it: Microsoft Flight Simulator 2024 through Wine crashed in vkDestroyImage (and once in
+vkDestroyBuffer) and hung, after its videos started being shared from D3D11 to D3D12. The plane now takes its own
+reference, like every other branch.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKImage.mm | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+index 87895fd..62dc89c 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+@@ -80,7 +80,9 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+         id<MTLTexture> tex;
+         // Use imported texture if we are binding to a VkDeviceMemory that was created with an import operation
+         if (dvcMem && (dvcMem->_externalMemoryHandleType & VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT) && dvcMem->_mtlTexture) {
+-            tex = dvcMem->_mtlTexture;
++            // Highball imported-texture-retain: every other branch makes a texture this plane owns and releaseMTLTexture()
++            // releases; the memory keeps its own reference to an imported one, so the plane takes one too.
++            tex = [dvcMem->_mtlTexture retain];
+         } else if (_image->_ioSurface) {
+             tex = [_image->getMTLDevice()
+                    newTextureWithDescriptor: mtlTexDesc
+-- 
+2.54.0 (Apple Git-157)
+

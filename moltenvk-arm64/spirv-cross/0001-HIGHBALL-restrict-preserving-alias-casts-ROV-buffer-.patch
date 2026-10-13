@@ -1,0 +1,75 @@
+From 2a0f8d2a459b6d3fe7caaa6a8337ccfea1b1c5ef Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 11 Oct 2026 23:08:52 +0200
+Subject: [PATCH 1/4] HIGHBALL: restrict-preserving alias casts, ROV buffer
+ arrays, OpCopyObject of access chains
+
+---
+ spirv_glsl.cpp |  4 ++++
+ spirv_msl.cpp  | 19 ++++++++++++++++---
+ 2 files changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/spirv_glsl.cpp b/spirv_glsl.cpp
+index cbd135d0..a296ed1a 100644
+--- a/spirv_glsl.cpp
++++ b/spirv_glsl.cpp
+@@ -13850,6 +13850,10 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
+ 			{
+ 				e.implied_read_expressions = rhs_expr->implied_read_expressions;
+ 				e.expression_dependencies = rhs_expr->expression_dependencies;
++				// HIGHBALL: a copy of an access chain is still an lvalue, not a pointer value to dereference
++				// (MSL emitted "*arr[i] = x" for an OpCopyObject of a Workgroup element pointer).
++				if (pointer && rhs_expr->access_chain)
++					e.access_chain = true;
+ 			}
+ 		}
+ 		break;
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index c5a9d433..93d24e08 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -13828,8 +13828,11 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
+ 	{
+ 		string quals = join(
+ 		    " [[id(", get_extended_member_decoration(type.self, index, SPIRVCrossDecorationResourceIndexPrimary), ")");
++		// HIGHBALL: Metal rejects raster_order_group on an array of buffer pointers in an argument buffer
++		// ("type constant ... & is not valid for attribute buffer"). Keep it for textures and single buffers.
++		bool buffer_array = !mbr_type.array.empty() && mbr_type.basetype == SPIRType::Struct;
+ 		if (interlocked_resources.count(
+-		        get_extended_member_decoration(type.self, index, SPIRVCrossDecorationInterfaceOrigID)))
++		        get_extended_member_decoration(type.self, index, SPIRVCrossDecorationInterfaceOrigID)) && !buffer_array)
+ 			quals += ", raster_order_group(0)";
+ 		quals += "]]";
+ 		return quals;
+@@ -19984,16 +19987,26 @@ void CompilerMSL::emit_argument_buffer_aliased_descriptor(const SPIRVariable &al
+ 		bool needs_post_cast_deref = !is_array(data_type);
+ 		string ref_type = needs_post_cast_deref ? "&" : join("(&)", type_to_array_glsl(var_type, aliased_var.self));
+ 
++		// HIGHBALL: the base descriptor can be __restrict while this alias is not, and reinterpret_cast may not
++		// drop a qualifier ("casts away qualifiers", vkd3d-proton raw and structured buffers aliasing one binding).
++		string alias_type = type_to_glsl(var_type, aliased_var.self, true);
++		if (*to_restrict(base_var.self, false) && alias_type.find("__restrict") == string::npos)
++		{
++			auto star = alias_type.rfind('*');
++			if (star != string::npos)
++				alias_type.insert(star + 1, " __restrict");
++		}
++
+ 		if (is_var_runtime_size_array(aliased_var))
+ 		{
+ 			name = join("reinterpret_cast<",
+-			            type_to_glsl(var_type, aliased_var.self, true), " ", descriptor_storage, " *>(&",
++			            alias_type, " ", descriptor_storage, " *>(&",
+ 			            unqualified_name, ")");
+ 		}
+ 		else
+ 		{
+ 			name = join(needs_post_cast_deref ? "*" : "", "reinterpret_cast<",
+-			            type_to_glsl(var_type, aliased_var.self, true), " ", descriptor_storage, " ",
++			            alias_type, " ", descriptor_storage, " ",
+ 			            ref_type,
+ 			            ">(", unqualified_name, ");");
+ 		}
+-- 
+2.54.0 (Apple Git-157)
+

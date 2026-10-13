@@ -1,0 +1,62 @@
+From 9cdeef2beba196cddd88834666b0530e8784db30 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Mon, 12 Oct 2026 16:54:51 +0200
+Subject: [PATCH] VKD3D_CONFIG=force_native_fp16: native 16-bit shader
+ operations without float16 denorm guarantees
+
+Native16BitShaderOpsSupported needs shaderDenormPreserveFloat16 and an independent denorm behaviour, which MoltenVK
+and KosmicKrisp on Apple GPUs do not report. Games that use native 16-bit operations without checking the cap then
+lose those pipelines ("Attempting to use 16-bit operations in shader ..., but this is not supported"): 16 compute
+pipelines per Microsoft Flight Simulator 2024 run on both drivers. The flag drops the two denorm requirements and
+keeps the others, so float16 denormals may flush on such devices.
+---
+ include/vkd3d.h     |  1 +
+ libs/vkd3d/device.c | 10 ++++++++--
+ 2 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/include/vkd3d.h b/include/vkd3d.h
+index bc77c8c..86bde66 100644
+--- a/include/vkd3d.h
++++ b/include/vkd3d.h
+@@ -120,6 +120,7 @@ extern "C" {
+ #define VKD3D_CONFIG_FLAG_DEFER_RESOURCE_DESTRUCTION (1ull << 60)
+ #define VKD3D_CONFIG_FLAG_PREFER_THIN_UAV_TILING (1ull << 61)
+ #define VKD3D_CONFIG_FLAG_EXTENDED_DEBUG_UTILS (1ull << 62)
++#define VKD3D_CONFIG_FLAG_FORCE_NATIVE_FP16 (1ull << 63)
+ 
+ struct vkd3d_instance;
+ 
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 9c10f41..dfb412f 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -1304,6 +1304,7 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
+     {"defer_resource_destruction", VKD3D_CONFIG_FLAG_DEFER_RESOURCE_DESTRUCTION},
+     {"prefer_thin_uav_tiling", VKD3D_CONFIG_FLAG_PREFER_THIN_UAV_TILING},
+     {"no_nvx", VKD3D_CONFIG_FLAG_NO_NVX},
++    {"force_native_fp16", VKD3D_CONFIG_FLAG_FORCE_NATIVE_FP16},
+ };
+ 
+ static void vkd3d_config_flags_init_once(void)
+@@ -9317,11 +9318,16 @@ uint32_t d3d12_device_get_max_descriptor_heap_size(struct d3d12_device *device,
+ 
+ static bool d3d12_device_supports_16bit_shader_ops(struct d3d12_device *device)
+ {
++    /* Highball: VKD3D_CONFIG=force_native_fp16 drops the two float16 denorm requirements, which MoltenVK and
++     * KosmicKrisp on Apple GPUs do not report, so games that use native 16-bit operations without checking
++     * Native16BitShaderOpsSupported keep those pipelines. */
++    bool relax_denorms = !!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_FORCE_NATIVE_FP16);
++
+     return device->device_info.vulkan_1_2_features.shaderFloat16 &&
+             device->device_info.features2.features.shaderInt16 &&
+             device->device_info.vulkan_1_1_features.uniformAndStorageBuffer16BitAccess &&
+-            device->device_info.vulkan_1_2_properties.shaderDenormPreserveFloat16 &&
+-            device->device_info.vulkan_1_2_properties.denormBehaviorIndependence != VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE &&
++            (relax_denorms || device->device_info.vulkan_1_2_properties.shaderDenormPreserveFloat16) &&
++            (relax_denorms || device->device_info.vulkan_1_2_properties.denormBehaviorIndependence != VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE) &&
+             device->device_info.properties2.properties.limits.minStorageBufferOffsetAlignment <= 16;
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

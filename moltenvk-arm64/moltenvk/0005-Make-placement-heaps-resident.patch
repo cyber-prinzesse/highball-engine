@@ -1,0 +1,52 @@
+From 5284705c8fb8272be0b53e9b4220504dc7b5b910 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Mon, 12 Oct 2026 22:18:37 +0200
+Subject: [PATCH] Make placement heaps resident
+
+Textures MoltenVK creates from a VkDeviceMemory heap after the image was bound (the aliases behind block-texel views of
+compressed images and behind 2D views of 3D images) never entered the device residency set, and Metal shader
+validation reported 995 accesses to them as not resident in three compute pipelines of Microsoft Flight Simulator
+2024 through vkd3d-proton. The heap is added to the residency set when it is created or imported, and removed through
+the deferred release when the memory is freed.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm
+index e6e7786..05c51a1 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDeviceMemory.mm
+@@ -229,6 +229,11 @@
+ 	[heapDesc release];
+ 	if (!_mtlHeap) { return false; }
+ 
++	// Highball heap-residency: an image placed in this heap has its own texture added to the residency set, but the
++	// textures MoltenVK makes from the heap later (the aliases behind block-texel views of compressed images and
++	// 2D views of 3D images) do not, and shaders used them while not resident. The heap covers everything in it.
++	_device->makeResident(_mtlHeap);
++
+ 	propagateDebugName();
+ 
+ 	return true;
+@@ -380,8 +385,10 @@
+ 				_externalMemoryHandleType = pImportInfo->handleType;
+ 				// This handle type will only be exposed to the user if we actually are supporting heaps
+ 				if (pImportInfo->handleType & VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT) {
++					if (_mtlHeap) { _device->removeResidency(_mtlHeap); }	// Highball heap-residency
+ 					[_mtlHeap release];
+ 					_mtlHeap = [((id<MTLHeap>)pImportInfo->handle) retain];
++					_device->makeResident(_mtlHeap);	// Highball heap-residency
+ 					_mtlStorageMode = _mtlHeap.storageMode;
+ 					_mtlCPUCacheMode = _mtlHeap.cpuCacheMode;
+ 					_allocationSize = _mtlHeap.size;
+@@ -518,6 +525,7 @@
+ 		[buf release];
+ 	}
+ 
++	if (_mtlHeap) { _device->removeResidency(_mtlHeap); }	// Highball heap-residency
+ 	[_mtlHeap release];
+ 	_mtlHeap = nil;
+ 
+-- 
+2.54.0 (Apple Git-157)
+

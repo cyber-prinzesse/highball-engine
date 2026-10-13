@@ -1,0 +1,97 @@
+From 01e4fb2c3ea561f2d6736d554c6747d8d4749aed Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Mon, 12 Oct 2026 19:46:36 +0200
+Subject: [PATCH 4/4] HB_MVK_TEXTURE_2D_AS_ARRAY=1: shader-readable 2D views as
+ one-layer 2D array textures
+
+With the variable set, a 2D image view that shaders can read (sampled or storage usage, a 2D or 2D array image,
+single-sampled, view type 2D, so 1D views emulated as 2D stay as they are) is created as a one-layer 2D array
+texture, and shaders are converted with SPIRV-Cross's texture_2D_as_2D_array (Highball's SPIRV-Cross patch 0004),
+which declares 2D textures as 2D arrays reading layer 0. D3D12 games through vkd3d-proton read one bindless
+descriptor as Texture2D or Texture2DArray (Microsoft Flight Simulator 2024's compute passes), which PC hardware
+tolerates and Metal does not promise. Off unless set.
+---
+ MoltenVK/MoltenVK/GPUObjects/MVKImage.mm    |  8 ++++++++
+ MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm |  2 ++
+ MoltenVK/MoltenVK/Vulkan/mvk_datatypes.hpp  |  3 +++
+ MoltenVK/MoltenVK/Vulkan/mvk_datatypes.mm   | 11 +++++++++++
+ 4 files changed, 24 insertions(+)
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+index 97f7e55..2f9e370 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+@@ -2310,6 +2310,14 @@ static void signalAndUntrack(const MVKSwapchainSignaler& signaler) {
+ 		}
+ 	}
+ 
++	// Highball texture-2d-as-array: a 2D view that shaders can read becomes a one-layer 2D array texture, matching
++	// SPIRV-Cross's texture_2D_as_2D_array, so a bindless descriptor can be read as Texture2D or Texture2DArray.
++	if (mvkHighballTexture2DAsArray() && pCreateInfo->viewType == VK_IMAGE_VIEW_TYPE_2D && _mtlTextureType == MTLTextureType2D &&
++		(_image->_mtlTextureType == MTLTextureType2D || _image->_mtlTextureType == MTLTextureType2DArray) &&
++		mvkIsAnyFlagEnabled(_usage, (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT))) {
++		_mtlTextureType = MTLTextureType2DArray;
++	}
++
+ 	// Remember the subresource range, and determine the actual number of mip levels and texture slices
+     _subresourceRange = pCreateInfo->subresourceRange;
+ 	if (_subresourceRange.levelCount == VK_REMAINING_MIP_LEVELS) {
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 7eae64c..7a25708 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -2127,6 +2127,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 
+ 	shaderConfig.options.mslOptions.ios_support_base_vertex_instance = mtlFeats.baseVertexInstanceDrawing;
+ 	shaderConfig.options.mslOptions.texture_1D_as_2D = mvkCfg.texture1DAs2D;
++	shaderConfig.options.mslOptions.texture_2D_as_2D_array = mvkHighballTexture2DAsArray();	// Highball
+ 	shaderConfig.options.mslOptions.enable_point_size_builtin = isRenderingPoints() || reflectData.pointMode;
+ 	shaderConfig.options.mslOptions.enable_point_size_default = shaderConfig.options.mslOptions.enable_point_size_builtin;
+ 	shaderConfig.options.mslOptions.default_point_size = 1.0f; // See VK_KHR_maintenance5
+@@ -2505,6 +2506,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 	shaderConfig.options.mslOptions.texture_buffer_native = true;
+ 	shaderConfig.options.mslOptions.dispatch_base = _allowsDispatchBase;
+ 	shaderConfig.options.mslOptions.texture_1D_as_2D = mvkCfg.texture1DAs2D;
++	shaderConfig.options.mslOptions.texture_2D_as_2D_array = mvkHighballTexture2DAsArray();	// Highball
+     shaderConfig.options.mslOptions.fixed_subgroup_size = mvkIsAnyFlagEnabled(pSS->flags, VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT) ? 0 : mtlFeats.maxSubgroupSize;
+ 
+ 	bool useMetalArgBuff = isUsingMetalArgumentBuffers();
+diff --git a/MoltenVK/MoltenVK/Vulkan/mvk_datatypes.hpp b/MoltenVK/MoltenVK/Vulkan/mvk_datatypes.hpp
+index 99460be..bf5d738 100644
+--- a/MoltenVK/MoltenVK/Vulkan/mvk_datatypes.hpp
++++ b/MoltenVK/MoltenVK/Vulkan/mvk_datatypes.hpp
+@@ -50,6 +50,9 @@ class MVKPixelFormats;
+ MTLTextureType mvkMTLTextureTypeFromVkImageTypeObj(VkImageType vkImageType, uint32_t arraySize, bool isMultisample, MVKBaseObject* mvkObj);
+ #define mvkMTLTextureTypeFromVkImageType(vkImageType, arraySize, isMultisample) mvkMTLTextureTypeFromVkImageTypeObj(vkImageType, arraySize, isMultisample, this)
+ 
++/** Highball texture-2d-as-array: true when HB_MVK_TEXTURE_2D_AS_ARRAY=1 (2D views as one-layer 2D arrays). */
++bool mvkHighballTexture2DAsArray();
++
+ MTLTextureType mvkMTLTextureTypeFromVkImageViewTypeObj(VkImageViewType vkImageViewType, bool isMultisample, MVKBaseObject* mvkObj);
+ #define mvkMTLTextureTypeFromVkImageViewType(vkImageViewType, isMultisample) mvkMTLTextureTypeFromVkImageViewTypeObj(vkImageViewType, isMultisample, this)
+ 
+diff --git a/MoltenVK/MoltenVK/Vulkan/mvk_datatypes.mm b/MoltenVK/MoltenVK/Vulkan/mvk_datatypes.mm
+index 9ee4db1..de234ea 100644
+--- a/MoltenVK/MoltenVK/Vulkan/mvk_datatypes.mm
++++ b/MoltenVK/MoltenVK/Vulkan/mvk_datatypes.mm
+@@ -189,6 +189,17 @@ MVK_PUBLIC_SYMBOL MTLTextureType mvkMTLTextureTypeFromVkImageViewType(VkImageVie
+ 	return mvkMTLTextureTypeFromVkImageViewTypeObj(vkImageViewType, isMultisample, nullptr);
+ }
+ 
++// Highball texture-2d-as-array (gin-19 experiment), see MVKImageView.
++__attribute__((used)) static const char* const kHighballTexture2DAsArray = "HIGHBALL texture-2d-as-array";
++bool mvkHighballTexture2DAsArray() {
++	static int enabled = -1;
++	if (enabled < 0) {
++		const char* env = getenv("HB_MVK_TEXTURE_2D_AS_ARRAY");
++		enabled = (env && env[0] == '1') ? 1 : 0;
++	}
++	return enabled == 1;
++}
++
+ MTLTextureType mvkMTLTextureTypeFromVkImageViewTypeObj(VkImageViewType vkImageViewType,
+ 													   bool isMultisample,
+ 													   MVKBaseObject* mvkObj) {
+-- 
+2.54.0 (Apple Git-157)
+

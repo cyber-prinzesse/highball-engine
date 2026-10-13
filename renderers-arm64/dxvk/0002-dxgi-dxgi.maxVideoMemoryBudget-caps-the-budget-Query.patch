@@ -1,0 +1,62 @@
+From 98829106e30a0c7693cfebb340685879249a1cf2 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Mon, 12 Oct 2026 14:40:04 +0200
+Subject: [PATCH 2/3] dxgi: dxgi.maxVideoMemoryBudget caps the budget
+ QueryVideoMemoryInfo reports
+
+On unified memory the budget is MoltenVK's device-local heap budget, about 80% of RAM, and games size their settings
+from it: Microsoft Flight Simulator 2024 on Ultra filled 26.8 GB on a 32 GB Mac, more than the GPU may wire, and the
+machine's GPU stalled. The new option, in megabytes, caps the local segment's budget without changing the adapter's
+description (capping DedicatedVideoMemory as well changed what the game did at start).
+---
+ src/dxgi/dxgi_adapter.cpp | 6 ++++++
+ src/dxgi/dxgi_options.cpp | 1 +
+ src/dxgi/dxgi_options.h   | 3 +++
+ 3 files changed, 10 insertions(+)
+
+diff --git a/src/dxgi/dxgi_adapter.cpp b/src/dxgi/dxgi_adapter.cpp
+index 259c782..0e6b9fb 100644
+--- a/src/dxgi/dxgi_adapter.cpp
++++ b/src/dxgi/dxgi_adapter.cpp
+@@ -312,6 +312,12 @@ namespace dxvk {
+       pVideoMemoryInfo->AvailableForReservation += memInfo.heaps[i].heapSize / 2;
+     }
+ 
++    // Highball: dxgi.maxVideoMemoryBudget caps the local budget only, the adapter description stays.
++    VkDeviceSize maxBudget = m_factory->GetOptions()->maxVideoMemoryBudget;
++
++    if (MemorySegmentGroup == DXGI_MEMORY_SEGMENT_GROUP_LOCAL && maxBudget && pVideoMemoryInfo->Budget > maxBudget)
++      pVideoMemoryInfo->Budget = maxBudget;
++
+     // We don't implement reservation, but the observable
+     // behaviour should match that of Windows drivers
+     uint32_t segmentId = uint32_t(MemorySegmentGroup);
+diff --git a/src/dxgi/dxgi_options.cpp b/src/dxgi/dxgi_options.cpp
+index d83342e..3cd753c 100644
+--- a/src/dxgi/dxgi_options.cpp
++++ b/src/dxgi/dxgi_options.cpp
+@@ -168,6 +168,7 @@ namespace dxvk {
+     // Interpret the memory limits as Megabytes
+     this->maxDeviceMemory = VkDeviceSize(config.getOption<int32_t>("dxgi.maxDeviceMemory", 0)) << 20;
+     this->maxSharedMemory = VkDeviceSize(config.getOption<int32_t>("dxgi.maxSharedMemory", 0)) << 20;
++    this->maxVideoMemoryBudget = VkDeviceSize(config.getOption<int32_t>("dxgi.maxVideoMemoryBudget", 0)) << 20;
+ 
+     this->maxFrameRate     = config.getOption<int32_t>("dxvk.maxFrameRate",
+                              config.getOption<int32_t>("dxgi.maxFrameRate", 0));
+diff --git a/src/dxgi/dxgi_options.h b/src/dxgi/dxgi_options.h
+index c61c574..a413f0e 100644
+--- a/src/dxgi/dxgi_options.h
++++ b/src/dxgi/dxgi_options.h
+@@ -39,6 +39,9 @@ namespace dxvk {
+     VkDeviceSize maxDeviceMemory;
+     VkDeviceSize maxSharedMemory;
+ 
++    /// Highball: caps the local budget QueryVideoMemoryInfo reports (unified memory)
++    VkDeviceSize maxVideoMemoryBudget;
++
+     /// Reports Nvidia GPUs running on the proprietary driver as a different
+     /// vendor (usually AMD). Proton will generally disable this option.
+     bool hideNvidiaGpu;
+-- 
+2.54.0 (Apple Git-157)
+
