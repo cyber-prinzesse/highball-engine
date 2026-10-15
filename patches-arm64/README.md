@@ -170,3 +170,7 @@ with it (MoltenVK and the Vulkan headers from Homebrew).
 - `0037-ffmpeg-arm64ec-yuv2rgb-narrow-blue-sums-first.patch`: Wine's ARM64EC port of swscale's yuv2rgb NEON code wrote
   some outputs (R2 for bgra) into v10/v11 before reading the blue sums kept there, so video converted to BGRA had
   vertical stripes and wrong colours. The blue sums are narrowed first. Same code in upstream master.
+- `0038-winemac-per-program-metal-shader-cache-folder.patch`: the Mac driver gives each program its own Metal shader
+  cache folder (highball/<program>/com.apple.metal under the user's cache folder, as DXMT does per game) in
+  macdrv_init, before the Cocoa side creates the first Metal device, after which Metal keeps its default folder, the
+  loader's, shared by every program the engine runs. HB_METAL_SHADER_CACHE names another folder, 0 keeps the default.
