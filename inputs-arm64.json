@@ -60,7 +60,7 @@
       "gstreamer-1.0-codecs",
       "gstreamer-1.0-codecs-restricted",
       "gstreamer-1.0-effects",
-      "gstreamer-1.0-libav"
+      "gstreamer-1.0-libav", "gstreamer-1.0-system"
     ],
     "note": "Expanded flat with pkgutil and unpacked component by component (gstreamer/unpkg.py), never installed. The runtime components above are merged into frameworks/GStreamer.framework, then gstreamer/prune.py keeps the plugins winegstreamer can use for games and the libraries they link, thinned to arm64 (45 MB). Wine is built against a copy with the core and GLib headers from the devel package. 1.28.8 had no macOS packages on 2026-10-11. Both checksums match the ones published beside the packages."
   },
