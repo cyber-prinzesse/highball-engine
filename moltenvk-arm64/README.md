@@ -52,6 +52,13 @@ file for file, the MoltenVK tree of the gin19g build that the Microsoft Flight S
   texture streaming work along (block noise in the cockpit displays, garbage ground textures, about 70 command
   buffers by Ready to fly). A Metal-only test fails the same way (an M1 Pro from 256-512 layers at 16384x16384, an M4
   at 2048) and works with one layer. With the patch a full test flight had no failed command buffer.
+- `0012` every VkDevice keeps an implicit pipeline cache on disk for pipelines created without one (vkd3d-proton's
+  global_pipeline_cache mode, enforced with a shader cache path, gives MoltenVK none, and MoltenVK has no driver
+  cache of its own as Mesa has): read at creation, written every 60 s when it grew and at destruction, one file per
+  device under highball/<program> in the user's cache folder, named with the pipelineCacheUUID. Libraries read from
+  cache data compile their MSL on first use. The SPIR-V to MSL conversions of one start serve the next (Microsoft
+  Flight Simulator 2024: about 11,000 at 100 to 140 ms each, the critical path of its 7 to 8 minute shader
+  preparation). HB_MVK_PIPELINE_CACHE names another folder, 0 disables.
 
 ## SPIRV-Cross (6c09849, MoltenVK 1.4.2's pin)
 

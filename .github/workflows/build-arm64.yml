@@ -92,7 +92,8 @@ jobs:
           field() { python3 -c "import json;v=json.load(open('inputs-arm64.json'))['gstreamer']['$1'];print(' '.join(v) if isinstance(v,list) else v)"; }
           V=$(field version)
           for p in runtime devel; do
-            curl -sSL --retry 3 -o "gst-$p.pkg" "$(field ${p}_url)"
+            # gstreamer.freedesktop.org closes transfers early at times: resume up to eight times.
+            for try in 1 2 3 4 5 6 7 8; do curl -sSL --http1.1 -C - -o "gst-$p.pkg" "$(field ${p}_url)" && break; echo "download of $p interrupted, resuming ($try)"; sleep 10; done
             echo "$(field ${p}_sha256)  gst-$p.pkg" | shasum -a 256 -c -
             pkgutil --expand "gst-$p.pkg" "gst-$p"
           done

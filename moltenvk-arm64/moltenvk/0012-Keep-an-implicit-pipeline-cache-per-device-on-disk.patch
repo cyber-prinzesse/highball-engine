@@ -1,0 +1,505 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Thu, 15 Oct 2026 16:40:00 +0200
+Subject: [PATCH] Keep an implicit pipeline cache per device on disk
+
+vkd3d-proton with a shader cache path (every Highball launch) enforces its global_pipeline_cache mode and creates
+pipelines with no VkPipelineCache at all, counting on the driver's own disk cache, which Mesa has and MoltenVK does
+not. So every SPIR-V to MSL conversion ran again at every start: Microsoft Flight Simulator 2024 converts about
+11,000 shaders at 100 to 140 ms each on an M4 at every boot, the critical path of its 7 to 8 minute shader
+preparation (the Metal compiles behind it are served by Metal's cache from the second boot on).
+
+Every VkDevice now keeps a pipeline cache of its own, used for pipelines created without one: read from a file at
+creation, written back every 60 s when it grew and at destruction (an app a user kills loses at most a minute).
+The file lives in highball/<program name> under the user's cache folder, one per device created in the process
+and named with the build's pipelineCacheUUID, since readData() only accepts data from the same build on the same
+GPU. HB_MVK_PIPELINE_CACHE names another folder, 0 disables. Writing goes through hbWriteAll, which holds the cache
+lock across the size and data calls (a library added in between resets the size and failed every round in the
+first form). A library read from cache data compiles its MSL on first use rather than in vkCreateDevice, where
+MoltenVK compiled them one after the other. The pipeline cache data now also carries SPIRV-Cross patch 0004's
+texture_2D_as_2D_array option, which matches() compares with the rest of the options struct: without it no entry
+read from disk ever matched. And a library converted for one next stage must provide every output the new
+next stage consumes: matches() only checked that the stored library's used outputs exist in the new pipeline,
+so a vertex library converted for a fragment shader reading fewer inputs was reused with one reading more and
+Metal refused the pipeline ("Fragment input(s) ... not written by vertex shader"): 2,000 to 6,700 refused
+pipelines per boot with a warm device-wide cache, missing draws on the menu globe, against 42 without one
+(MoltenVK's per-module cache never reused a library across pipelines, since vkd3d-proton creates one shader
+module per pipeline). The interface key also carries the 32-bit base type: MoltenVK maps float, int and uint
+outputs all to ANY32, so a fragment library converted for a vertex stage writing float4 at a location served a
+pipeline whose vertex stage writes uint4 there (1,500 to 2,000 refused pipelines per flight). The file name
+carries the patch's own format tag (hb3), since the pipelineCacheUUID does not change when the serialized
+layout does; files of other tags are removed; and whatever a damaged file throws while it is read, the device
+starts with an empty cache and the file goes (a layout change had killed the game with std::bad_alloc at
+device creation). And a cached library serves one pairing of stages only: the options carry the SPIR-V hash
+of the other stage (the fragment module's for the vertex and tessellation stages, the vertex module's for the
+fragment stage), since with the two key fixes a flight still refused about 2,000 pipelines; whatever the key
+misses, sharing across partners exposes it, and per-pairing sharing keeps the whole second-start win, a game
+pairing the same shaders at every run. Measured on the M4 on 2026-10-15.
+---
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+index 545b8c3..22f78ba 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
+@@ -32,6 +32,7 @@
+ #include <mutex>
+ #include <deque>
+ #include <os/lock.h>
++#include <dispatch/dispatch.h>
+ 
+ #import <Metal/Metal.h>
+ #import <QuartzCore/CAMetalLayer.h>
+@@ -652,6 +653,8 @@ public:
+ };
+ 
+ /** Represents a Vulkan logical GPU device, associated with a physical device. */
++class MVKPipelineCache;
++
+ class MVKDevice : public MVKDispatchableVulkanAPIObject {
+ 
+ public:
+@@ -676,6 +679,10 @@ public:
+     /** Returns the common resource factory for creating command resources. */
+     MVKCommandResourceFactory* getCommandResourceFactory() { return _commandResourceFactory; }
+ 
++	/** Highball implicit pipeline cache: the cache for pipelines created without one, kept in a file per program and device. */
++	MVKPipelineCache* getImplicitPipelineCache() { return _implicitPipelineCache; }
++	void hbFlushImplicitPipelineCache();
++
+ 	/** Returns the function pointer corresponding to the specified named entry point. */
+ 	PFN_vkVoidFunction getProcAddr(const char* pName);
+ 
+@@ -1130,6 +1137,12 @@ protected:
+ 	uint32_t _visibilityBufferCount = 0;
+ 	int _capturePipeFileDesc = -1;
+ 	bool _isPerformanceTracking = false;
++	void hbInitImplicitPipelineCache();
++	void hbTearDownImplicitPipelineCache();
++	MVKPipelineCache* _implicitPipelineCache = nullptr;
++	std::string _implicitPipelineCachePath;
++	uint64_t _implicitPipelineCacheWritten = 0;
++	dispatch_source_t _implicitPipelineCacheTimer = nullptr;
+ 	bool _isCurrentlyAutoGPUCapturing = false;
+ 
+ };
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 3099676..222b740 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -5214,6 +5214,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 		}
+ 	}
+ 
++	hbInitImplicitPipelineCache();
++
+ 	MVKLogInfo("Created VkDevice to run on GPU %s with the following %d Vulkan extensions enabled:%s",
+ 			   getName(), _enabledExtensions.getEnabledCount(), _enabledExtensions.enabledNamesString("\n\t", true).c_str());
+ }
+@@ -5579,6 +5581,7 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ }
+ 
+ MVKDevice::~MVKDevice() {
++	hbTearDownImplicitPipelineCache();
+ 	if (_isPerformanceTracking) {
+ 		auto perfLogStyle = getMVKConfig().activityPerformanceLoggingStyle;
+ 		if (perfLogStyle == MVK_CONFIG_ACTIVITY_PERFORMANCE_LOGGING_STYLE_DEVICE_LIFETIME) {
+@@ -5690,3 +5693,115 @@ uint64_t mvkGetLocationID(id<MTLDevice> mtlDevice) {
+ 
+ 	return hash;
+ }
++
++
++#pragma mark -
++#pragma mark Highball implicit pipeline cache
++
++// Highball implicit pipeline cache: the device keeps a pipeline cache of its own for the pipelines created without
++// one, reads it from a file at creation and writes it back every 60 s when it grew and at destruction, so the
++// SPIR-V to MSL conversions of one run serve the next. readData() rejects data from another MoltenVK build or GPU
++// through the header.
++#include "MVKPipeline.h"
++#include <atomic>
++#include <cstdio>
++#include <fstream>
++#include <iterator>
++#include <unistd.h>
++#include <limits.h>
++
++static std::mutex hbImplicitCacheLock;
++
++// The folder: HB_MVK_PIPELINE_CACHE (0 for none, a relative one goes under the user's cache folder), or
++// highball/<program name> under the user's cache folder, the program name being the Windows executable's (Wine
++// sets it with setprogname). One file per VkDevice created in the process, in creation order, named with this
++// build's pipelineCacheUUID, since readData() only accepts data written by the same build on the same GPU.
++void MVKDevice::hbInitImplicitPipelineCache() {
++	static std::atomic<unsigned> deviceIndex{0};
++	const char* env = getenv("HB_MVK_PIPELINE_CACHE");
++	if (env && !strcmp(env, "0")) { return; }
++	std::string dir = (env && *env) ? env : std::string("highball/") + getprogname();
++	if (dir[0] != '/') {
++		char buf[PATH_MAX];
++		size_t len = confstr(_CS_DARWIN_USER_CACHE_DIR, buf, sizeof(buf));
++		if ( !len || len >= sizeof(buf) ) { return; }
++		if (len >= 2 && buf[len - 2] == '/') { buf[len - 2] = 0; }
++		dir = std::string(buf) + "/" + dir;
++	}
++	[[NSFileManager defaultManager] createDirectoryAtPath: [NSString stringWithUTF8String: dir.c_str()] withIntermediateDirectories: YES attributes: nil error: nil];
++	char uuid[VK_UUID_SIZE * 2 + 1];
++	auto& dvcProps = _physicalDevice->_properties;
++	for (size_t i = 0; i < VK_UUID_SIZE; i++) { snprintf(uuid + i * 2, 3, "%02x", dvcProps.pipelineCacheUUID[i]); }
++	// The file name carries this patch's own format tag: the pipelineCacheUUID does not change when the serialized
++	// layout does. Files of other tags in the folder are stale and removed.
++	static const char* hbCacheFormat = "hb3";
++	std::string tag = std::string("moltenvk-") + uuid + "-" + hbCacheFormat + "-";
++	std::string path = dir + "/" + tag + std::to_string(++deviceIndex) + ".bin";
++	for (NSString* name in [[NSFileManager defaultManager] contentsOfDirectoryAtPath: [NSString stringWithUTF8String: dir.c_str()] error: nil]) {
++		std::string n = name.UTF8String;
++		if (n.rfind("moltenvk-", 0) == 0 && n.find("-" + std::string(hbCacheFormat) + "-") == std::string::npos) {
++			[[NSFileManager defaultManager] removeItemAtPath: [NSString stringWithUTF8String: (dir + "/" + n).c_str()] error: nil];
++		}
++	}
++	std::vector<char> data;
++	{
++		std::ifstream in(path, std::ios::binary);
++		if (in) { data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()); }
++	}
++	VkPipelineCacheCreateInfo info = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, data.size(), data.data() };
++	// Whatever a damaged file throws while it is read, the device starts with an empty cache and the file goes.
++	try {
++		_implicitPipelineCache = new MVKPipelineCache(this, &info);
++	} catch (...) {
++		MVKLogInfo("Highball: implicit pipeline cache %s unreadable, removed.", path.c_str());
++		std::remove(path.c_str());
++		data.clear();
++		info.initialDataSize = 0;
++		info.pInitialData = nullptr;
++		_implicitPipelineCache = new MVKPipelineCache(this, &info);
++	}
++	_implicitPipelineCachePath = path;
++	_implicitPipelineCacheWritten = _implicitPipelineCache->hbGeneration();
++	MVKLogInfo("Highball: implicit pipeline cache %s, %lu bytes read.", path.c_str(), (unsigned long)data.size());
++	// A utility queue: a background one is starved for minutes while a game saturates the CPUs.
++	_implicitPipelineCacheTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
++	dispatch_source_set_timer(_implicitPipelineCacheTimer, dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC), 60 * NSEC_PER_SEC, 5 * NSEC_PER_SEC);
++	dispatch_source_set_event_handler(_implicitPipelineCacheTimer, ^{ hbFlushImplicitPipelineCache(); });
++	dispatch_resume(_implicitPipelineCacheTimer);
++}
++
++void MVKDevice::hbFlushImplicitPipelineCache() {
++	std::lock_guard<std::mutex> lock(hbImplicitCacheLock);
++	if ( !_implicitPipelineCache ) { return; }
++	uint64_t gen = _implicitPipelineCache->hbGeneration();
++	if (gen == _implicitPipelineCacheWritten) { return; }
++	std::vector<char> data;
++	if (_implicitPipelineCache->hbWriteAll(data) != VK_SUCCESS || data.empty()) { return; }
++	size_t size = data.size();
++	std::string tmp = _implicitPipelineCachePath + ".tmp";
++	{
++		std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
++		if ( !out ) { return; }
++		out.write(data.data(), size);
++	}
++	if (rename(tmp.c_str(), _implicitPipelineCachePath.c_str()) != 0) { return; }
++	_implicitPipelineCacheWritten = gen;
++	MVKLogInfo("Highball: implicit pipeline cache written, %lu bytes, %llu shader libraries added since the read.",
++			   (unsigned long)size, (unsigned long long)gen);
++}
++
++void MVKDevice::hbTearDownImplicitPipelineCache() {
++	if ( !_implicitPipelineCache ) { return; }
++	if (_implicitPipelineCacheTimer) {
++		dispatch_semaphore_t cancelled = dispatch_semaphore_create(0);
++		dispatch_source_set_cancel_handler(_implicitPipelineCacheTimer, ^{ dispatch_semaphore_signal(cancelled); });
++		dispatch_source_cancel(_implicitPipelineCacheTimer);
++		dispatch_semaphore_wait(cancelled, DISPATCH_TIME_FOREVER);
++		dispatch_release(_implicitPipelineCacheTimer);
++		_implicitPipelineCacheTimer = nullptr;
++	}
++	hbFlushImplicitPipelineCache();
++	std::lock_guard<std::mutex> lock(hbImplicitCacheLock);
++	_implicitPipelineCache->destroy();
++	_implicitPipelineCache = nullptr;
++}
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index e385e9b..62ae193 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -485,6 +485,12 @@ public:
+ 	 */
+ 	VkResult writeData(size_t* pDataSize, void* pData);
+ 
++	/** Highball implicit pipeline cache: how many shader libraries were added after the initial data was read. */
++	uint64_t hbGeneration() { return _hbGeneration; }
++
++	/** Highball implicit pipeline cache: serializes the whole cache into out under the cache lock, in one go. */
++	VkResult hbWriteAll(std::vector<char>& out);
++
+ 	/**
+ 	 * Return a shader library for the shader conversion configuration, from the
+ 	 * pipeline's pipeline cache, or compiled from source in the shader module.
+@@ -521,6 +527,7 @@ protected:
+ 
+ 	std::unordered_map<MVKShaderModuleKey, MVKShaderLibraryCache*> _shaderCache;
+ 	size_t _dataSize = 0;
++	uint64_t _hbGeneration = 0;	// Highball implicit pipeline cache: shader libraries added since creation
+ 	std::mutex _shaderCacheLock;
+ 	bool _isExternallySynchronized = false;
+ 	bool _isMergeInternallySynchronized = false;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 7a25708..0e85c65 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -1498,6 +1498,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 													const VkPipelineShaderStageCreateInfo*& pFragmentSS) {
+ 	const auto& implicit = _stageResources[kMVKShaderStageVertex].implicitBuffers.ids;
+ 	shaderConfig.options.entryPointStage = spv::ExecutionModelVertex;
++	shaderConfig.options.hbPartnerHash = _fragmentModule ? (uint64_t)_fragmentModule->getKey().codeHash : 0;	// Highball implicit pipeline cache
+ 	shaderConfig.options.entryPointName = pVertexSS->pName;
+ 	addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
+ 	shaderConfig.options.mslOptions.shader_output_buffer_index = implicit[MVKImplicitBuffer::Output];
+@@ -1536,6 +1537,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 													MVKMTLFunction* pVtxFunctions) {
+ 	const auto& implicit = _stageResources[kMVKShaderStageVertex].implicitBuffers.ids;
+ 	shaderConfig.options.entryPointStage = spv::ExecutionModelVertex;
++	shaderConfig.options.hbPartnerHash = _fragmentModule ? (uint64_t)_fragmentModule->getKey().codeHash : 0;	// Highball implicit pipeline cache
+ 	shaderConfig.options.entryPointName = pVertexSS->pName;
+ 	addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
+ 	shaderConfig.options.mslOptions.shader_index_buffer_index = implicit[MVKImplicitBuffer::Index];
+@@ -1580,6 +1582,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 													 VkPipelineCreationFeedback* pTessCtlFB) {
+ 	const auto& implicit = _stageResources[kMVKShaderStageTessCtl].implicitBuffers.ids;
+ 	shaderConfig.options.entryPointStage = spv::ExecutionModelTessellationControl;
++	shaderConfig.options.hbPartnerHash = _vertexModule ? (uint64_t)_vertexModule->getKey().codeHash : 0;	// Highball implicit pipeline cache
+ 	shaderConfig.options.entryPointName = pTessCtlSS->pName;
+ 	addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
+ 	shaderConfig.options.mslOptions.indirect_params_buffer_index = implicit[MVKImplicitBuffer::IndirectParams];
+@@ -1619,6 +1622,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 													  const VkPipelineShaderStageCreateInfo*& pFragmentSS) {
+ 	const auto& implicit = _stageResources[kMVKShaderStageTessEval].implicitBuffers.ids;
+ 	shaderConfig.options.entryPointStage = spv::ExecutionModelTessellationEvaluation;
++	shaderConfig.options.hbPartnerHash = _vertexModule ? (uint64_t)_vertexModule->getKey().codeHash : 0;	// Highball implicit pipeline cache
+ 	shaderConfig.options.entryPointName = pTessEvalSS->pName;
+ 	addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
+ 	shaderConfig.options.mslOptions.shader_input_buffer_index = getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalInputBufferBinding);
+@@ -1658,6 +1662,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 	auto& mtlFeats = getMetalFeatures();
+ 	if (pFragmentSS) {
+ 		shaderConfig.options.entryPointStage = spv::ExecutionModelFragment;
++		shaderConfig.options.hbPartnerHash = _vertexModule ? (uint64_t)_vertexModule->getKey().codeHash : 0;	// Highball implicit pipeline cache
+ 		addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
+ 		shaderConfig.options.mslOptions.view_mask_buffer_index = implicit[MVKImplicitBuffer::ViewRange];
+ 		shaderConfig.options.entryPointName = pFragmentSS->pName;
+@@ -2262,6 +2267,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 		sosv.component = si.component;
+         sosv.builtin = si.builtin;
+         sosv.vecsize = si.vecWidth;
++        so.hbBaseType = (uint8_t)si.baseType;	// Highball implicit pipeline cache
+ 		sosv.rate = si.perPatch ? MSL_SHADER_VARIABLE_RATE_PER_PATCH : MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
+ 
+         switch (getPixelFormats()->getFormatType(mvkFormatFromOutput(si) ) ) {
+@@ -2307,6 +2313,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 		sisv.component = so.component;
+         sisv.builtin = so.builtin;
+         sisv.vecsize = so.vecWidth;
++        si.hbBaseType = (uint8_t)so.baseType;	// Highball implicit pipeline cache
+ 		sisv.rate = so.perPatch ? MSL_SHADER_VARIABLE_RATE_PER_PATCH : MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
+ 
+         switch (getPixelFormats()->getFormatType(mvkFormatFromOutput(so) ) ) {
+@@ -2590,7 +2597,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 	bool wasAdded = false;
+ 	MVKShaderLibraryCache* slCache = getShaderLibraryCache(shaderModule->getKey());
+ 	MVKShaderLibrary* shLib = slCache->getShaderLibrary(pContext, shaderModule, pipeline, &wasAdded, pShaderFeedback, startTime);
+-	if (wasAdded) { markDirty(); }
++	if (wasAdded) { markDirty(); _hbGeneration++; }	// Highball implicit pipeline cache
+ 	else if (pShaderFeedback) { mvkEnableFlags(pShaderFeedback->flags, VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT); }
+ 	return shLib;
+ }
+@@ -2880,6 +2887,7 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
+ 				opt.view_index_from_device_index,
+ 				opt.dispatch_base,
+ 				opt.texture_1D_as_2D,
++				opt.texture_2D_as_2D_array,	// Highball: SPIRV-Cross patch 0004's option, compared by matches()
+ 				opt.emulate_reversed_depth_viewport,
+ 				opt.argument_buffers,
+ 				opt.argument_buffers_tier,
+@@ -2996,14 +3004,16 @@ void serialize(Archive & archive, SPIRVToMSLConversionOptions& opt) {
+ 				opt.tessPatchKind,
+ 				opt.numTessControlPoints,
+ 				opt.shouldFlipVertexY,
+-				opt.shouldFixupClipSpace);
++				opt.shouldFixupClipSpace,
++				opt.hbPartnerHash);	// Highball implicit pipeline cache
+ 	}
+ 
+ 	template<class Archive>
+ 	void serialize(Archive & archive, MSLShaderInterfaceVariable& si) {
+ 		archive(si.shaderVar,
+ 				si.binding,
+-				si.outIsUsedByShader);
++				si.outIsUsedByShader,
++				si.hbBaseType);	// Highball implicit pipeline cache
+ 	}
+ 
+ 	template<class Archive>
+@@ -3210,3 +3220,18 @@ void mvkValidateCeralArchiveDefinitions() {
+ 	missingBytes += mvkValidateCerealArchiveSize<MVKCompressor<std::string>>(20);				// Contains collection
+ 	assert(missingBytes == 0 && "Cereal Archive definitions incomplete. See previous logged errors.");
+ }
++
++
++// Highball implicit pipeline cache: writeData() needs two calls, one for the size and one for the data, and a
++// library added between them resets the size, so a live cache is written with the lock held across both.
++VkResult MVKPipelineCache::hbWriteAll(std::vector<char>& out) {
++	lock_guard<mutex> lock(_shaderCacheLock);
++	size_t size = 0;
++	VkResult rslt = writeDataImpl(&size, nullptr);
++	if (rslt != VK_SUCCESS) { return rslt; }
++	if ( !size ) { out.clear(); return VK_SUCCESS; }
++	out.resize(size);
++	rslt = writeDataImpl(&size, out.data());
++	if (rslt == VK_SUCCESS) { out.resize(size); }
++	return rslt;
++}
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
+index c5b7499..b2f8f27 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
+@@ -24,6 +24,7 @@
+ #include "MVKSmallVector.h"
+ #include <MoltenVKShaderConverter/SPIRVToMSLConverter.h>
+ #include <mutex>
++#include <atomic>
+ 
+ #import <Metal/Metal.h>
+ 
+@@ -153,6 +154,9 @@ protected:
+ 	MVKVulkanAPIDeviceObject* _owner;
+ 	id<MTLLibrary> _mtlLibrary;
+ 	MVKCompressor<std::string> _compressedMSL;
++	void hbCompileLazily();	// Highball implicit pipeline cache: compile MSL read from cache data on first use
++	std::mutex _hbLazyLock;
++	std::atomic<bool> _hbLazy{false};
+ 	mvk::SPIRVToMSLConversionResultInfo _shaderConversionResultInfo;
+ 
+ 	/** When true, representing a library created with source, but never specialized */
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+index 3aa44a4..254a8de 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -73,6 +73,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 												VkPipelineCreationFeedback* pShaderFeedback,
+ 												MVKShaderModule* shaderModule) {
+ 
++	hbCompileLazily();
+ 	if ( !_mtlLibrary ) { return MVKMTLFunctionNull; }
+ 
+ 	id<MTLLibrary> lib = _mtlLibrary;
+@@ -220,9 +221,13 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 
+ 	_shaderConversionResultInfo = resultInfo;
+ 	_compressedMSL = compressedMSL;
+-	string msl;
+-	decompressMSL(msl);
+-	compileLibrary(msl, specializationMacroDef);
++	if (specializationMacroDef) {
++		string msl;
++		decompressMSL(msl);
++		compileLibrary(msl, specializationMacroDef);
++	} else {
++		_hbLazy.store(true, std::memory_order_release);	// Highball implicit pipeline cache: compiled on first use
++	}
+ }
+ 
+ void MVKShaderLibrary::compileLibrary(const string& msl,
+@@ -276,6 +281,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 	_mtlLibrary = [other._mtlLibrary retain];
+ 	_shaderConversionResultInfo = other._shaderConversionResultInfo;
+ 	_compressedMSL = other._compressedMSL;
++	_hbLazy.store(other._hbLazy.load(std::memory_order_acquire), std::memory_order_release);
+ }
+ 
+ MVKShaderLibrary& MVKShaderLibrary::operator=(const MVKShaderLibrary& other) {
+@@ -286,6 +292,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 	_owner = other._owner;
+ 	_shaderConversionResultInfo = other._shaderConversionResultInfo;
+ 	_compressedMSL = other._compressedMSL;
++	_hbLazy.store(other._hbLazy.load(std::memory_order_acquire), std::memory_order_release);
+ 	return *this;
+ }
+ 
+@@ -401,6 +408,7 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 	if ( !mvkLib ) {
+ 		uint64_t startTime = pShaderFeedback ? mvkGetTimestamp() : getPerformanceTimestamp();
+ 		MVKPipelineCache* pipelineCache = pipeline->getPipelineCache();
++		if ( !pipelineCache ) { pipelineCache = getDevice()->getImplicitPipelineCache(); }	// Highball implicit pipeline cache
+ 		if (pipelineCache) {
+ 			mvkLib = pipelineCache->getShaderLibrary(pShaderConfig, this, pipeline, pShaderFeedback, startTime);
+ 		} else {
+@@ -742,3 +750,16 @@ static uint32_t getWorkgroupDimensionSize(const SPIRVWorkgroupSizeDimension& wgD
+ 	[_mtlFunction release];
+ }
+ 
++
++
++// Highball implicit pipeline cache: a library read from cache data compiles its MSL the first time a function is
++// asked for. One compile per library, whichever thread comes first; the others wait on the lock.
++void MVKShaderLibrary::hbCompileLazily() {
++	if ( !_hbLazy.load(std::memory_order_acquire) ) { return; }
++	std::lock_guard<std::mutex> lock(_hbLazyLock);
++	if ( !_hbLazy.load(std::memory_order_acquire) ) { return; }
++	std::string msl;
++	decompressMSL(msl);
++	if ( !msl.empty() ) { compileLibrary(msl, nullptr); }
++	_hbLazy.store(false, std::memory_order_release);
++}
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
+index 406f4f8..3b97f61 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
+@@ -54,6 +54,7 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionOptions::matches(const SPIRVToMSLConv
+ 	if (numTessControlPoints != other.numTessControlPoints) { return false; }
+ 	if (shouldFlipVertexY != other.shouldFlipVertexY) { return false; }
+ 	if (shouldFixupClipSpace != other.shouldFixupClipSpace) { return false; }
++	if (hbPartnerHash != other.hbPartnerHash) { return false; }	// Highball implicit pipeline cache
+ 	return true;
+ }
+ 
+@@ -94,6 +95,7 @@ MVK_PUBLIC_SYMBOL SPIRVToMSLConversionOptions::SPIRVToMSLConversionOptions() {
+ MVK_PUBLIC_SYMBOL bool mvk::MSLShaderInterfaceVariable::matches(const mvk::MSLShaderInterfaceVariable& other) const {
+ 	if (memcmp(&shaderVar, &other.shaderVar, sizeof(shaderVar)) != 0) { return false; }
+ 	if (binding != other.binding) { return false; }
++	if (hbBaseType != other.hbBaseType) { return false; }	// Highball implicit pipeline cache
+ 	return true;
+ }
+ 
+@@ -199,6 +201,10 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionConfiguration::matches(const SPIRVToM
+ 	for (const auto& so : shaderOutputs) {
+ 		if (so.outIsUsedByShader && !containsMatching(other.shaderOutputs, so)) { return false; }
+ 	}
++	// Highball implicit pipeline cache: the new next stage must find every output it consumes in this library.
++	for (const auto& so : other.shaderOutputs) {
++		if ( !containsMatching(shaderOutputs, so) ) { return false; }
++	}
+ 
+     for (const auto& rb : resourceBindings) {
+         if (rb.resourceBinding.stage == options.entryPointStage &&
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
+index bffc072..7e8741d 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
+@@ -45,6 +45,7 @@ namespace mvk {
+ 		uint32_t numTessControlPoints = 0;
+ 		bool shouldFlipVertexY = true;
+ 		bool shouldFixupClipSpace = false;
++		uint64_t hbPartnerHash = 0;	// Highball implicit pipeline cache: the SPIR-V hash of the other stage, a library serves one pairing
+ 
+ 		/**
+ 		 * Returns whether the specified options match this one.
+@@ -77,6 +78,7 @@ namespace mvk {
+ 		SPIRV_CROSS_NAMESPACE::MSLShaderInterfaceVariable shaderVar;
+ 		uint32_t binding = 0;
+ 		bool outIsUsedByShader = false;
++		uint8_t hbBaseType = 0;	// Highball implicit pipeline cache: the 32-bit base type (float, int, uint), which format does not tell apart
+ 
+ 		/**
+ 		 * Returns whether the specified interface variable match this one.
+-- 
+2.39.5

@@ -1,0 +1,80 @@
+winemac: one Metal shader cache folder per program, set before the first Metal device.
+
+Metal keeps its shader cache (compiled MSL libraries and GPU pipeline binaries) in one folder per process identity,
+here the loader's, shared by every program this engine runs, and MTLSetShaderCachePath takes another folder only
+before the first Metal device exists; the Mac driver creates devices for the displays (cocoa_display.m) long before a
+renderer loads, so a renderer cannot move it. The driver now sets highball/<program>/com.apple.metal under the
+user's cache folder in macdrv_init, before the Cocoa side starts, the program being the Windows executable's name
+(ntdll sets it with setprogname), as DXMT does per game on the Intel engines. One game's pipelines then survive the
+others', and a second start compiles nothing Metal already compiled: in Microsoft Flight Simulator 2024 the second
+boot's MTLCompilerService stayed at 0% where the first had it at 100 to 380% for the whole shader preparation.
+HB_METAL_SHADER_CACHE names another folder (a relative one goes under the user's cache folder), 0 keeps Metal's
+default. Measured on the M4 on 2026-10-15 (private/notes/msfs-2024-arm64-boot-2026-10-15.md).
+
+--- a/dlls/winemac.drv/macdrv_main.c	2026-10-15 16:19:43
++++ b/dlls/winemac.drv/macdrv_main.c	2026-10-15 16:19:43
+@@ -28,6 +28,9 @@
+ 
+ #include <Security/AuthSession.h>
+ #include <IOKit/pwr_mgt/IOPMLib.h>
++#include <dlfcn.h>
++#include <sys/stat.h>
++#include <unistd.h>
+ 
+ #include "ntstatus.h"
+ #include "macdrv.h"
+@@ -417,6 +420,46 @@
+     }
+ 
+     localized_strings = dict;
++}
++
++
++/***********************************************************************
++ *              set_metal_shader_cache_path
++ *
++ * Metal keeps its shader cache (compiled MSL libraries and GPU pipeline binaries) in
++ * one folder per process identity, here the loader's, shared by every program this
++ * engine runs, and it takes another folder only before the first Metal device exists.
++ * Give each program its own folder under the user's cache folder, named after its
++ * executable, before the Cocoa side creates a device for the displays, so one game's
++ * pipelines survive the others' and a second start compiles nothing again.
++ * HB_METAL_SHADER_CACHE names another folder (a relative one goes under the user's
++ * cache folder) and 0 keeps Metal's default.
++ */
++static void set_metal_shader_cache_path(void)
++{
++    void (*set_path)(CFStringRef) = dlsym(RTLD_DEFAULT, "MTLSetShaderCachePath");
++    const char *env = getenv("HB_METAL_SHADER_CACHE");
++    char base[PATH_MAX], path[PATH_MAX], *p;
++    CFStringRef str;
++    size_t len;
++
++    if (!set_path || (env && !strcmp(env, "0"))) return;
++    if (env && env[0] == '/') snprintf(path, sizeof(path), "%s", env);
++    else
++    {
++        len = confstr(_CS_DARWIN_USER_CACHE_DIR, base, sizeof(base));
++        if (!len || len >= sizeof(base)) return;
++        if (len >= 2 && base[len - 2] == '/') base[len - 2] = 0;
++        if (env) snprintf(path, sizeof(path), "%s/%s", base, env);
++        else snprintf(path, sizeof(path), "%s/highball/%s/com.apple.metal", base, getprogname());
++    }
++    for (p = path + 1; *p; p++)
++        if (*p == '/') { *p = 0; mkdir(path, 0755); *p = '/'; }
++    mkdir(path, 0755);
++    if (!(str = CFStringCreateWithCString(NULL, path, kCFStringEncodingUTF8))) return;
++    set_path(str);
++    CFRelease(str);
++    TRACE("Metal shader cache folder %s\n", path);
+ }
+ 
+ 
+@@ -441,6 +484,7 @@
+     init_win_context();
+     setup_options();
+     load_strings(params->strings);
++    set_metal_shader_cache_path();
+ 
+     macdrv_err_on = ERR_ON(macdrv);
+     if (macdrv_start_cocoa_app(NtGetTickCount()))
