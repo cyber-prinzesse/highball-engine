@@ -18,7 +18,13 @@ lock across the size and data calls (a library added in between resets the size 
 first form). A library read from cache data compiles its MSL on first use rather than in vkCreateDevice, where
 MoltenVK compiled them one after the other. The pipeline cache data now also carries SPIRV-Cross patch 0004's
 texture_2D_as_2D_array option, which matches() compares with the rest of the options struct: without it no entry
-read from disk ever matched. Measured on the M4 on 2026-10-15.
+read from disk ever matched. And a library converted for one next stage must provide every output the new
+next stage consumes: matches() only checked that the stored library's used outputs exist in the new pipeline,
+so a vertex library converted for a fragment shader reading fewer inputs was reused with one reading more and
+Metal refused the pipeline ("Fragment input(s) ... not written by vertex shader"): 2,000 to 6,700 refused
+pipelines per boot with a warm device-wide cache, missing draws on the menu globe, against 42 without one
+(MoltenVK's per-module cache never reused a library across pipelines, since vkd3d-proton creates one shader
+module per pipeline). Measured on the M4 on 2026-10-15.
 ---
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 index 545b8c3..22f78ba 100644
@@ -338,5 +344,20 @@ index 3aa44a4..254a8de 100644
 +	if ( !msl.empty() ) { compileLibrary(msl, nullptr); }
 +	_hbLazy.store(false, std::memory_order_release);
 +}
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
+index 406f4f8..7d51c57 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
+@@ -199,6 +199,10 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionConfiguration::matches(const SPIRVToM
+ 	for (const auto& so : shaderOutputs) {
+ 		if (so.outIsUsedByShader && !containsMatching(other.shaderOutputs, so)) { return false; }
+ 	}
++	// Highball implicit pipeline cache: the new next stage must find every output it consumes in this library.
++	for (const auto& so : other.shaderOutputs) {
++		if ( !containsMatching(shaderOutputs, so) ) { return false; }
++	}
+ 
+     for (const auto& rb : resourceBindings) {
+         if (rb.resourceBinding.stage == options.entryPointStage &&
 -- 
 2.39.5
