@@ -92,7 +92,7 @@ jobs:
           field() { python3 -c "import json;v=json.load(open('inputs-arm64.json'))['gstreamer']['$1'];print(' '.join(v) if isinstance(v,list) else v)"; }
           V=$(field version)
           for p in runtime devel; do
-            curl -sSL --retry 3 -o "gst-$p.pkg" "$(field ${p}_url)"
+            curl -sSL --http1.1 --retry 5 --retry-all-errors -o "gst-$p.pkg" "$(field ${p}_url)"
             echo "$(field ${p}_sha256)  gst-$p.pkg" | shasum -a 256 -c -
             pkgutil --expand "gst-$p.pkg" "gst-$p"
           done
