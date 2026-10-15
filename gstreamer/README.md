@@ -9,8 +9,9 @@ macOS packages from gstreamer.freedesktop.org (pinned in `inputs-arm64.json`) an
   component, 4.7 GB for the devel package.
 - `prune.py` keeps the plugins winegstreamer can use for games and exactly the libraries they and
   winegstreamer link, then thins everything to arm64 and signs it ad hoc: 46 MB with the licence texts,
-  against 355 MB for the components it starts from. No applemedia: it links GStreamer's own MoltenVK, a
-  second copy next to Wine's in the same process, so FFmpeg (gst-libav) decodes.
+  against 355 MB for the components it starts from. applemedia is kept (VideoToolbox decoding, vtdec_hw
+  outranks avdec_h264) with GStreamer's own MoltenVK through libgstvulkan, a second copy next to Wine's in
+  the same process, measured harmless on 2026-10-15.
 
 The framework goes to `frameworks/GStreamer.framework`, as Sikarugir's template framework does for the Intel
 engines. `winegstreamer.so` finds it through one rpath, `@loader_path/../../GStreamer.framework/Versions/1.0/lib`,

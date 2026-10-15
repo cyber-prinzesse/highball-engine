@@ -2,14 +2,16 @@
 # gstreamer/prune.py <GStreamer.framework> [--thin]: keeps the plugins Wine's winegstreamer can use for games (Media
 # Foundation and DirectShow playback: containers, parsers, decoders, conversion) and exactly the libraries they and
 # winegstreamer link (an otool closure over @rpath names), and drops everything else. Optionally thins every Mach-O
-# to arm64 and signs it ad hoc. No applemedia: it links GStreamer's own MoltenVK, a second copy next to Wine's in
-# the same process, so FFmpeg (libav) decodes instead. Prints what stays.
+# to arm64 and signs it ad hoc. applemedia (VideoToolbox decoding, vtdec_hw outranks avdec_h264) comes with
+# GStreamer's own MoltenVK through libgstvulkan, a second copy next to Wine's in the same process; measured
+# harmless (Microsoft Flight Simulator 2024's 4K intro and loading videos decoded in hardware on 2026-10-15,
+# where FFmpeg had taken two cores for the whole boot). Prints what stays.
 import os, subprocess, sys
 
 KEEP_PLUGINS = """
 coreelements typefindfunctions app playback videoconvertscale videofilter audioconvert audioresample volume rawparse
 pbtypes deinterlace isomp4 matroska avi ogg flv asf mpegtsdemux mpegpsdemux id3demux apetag audioparsers
-videoparsersbad vorbis theora opus flac mpg123 dav1d libav wavparse
+videoparsersbad vorbis theora opus flac mpg123 dav1d libav wavparse applemedia
 """.split()
 WINE_LIBS = """libgstreamer-1.0.0.dylib libgstvideo-1.0.0.dylib libgstaudio-1.0.0.dylib libgsttag-1.0.0.dylib
 libgstbase-1.0.0.dylib libgobject-2.0.0.dylib libglib-2.0.0.dylib libintl.8.dylib""".split()
