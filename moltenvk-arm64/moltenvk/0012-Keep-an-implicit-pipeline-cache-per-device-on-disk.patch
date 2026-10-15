@@ -24,7 +24,10 @@ so a vertex library converted for a fragment shader reading fewer inputs was reu
 Metal refused the pipeline ("Fragment input(s) ... not written by vertex shader"): 2,000 to 6,700 refused
 pipelines per boot with a warm device-wide cache, missing draws on the menu globe, against 42 without one
 (MoltenVK's per-module cache never reused a library across pipelines, since vkd3d-proton creates one shader
-module per pipeline). Measured on the M4 on 2026-10-15.
+module per pipeline). The interface key also carries the 32-bit base type: MoltenVK maps float, int and uint
+outputs all to ANY32, so a fragment library converted for a vertex stage writing float4 at a location served a
+pipeline whose vertex stage writes uint4 there (1,500 to 2,000 refused pipelines per flight). Measured on the M4
+on 2026-10-15.
 ---
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 index 545b8c3..22f78ba 100644
@@ -213,10 +216,26 @@ index e385e9b..62ae193 100644
  	bool _isExternallySynchronized = false;
  	bool _isMergeInternallySynchronized = false;
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
-index 7a25708..99d52a6 100644
+index 7a25708..301dba8 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
-@@ -2590,7 +2590,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -2262,6 +2262,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 		sosv.component = si.component;
+         sosv.builtin = si.builtin;
+         sosv.vecsize = si.vecWidth;
++        so.hbBaseType = (uint8_t)si.baseType;	// Highball implicit pipeline cache
+ 		sosv.rate = si.perPatch ? MSL_SHADER_VARIABLE_RATE_PER_PATCH : MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
+ 
+         switch (getPixelFormats()->getFormatType(mvkFormatFromOutput(si) ) ) {
+@@ -2307,6 +2308,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 		sisv.component = so.component;
+         sisv.builtin = so.builtin;
+         sisv.vecsize = so.vecWidth;
++        si.hbBaseType = (uint8_t)so.baseType;	// Highball implicit pipeline cache
+ 		sisv.rate = so.perPatch ? MSL_SHADER_VARIABLE_RATE_PER_PATCH : MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
+ 
+         switch (getPixelFormats()->getFormatType(mvkFormatFromOutput(so) ) ) {
+@@ -2590,7 +2592,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  	bool wasAdded = false;
  	MVKShaderLibraryCache* slCache = getShaderLibraryCache(shaderModule->getKey());
  	MVKShaderLibrary* shLib = slCache->getShaderLibrary(pContext, shaderModule, pipeline, &wasAdded, pShaderFeedback, startTime);
@@ -225,7 +244,7 @@ index 7a25708..99d52a6 100644
  	else if (pShaderFeedback) { mvkEnableFlags(pShaderFeedback->flags, VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT); }
  	return shLib;
  }
-@@ -2880,6 +2880,7 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
+@@ -2880,6 +2882,7 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
  				opt.view_index_from_device_index,
  				opt.dispatch_base,
  				opt.texture_1D_as_2D,
@@ -233,7 +252,17 @@ index 7a25708..99d52a6 100644
  				opt.emulate_reversed_depth_viewport,
  				opt.argument_buffers,
  				opt.argument_buffers_tier,
-@@ -3210,3 +3211,18 @@ void mvkValidateCeralArchiveDefinitions() {
+@@ -3003,7 +3006,8 @@ void serialize(Archive & archive, SPIRVToMSLConversionOptions& opt) {
+ 	void serialize(Archive & archive, MSLShaderInterfaceVariable& si) {
+ 		archive(si.shaderVar,
+ 				si.binding,
+-				si.outIsUsedByShader);
++				si.outIsUsedByShader,
++				si.hbBaseType);	// Highball implicit pipeline cache
+ 	}
+ 
+ 	template<class Archive>
+@@ -3210,3 +3214,18 @@ void mvkValidateCeralArchiveDefinitions() {
  	missingBytes += mvkValidateCerealArchiveSize<MVKCompressor<std::string>>(20);				// Contains collection
  	assert(missingBytes == 0 && "Cereal Archive definitions incomplete. See previous logged errors.");
  }
@@ -345,10 +374,18 @@ index 3aa44a4..254a8de 100644
 +	_hbLazy.store(false, std::memory_order_release);
 +}
 diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
-index 406f4f8..7d51c57 100644
+index 406f4f8..3f8ebd7 100644
 --- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
 +++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
-@@ -199,6 +199,10 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionConfiguration::matches(const SPIRVToM
+@@ -94,6 +94,7 @@ MVK_PUBLIC_SYMBOL SPIRVToMSLConversionOptions::SPIRVToMSLConversionOptions() {
+ MVK_PUBLIC_SYMBOL bool mvk::MSLShaderInterfaceVariable::matches(const mvk::MSLShaderInterfaceVariable& other) const {
+ 	if (memcmp(&shaderVar, &other.shaderVar, sizeof(shaderVar)) != 0) { return false; }
+ 	if (binding != other.binding) { return false; }
++	if (hbBaseType != other.hbBaseType) { return false; }	// Highball implicit pipeline cache
+ 	return true;
+ }
+ 
+@@ -199,6 +200,10 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionConfiguration::matches(const SPIRVToM
  	for (const auto& so : shaderOutputs) {
  		if (so.outIsUsedByShader && !containsMatching(other.shaderOutputs, so)) { return false; }
  	}
@@ -359,5 +396,17 @@ index 406f4f8..7d51c57 100644
  
      for (const auto& rb : resourceBindings) {
          if (rb.resourceBinding.stage == options.entryPointStage &&
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
+index bffc072..44b0e92 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
+@@ -77,6 +77,7 @@ namespace mvk {
+ 		SPIRV_CROSS_NAMESPACE::MSLShaderInterfaceVariable shaderVar;
+ 		uint32_t binding = 0;
+ 		bool outIsUsedByShader = false;
++		uint8_t hbBaseType = 0;	// Highball implicit pipeline cache: the 32-bit base type (float, int, uint), which format does not tell apart
+ 
+ 		/**
+ 		 * Returns whether the specified interface variable match this one.
 -- 
 2.39.5
