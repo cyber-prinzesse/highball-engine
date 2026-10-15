@@ -27,10 +27,14 @@ pipelines per boot with a warm device-wide cache, missing draws on the menu glob
 module per pipeline). The interface key also carries the 32-bit base type: MoltenVK maps float, int and uint
 outputs all to ANY32, so a fragment library converted for a vertex stage writing float4 at a location served a
 pipeline whose vertex stage writes uint4 there (1,500 to 2,000 refused pipelines per flight). The file name
-carries the patch's own format tag (hb2), since the pipelineCacheUUID does not change when the serialized
+carries the patch's own format tag (hb3), since the pipelineCacheUUID does not change when the serialized
 layout does; files of other tags are removed; and whatever a damaged file throws while it is read, the device
 starts with an empty cache and the file goes (a layout change had killed the game with std::bad_alloc at
-device creation). Measured on the M4 on 2026-10-15.
+device creation). And a cached library serves one pairing of stages only: the options carry the SPIR-V hash
+of the other stage (the fragment module's for the vertex and tessellation stages, the vertex module's for the
+fragment stage), since with the two key fixes a flight still refused about 2,000 pipelines; whatever the key
+misses, sharing across partners exposes it, and per-pairing sharing keeps the whole second-start win, a game
+pairing the same shaders at every run. Measured on the M4 on 2026-10-15.
 ---
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 index 545b8c3..22f78ba 100644
@@ -78,7 +82,7 @@ index 545b8c3..22f78ba 100644
  
  };
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 3099676..a46390e 100644
+index 3099676..222b740 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -5214,6 +5214,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
@@ -143,7 +147,7 @@ index 3099676..a46390e 100644
 +	for (size_t i = 0; i < VK_UUID_SIZE; i++) { snprintf(uuid + i * 2, 3, "%02x", dvcProps.pipelineCacheUUID[i]); }
 +	// The file name carries this patch's own format tag: the pipelineCacheUUID does not change when the serialized
 +	// layout does. Files of other tags in the folder are stale and removed.
-+	static const char* hbCacheFormat = "hb2";
++	static const char* hbCacheFormat = "hb3";
 +	std::string tag = std::string("moltenvk-") + uuid + "-" + hbCacheFormat + "-";
 +	std::string path = dir + "/" + tag + std::to_string(++deviceIndex) + ".bin";
 +	for (NSString* name in [[NSFileManager defaultManager] contentsOfDirectoryAtPath: [NSString stringWithUTF8String: dir.c_str()] error: nil]) {
@@ -240,10 +244,50 @@ index e385e9b..62ae193 100644
  	bool _isExternallySynchronized = false;
  	bool _isMergeInternallySynchronized = false;
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
-index 7a25708..301dba8 100644
+index 7a25708..0e85c65 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
-@@ -2262,6 +2262,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -1498,6 +1498,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 													const VkPipelineShaderStageCreateInfo*& pFragmentSS) {
+ 	const auto& implicit = _stageResources[kMVKShaderStageVertex].implicitBuffers.ids;
+ 	shaderConfig.options.entryPointStage = spv::ExecutionModelVertex;
++	shaderConfig.options.hbPartnerHash = _fragmentModule ? (uint64_t)_fragmentModule->getKey().codeHash : 0;	// Highball implicit pipeline cache
+ 	shaderConfig.options.entryPointName = pVertexSS->pName;
+ 	addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
+ 	shaderConfig.options.mslOptions.shader_output_buffer_index = implicit[MVKImplicitBuffer::Output];
+@@ -1536,6 +1537,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 													MVKMTLFunction* pVtxFunctions) {
+ 	const auto& implicit = _stageResources[kMVKShaderStageVertex].implicitBuffers.ids;
+ 	shaderConfig.options.entryPointStage = spv::ExecutionModelVertex;
++	shaderConfig.options.hbPartnerHash = _fragmentModule ? (uint64_t)_fragmentModule->getKey().codeHash : 0;	// Highball implicit pipeline cache
+ 	shaderConfig.options.entryPointName = pVertexSS->pName;
+ 	addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
+ 	shaderConfig.options.mslOptions.shader_index_buffer_index = implicit[MVKImplicitBuffer::Index];
+@@ -1580,6 +1582,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 													 VkPipelineCreationFeedback* pTessCtlFB) {
+ 	const auto& implicit = _stageResources[kMVKShaderStageTessCtl].implicitBuffers.ids;
+ 	shaderConfig.options.entryPointStage = spv::ExecutionModelTessellationControl;
++	shaderConfig.options.hbPartnerHash = _vertexModule ? (uint64_t)_vertexModule->getKey().codeHash : 0;	// Highball implicit pipeline cache
+ 	shaderConfig.options.entryPointName = pTessCtlSS->pName;
+ 	addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
+ 	shaderConfig.options.mslOptions.indirect_params_buffer_index = implicit[MVKImplicitBuffer::IndirectParams];
+@@ -1619,6 +1622,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 													  const VkPipelineShaderStageCreateInfo*& pFragmentSS) {
+ 	const auto& implicit = _stageResources[kMVKShaderStageTessEval].implicitBuffers.ids;
+ 	shaderConfig.options.entryPointStage = spv::ExecutionModelTessellationEvaluation;
++	shaderConfig.options.hbPartnerHash = _vertexModule ? (uint64_t)_vertexModule->getKey().codeHash : 0;	// Highball implicit pipeline cache
+ 	shaderConfig.options.entryPointName = pTessEvalSS->pName;
+ 	addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
+ 	shaderConfig.options.mslOptions.shader_input_buffer_index = getMetalBufferIndexForVertexAttributeBinding(kMVKTessEvalInputBufferBinding);
+@@ -1658,6 +1662,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 	auto& mtlFeats = getMetalFeatures();
+ 	if (pFragmentSS) {
+ 		shaderConfig.options.entryPointStage = spv::ExecutionModelFragment;
++		shaderConfig.options.hbPartnerHash = _vertexModule ? (uint64_t)_vertexModule->getKey().codeHash : 0;	// Highball implicit pipeline cache
+ 		addCommonImplicitBuffersToShaderConfig(shaderConfig, implicit);
+ 		shaderConfig.options.mslOptions.view_mask_buffer_index = implicit[MVKImplicitBuffer::ViewRange];
+ 		shaderConfig.options.entryPointName = pFragmentSS->pName;
+@@ -2262,6 +2267,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  		sosv.component = si.component;
          sosv.builtin = si.builtin;
          sosv.vecsize = si.vecWidth;
@@ -251,7 +295,7 @@ index 7a25708..301dba8 100644
  		sosv.rate = si.perPatch ? MSL_SHADER_VARIABLE_RATE_PER_PATCH : MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
  
          switch (getPixelFormats()->getFormatType(mvkFormatFromOutput(si) ) ) {
-@@ -2307,6 +2308,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -2307,6 +2313,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  		sisv.component = so.component;
          sisv.builtin = so.builtin;
          sisv.vecsize = so.vecWidth;
@@ -259,7 +303,7 @@ index 7a25708..301dba8 100644
  		sisv.rate = so.perPatch ? MSL_SHADER_VARIABLE_RATE_PER_PATCH : MSL_SHADER_VARIABLE_RATE_PER_VERTEX;
  
          switch (getPixelFormats()->getFormatType(mvkFormatFromOutput(so) ) ) {
-@@ -2590,7 +2592,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+@@ -2590,7 +2597,7 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
  	bool wasAdded = false;
  	MVKShaderLibraryCache* slCache = getShaderLibraryCache(shaderModule->getKey());
  	MVKShaderLibrary* shLib = slCache->getShaderLibrary(pContext, shaderModule, pipeline, &wasAdded, pShaderFeedback, startTime);
@@ -268,7 +312,7 @@ index 7a25708..301dba8 100644
  	else if (pShaderFeedback) { mvkEnableFlags(pShaderFeedback->flags, VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT); }
  	return shLib;
  }
-@@ -2880,6 +2882,7 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
+@@ -2880,6 +2887,7 @@ void serialize(Archive & archive, CompilerMSL::Options& opt) {
  				opt.view_index_from_device_index,
  				opt.dispatch_base,
  				opt.texture_1D_as_2D,
@@ -276,7 +320,16 @@ index 7a25708..301dba8 100644
  				opt.emulate_reversed_depth_viewport,
  				opt.argument_buffers,
  				opt.argument_buffers_tier,
-@@ -3003,7 +3006,8 @@ void serialize(Archive & archive, SPIRVToMSLConversionOptions& opt) {
+@@ -2996,14 +3004,16 @@ void serialize(Archive & archive, SPIRVToMSLConversionOptions& opt) {
+ 				opt.tessPatchKind,
+ 				opt.numTessControlPoints,
+ 				opt.shouldFlipVertexY,
+-				opt.shouldFixupClipSpace);
++				opt.shouldFixupClipSpace,
++				opt.hbPartnerHash);	// Highball implicit pipeline cache
+ 	}
+ 
+ 	template<class Archive>
  	void serialize(Archive & archive, MSLShaderInterfaceVariable& si) {
  		archive(si.shaderVar,
  				si.binding,
@@ -286,7 +339,7 @@ index 7a25708..301dba8 100644
  	}
  
  	template<class Archive>
-@@ -3210,3 +3214,18 @@ void mvkValidateCeralArchiveDefinitions() {
+@@ -3210,3 +3220,18 @@ void mvkValidateCeralArchiveDefinitions() {
  	missingBytes += mvkValidateCerealArchiveSize<MVKCompressor<std::string>>(20);				// Contains collection
  	assert(missingBytes == 0 && "Cereal Archive definitions incomplete. See previous logged errors.");
  }
@@ -398,10 +451,18 @@ index 3aa44a4..254a8de 100644
 +	_hbLazy.store(false, std::memory_order_release);
 +}
 diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
-index 406f4f8..3f8ebd7 100644
+index 406f4f8..3b97f61 100644
 --- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
 +++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
-@@ -94,6 +94,7 @@ MVK_PUBLIC_SYMBOL SPIRVToMSLConversionOptions::SPIRVToMSLConversionOptions() {
+@@ -54,6 +54,7 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionOptions::matches(const SPIRVToMSLConv
+ 	if (numTessControlPoints != other.numTessControlPoints) { return false; }
+ 	if (shouldFlipVertexY != other.shouldFlipVertexY) { return false; }
+ 	if (shouldFixupClipSpace != other.shouldFixupClipSpace) { return false; }
++	if (hbPartnerHash != other.hbPartnerHash) { return false; }	// Highball implicit pipeline cache
+ 	return true;
+ }
+ 
+@@ -94,6 +95,7 @@ MVK_PUBLIC_SYMBOL SPIRVToMSLConversionOptions::SPIRVToMSLConversionOptions() {
  MVK_PUBLIC_SYMBOL bool mvk::MSLShaderInterfaceVariable::matches(const mvk::MSLShaderInterfaceVariable& other) const {
  	if (memcmp(&shaderVar, &other.shaderVar, sizeof(shaderVar)) != 0) { return false; }
  	if (binding != other.binding) { return false; }
@@ -409,7 +470,7 @@ index 406f4f8..3f8ebd7 100644
  	return true;
  }
  
-@@ -199,6 +200,10 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionConfiguration::matches(const SPIRVToM
+@@ -199,6 +201,10 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionConfiguration::matches(const SPIRVToM
  	for (const auto& so : shaderOutputs) {
  		if (so.outIsUsedByShader && !containsMatching(other.shaderOutputs, so)) { return false; }
  	}
@@ -421,10 +482,18 @@ index 406f4f8..3f8ebd7 100644
      for (const auto& rb : resourceBindings) {
          if (rb.resourceBinding.stage == options.entryPointStage &&
 diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
-index bffc072..44b0e92 100644
+index bffc072..7e8741d 100644
 --- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
 +++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.h
-@@ -77,6 +77,7 @@ namespace mvk {
+@@ -45,6 +45,7 @@ namespace mvk {
+ 		uint32_t numTessControlPoints = 0;
+ 		bool shouldFlipVertexY = true;
+ 		bool shouldFixupClipSpace = false;
++		uint64_t hbPartnerHash = 0;	// Highball implicit pipeline cache: the SPIR-V hash of the other stage, a library serves one pairing
+ 
+ 		/**
+ 		 * Returns whether the specified options match this one.
+@@ -77,6 +78,7 @@ namespace mvk {
  		SPIRV_CROSS_NAMESPACE::MSLShaderInterfaceVariable shaderVar;
  		uint32_t binding = 0;
  		bool outIsUsedByShader = false;
