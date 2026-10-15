@@ -26,8 +26,11 @@ pipelines per boot with a warm device-wide cache, missing draws on the menu glob
 (MoltenVK's per-module cache never reused a library across pipelines, since vkd3d-proton creates one shader
 module per pipeline). The interface key also carries the 32-bit base type: MoltenVK maps float, int and uint
 outputs all to ANY32, so a fragment library converted for a vertex stage writing float4 at a location served a
-pipeline whose vertex stage writes uint4 there (1,500 to 2,000 refused pipelines per flight). Measured on the M4
-on 2026-10-15.
+pipeline whose vertex stage writes uint4 there (1,500 to 2,000 refused pipelines per flight). The file name
+carries the patch's own format tag (hb2), since the pipelineCacheUUID does not change when the serialized
+layout does; files of other tags are removed; and whatever a damaged file throws while it is read, the device
+starts with an empty cache and the file goes (a layout change had killed the game with std::bad_alloc at
+device creation). Measured on the M4 on 2026-10-15.
 ---
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.h
 index 545b8c3..22f78ba 100644
@@ -75,7 +78,7 @@ index 545b8c3..22f78ba 100644
  
  };
 diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
-index 3099676..e7c6c2e 100644
+index 3099676..a46390e 100644
 --- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 +++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
 @@ -5214,6 +5214,8 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
@@ -95,7 +98,7 @@ index 3099676..e7c6c2e 100644
  	if (_isPerformanceTracking) {
  		auto perfLogStyle = getMVKConfig().activityPerformanceLoggingStyle;
  		if (perfLogStyle == MVK_CONFIG_ACTIVITY_PERFORMANCE_LOGGING_STYLE_DEVICE_LIFETIME) {
-@@ -5690,3 +5693,94 @@ uint64_t mvkGetLocationID(id<MTLDevice> mtlDevice) {
+@@ -5690,3 +5693,115 @@ uint64_t mvkGetLocationID(id<MTLDevice> mtlDevice) {
  
  	return hash;
  }
@@ -110,6 +113,7 @@ index 3099676..e7c6c2e 100644
 +// through the header.
 +#include "MVKPipeline.h"
 +#include <atomic>
++#include <cstdio>
 +#include <fstream>
 +#include <iterator>
 +#include <unistd.h>
@@ -137,14 +141,34 @@ index 3099676..e7c6c2e 100644
 +	char uuid[VK_UUID_SIZE * 2 + 1];
 +	auto& dvcProps = _physicalDevice->_properties;
 +	for (size_t i = 0; i < VK_UUID_SIZE; i++) { snprintf(uuid + i * 2, 3, "%02x", dvcProps.pipelineCacheUUID[i]); }
-+	std::string path = dir + "/moltenvk-" + uuid + "-" + std::to_string(++deviceIndex) + ".bin";
++	// The file name carries this patch's own format tag: the pipelineCacheUUID does not change when the serialized
++	// layout does. Files of other tags in the folder are stale and removed.
++	static const char* hbCacheFormat = "hb2";
++	std::string tag = std::string("moltenvk-") + uuid + "-" + hbCacheFormat + "-";
++	std::string path = dir + "/" + tag + std::to_string(++deviceIndex) + ".bin";
++	for (NSString* name in [[NSFileManager defaultManager] contentsOfDirectoryAtPath: [NSString stringWithUTF8String: dir.c_str()] error: nil]) {
++		std::string n = name.UTF8String;
++		if (n.rfind("moltenvk-", 0) == 0 && n.find("-" + std::string(hbCacheFormat) + "-") == std::string::npos) {
++			[[NSFileManager defaultManager] removeItemAtPath: [NSString stringWithUTF8String: (dir + "/" + n).c_str()] error: nil];
++		}
++	}
 +	std::vector<char> data;
 +	{
 +		std::ifstream in(path, std::ios::binary);
 +		if (in) { data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()); }
 +	}
 +	VkPipelineCacheCreateInfo info = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, data.size(), data.data() };
-+	_implicitPipelineCache = new MVKPipelineCache(this, &info);
++	// Whatever a damaged file throws while it is read, the device starts with an empty cache and the file goes.
++	try {
++		_implicitPipelineCache = new MVKPipelineCache(this, &info);
++	} catch (...) {
++		MVKLogInfo("Highball: implicit pipeline cache %s unreadable, removed.", path.c_str());
++		std::remove(path.c_str());
++		data.clear();
++		info.initialDataSize = 0;
++		info.pInitialData = nullptr;
++		_implicitPipelineCache = new MVKPipelineCache(this, &info);
++	}
 +	_implicitPipelineCachePath = path;
 +	_implicitPipelineCacheWritten = _implicitPipelineCache->hbGeneration();
 +	MVKLogInfo("Highball: implicit pipeline cache %s, %lu bytes read.", path.c_str(), (unsigned long)data.size());
