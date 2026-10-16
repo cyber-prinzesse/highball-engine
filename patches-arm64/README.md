@@ -174,3 +174,12 @@ with it (MoltenVK and the Vulkan headers from Homebrew).
   cache folder (highball/<program>/com.apple.metal under the user's cache folder, as DXMT does per game) in
   macdrv_init, before the Cocoa side creates the first Metal device, after which Metal keeps its default folder, the
   loader's, shared by every program the engine runs. HB_METAL_SHADER_CACHE names another folder, 0 keeps the default.
+- `0040-mfmediaengine-events-from-a-work-queue-thread-never-under-the-engine-lock.patch`: Wine's media engine called
+  the application's IMFMediaEngineNotify::EventNotify with its own lock held (on the caller's thread in Play, Pause,
+  SetSource and the setters, on the MF work-queue thread for the session events), so an application whose callback
+  takes a lock of its own, while another of its threads holds that lock and calls any engine method, deadlocked:
+  Microsoft Flight Simulator 2024's main and intro-video threads on the M4 (2026-10-16), a black screen for good.
+  Events now queue in order and are delivered by one dispatcher work item on the multithreaded queue with no engine
+  lock held; Shutdown drains them. `tests/mfmediaengine/mfdeadlock.c` reproduces the deadlock (DEADLOCK on the engine
+  as shipped, OK with the patch). The code is platform-independent and belongs in `patches/` for the Intel line's next
+  Wine 11 revision too.
