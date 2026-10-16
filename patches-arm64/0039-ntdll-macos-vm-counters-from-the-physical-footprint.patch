@@ -1,0 +1,37 @@
+ntdll: a process's memory counters on macOS from the task's physical footprint, not its virtual size.
+
+fill_vm_counters reported the Mach task's virtual size as PagefileUsage (and resident plus virtual as
+VirtualSize), which kernelbase hands out as PrivateUsage too. The virtual size counts every reservation of the
+host process, and the x86-64 emulator reserves its guest address space and lookup tables in the hundreds of GB:
+a 17 MB probe under the arm64 engine reported 463,651 MB of page file usage with a 17 MB working set. A program
+that budgets on that figure starves itself: Microsoft Flight Simulator 2024's own session trace recorded
+639,388,984 KiB "in use" on a 32 GB Mac, kept 102 MB of textures on the GPU and scaled its terrain level of
+detail to a quarter (terrainLodMilli 251), which is the coarse Free Flight map and menu globe that no graphics
+setting changed. Windows reports the private commit; the task's physical footprint (TASK_VM_INFO) is the
+closest figure macOS keeps, so PagefileUsage, PeakPagefileUsage and VirtualSize come from it now (the probe:
+16 MB, 16 MB, 34 MB). Found on the M4 on 2026-10-16 (private/notes/msfs-2024-arm64-boot-2026-10-15.md).
+diff --git a/dlls/ntdll/unix/process.c b/dlls/ntdll/unix/process.c
+index 9dad6c3..b1cfc44 100644
+--- a/dlls/ntdll/unix/process.c
++++ b/dlls/ntdll/unix/process.c
+@@ -999,8 +999,18 @@ void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid )
+     infoCount = MACH_TASK_BASIC_INFO_COUNT;
+     if(task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &infoCount) == KERN_SUCCESS)
+     {
+-        pvmi->VirtualSize = info.resident_size + info.virtual_size;
+-        pvmi->PagefileUsage = info.virtual_size;
++        /* The Mach virtual size counts every reservation of the host process, which an emulator of another
++         * architecture makes in the hundreds of GB; a program that budgets on PagefileUsage then starves itself.
++         * Windows reports the private commit, which the task's physical footprint approximates best. */
++        task_vm_info_data_t vm_info;
++        mach_msg_type_number_t vmCount = TASK_VM_INFO_COUNT;
++        ULONG64 footprint = info.resident_size;
++        if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm_info, &vmCount) == KERN_SUCCESS && vm_info.phys_footprint)
++            footprint = vm_info.phys_footprint;
++        pvmi->VirtualSize = footprint + info.resident_size;
++        pvmi->PeakVirtualSize = pvmi->VirtualSize;
++        pvmi->PagefileUsage = footprint;
++        pvmi->PeakPagefileUsage = footprint;
+         pvmi->WorkingSetSize = info.resident_size;
+         pvmi->PeakWorkingSetSize = info.resident_size_max;
+     }
