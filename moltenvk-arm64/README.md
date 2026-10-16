@@ -64,6 +64,10 @@ file for file, the MoltenVK tree of the gin19g build that the Microsoft Flight S
   bytes) while the pool holds what the app asked for, and a descriptor index past the pool's end reads an unmapped
   page on Metal, a GPU page fault the device recovers from (Microsoft Flight Simulator 2024 at the end of its loading
   screens, every start; a PC's mapped heap memory absorbs the same read). HB_MVK_POOL_GUARD=0 turns it off.
+- `0014` a copy from a compressed image to an uncompressed one keeps every partial edge block (the extent divided by
+  the block size rounds up): a 5x5 BC7 region reached a 1x1 destination instead of 2x2. Proven with a standalone
+  probe on 2026-10-13 (5 of 8 cases wrong before, 8 of 8 right after); the game compresses its tiles on the GPU
+  through such views, with borders that make their sizes odd.
 
 ## SPIRV-Cross (6c09849, MoltenVK 1.4.2's pin)
 
