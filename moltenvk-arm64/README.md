@@ -59,6 +59,25 @@ file for file, the MoltenVK tree of the gin19g build that the Microsoft Flight S
   cache data compile their MSL on first use. The SPIR-V to MSL conversions of one start serve the next (Microsoft
   Flight Simulator 2024: about 11,000 at 100 to 140 ms each, the critical path of its 7 to 8 minute shader
   preparation). HB_MVK_PIPELINE_CACHE names another folder, 0 disables.
+- `0013` an update-after-bind descriptor pool (a D3D12 bindless heap under vkd3d-proton) gets 8 MiB + 64 KiB of guard
+  room after its GPU buffer: the shaders declare the descriptor arrays at the layout maximum (1,000,003 entries of 8
+  bytes) while the pool holds what the app asked for, and a descriptor index past the pool's end reads an unmapped
+  page on Metal, a GPU page fault the device recovers from (Microsoft Flight Simulator 2024 at the end of its loading
+  screens, every start; a PC's mapped heap memory absorbs the same read). HB_MVK_POOL_GUARD=0 turns it off.
+- `0014` a copy from a compressed image to an uncompressed one keeps every partial edge block (the extent divided by
+  the block size rounds up): a 5x5 BC7 region reached a 1x1 destination instead of 2x2. Proven with a standalone
+  probe on 2026-10-13 (5 of 8 cases wrong before, 8 of 8 right after); the game compresses its tiles on the GPU
+  through such views, with borders that make their sizes odd.
+- `0015` pipeline variants against the live render pass. D3D12 lets a pipeline carry more colour targets than
+  the pass binds, draw without a depth format into a depth buffer, use a colour format other than the target's
+  and draw any primitive class under dynamic topology; Metal calls each undefined, and Microsoft Flight
+  Simulator 2024 does them dozens of times a second (Metal API validation, M4, 2026-10-16). A graphics pipeline
+  keeps its Metal descriptor and, when the pass's attachment formats or the drawn primitive class differ from the
+  descriptor's, rebuilds its state against them once per shape, cached (HB_MVK_PASS_VARIANTS=0 turns it off).
+  The declared primitive class stays: Metal refuses a pipeline whose vertex shader writes the layer index without
+  one (a first form that left it unspecified lost 114,039 pipelines a flight and ran at 11 fps; a second that
+  dropped the descriptor after a matching first bind missed the pipelines that switch targets). useResource skips
+  a nil resource.
 
 ## SPIRV-Cross (6c09849, MoltenVK 1.4.2's pin)
 
