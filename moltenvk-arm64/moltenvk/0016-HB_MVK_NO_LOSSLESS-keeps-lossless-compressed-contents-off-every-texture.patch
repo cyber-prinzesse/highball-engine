@@ -1,0 +1,50 @@
+HB_MVK_NO_LOSSLESS keeps lossless-compressed contents off textures: =1 every texture, =large the large plain ones.
+
+Metal gives private textures GPU-optimised (lossless-compressed) contents by default. Microsoft Flight Simulator
+2024 on an M4 stops the GPU a few times a flight ("Caused GPU Hang Error (kIOGPUCommandBufferCallbackErrorHang)",
+the device resumed, a one to two second freeze each): with MTLCommandBufferErrorOptionEncoderExecutionStatus the
+one FAULTED encoder is a blit encoder whose command buffer holds exactly a buffer-to-image copy into a 3840x2160
+BGRA8 private compressed image and an image-to-image copy of a 3840x2160 BGRA8 image, both of which the game
+records every frame; the G-buffer passes in the other failed buffers are only "affected" by the reset. With
+HB_MVK_NO_LOSSLESS=1 the same route flew with 0 hangs and the best frame times of the day at no frame-rate cost,
+but two of three boots with it then crashed in their loading, and the engine's patch 0010 places heap-placed
+block-compressed textures by a layout measured with optimised contents on, so =large keeps the switch to the 2D
+8-bit colour textures of 2048x2048 texels or more (the hanging image's class) and leaves block-compressed
+textures as they were. The condition uses static image properties only: the descriptor is built once for the
+memory requirements before any memory is bound and again at creation, and a test on the binding sized placed
+render targets for one layout and created them with the other (a black world). Off by default; a game's db row sets it. Measured on
+the M4 on 2026-10-16 and 17 (private/notes/msfs-2024-arm64-boot-2026-10-15.md).
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+index ad07eb2..c01f30f 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKImage.mm
+@@ -195,8 +195,24 @@ static uint32_t mvkGetMTLTextureIOSurfaceID(id<MTLTexture> tex) {
+     // sides are not ordered, and a read racing a write of a compressed texture showed whole tiles of garbage (magenta
+     // blocks in Microsoft Flight Simulator 2024's videos, written through D3D11 and read through D3D12).
+     bool isShared = _image->getMemoryBinding(_planeIndex)->_externalMemoryHandleTypes != 0;
++    // Highball no-lossless: HB_MVK_NO_LOSSLESS=1 keeps GPU-optimised (lossless-compressed) contents off every texture;
++    // HB_MVK_NO_LOSSLESS=large off the 2D 8-bit colour textures of 2048x2048 texels or more (a game whose per-frame
++    // buffer-to-image uploads into such an image stop the GPU in the blit, Microsoft Flight Simulator 2024 on an M4,
++    // runs clean with it; block-compressed textures keep their layout).
++    static const char* hbNL = getenv("HB_MVK_NO_LOSSLESS");
++    static const bool hbNoLosslessAll = hbNL && hbNL[0] == '1';
++    static const bool hbNoLosslessLarge = hbNL && hbNL[0] == 'l';
++    bool hbNoLossless = hbNoLosslessAll;
++    if (hbNoLosslessLarge && !hbNoLossless) {
++        // static properties only: this descriptor is built once for the memory requirements, before any memory is
++        // bound, and again at creation, and the two must agree (a binding-dependent test sized the texture for one
++        // layout and created it with the other: a black world)
++        MVKFormatType hbFT = _image->getPixelFormats()->getFormatType(_mtlPixFmt);
++        if ((hbFT == kMVKFormatColorUInt8 || hbFT == kMVKFormatColorInt8) && _image->_mtlTextureType == MTLTextureType2D &&
++            (uint64_t)extent.width * extent.height >= 2048ull * 2048ull) { hbNoLossless = true; }
++    }
+     mtlTexDesc.allowGPUOptimizedContents = !_image->_is2DViewOn3DImageCompatible && !_image->_isBlockTexelViewCompatible &&
+-                                           !_image->_isSlicedViewOf3DCompatible && !isShared;
++                                           !_image->_isSlicedViewOf3DCompatible && !isShared && !hbNoLossless;
+ 
+     return mtlTexDesc;
+ }
+-- 
+2.54.0 (Apple Git-157)
+
