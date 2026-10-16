@@ -59,8 +59,8 @@ file for file, the MoltenVK tree of the gin19g build that the Microsoft Flight S
   cache data compile their MSL on first use. The SPIR-V to MSL conversions of one start serve the next (Microsoft
   Flight Simulator 2024: about 11,000 at 100 to 140 ms each, the critical path of its 7 to 8 minute shader
   preparation). HB_MVK_PIPELINE_CACHE names another folder, 0 disables.
-- `0013` an update-after-bind descriptor pool (a D3D12 bindless heap under vkd3d-proton) gets guard room after its GPU buffer,
-  four times its size between 64 KiB and 8 MiB + 64 KiB: the shaders declare the descriptor arrays at the layout maximum (1,000,003 entries of 8
+- `0013` an update-after-bind descriptor pool (a D3D12 bindless heap under vkd3d-proton) gets 8 MiB + 64 KiB of guard
+  room after its GPU buffer: the shaders declare the descriptor arrays at the layout maximum (1,000,003 entries of 8
   bytes) while the pool holds what the app asked for, and a descriptor index past the pool's end reads an unmapped
   page on Metal, a GPU page fault the device recovers from (Microsoft Flight Simulator 2024 at the end of its loading
   screens, every start; a PC's mapped heap memory absorbs the same read). HB_MVK_POOL_GUARD=0 turns it off.
