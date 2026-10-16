@@ -1,0 +1,172 @@
+Pipeline variants against the live render pass.
+
+D3D12 lets a pipeline carry more colour targets than the pass binds (writes to unbound targets are discarded), a
+pipeline without a depth format draw with a depth buffer bound (the buffer is ignored), a pipeline's colour format
+differ from the target's, and a triangle pipeline draw lines or points under dynamic topology; Metal's validation
+calls each undefined, vkd3d-proton emits them all for Microsoft Flight Simulator 2024, and Apple GPUs hang on some.
+At bind time the graphics pipeline compares its Metal descriptor with the live subpass (colour slots, depth,
+stencil) and the drawn primitive class and, when they differ, builds and caches a variant of its pipeline state
+against the pass's formats and the drawn class (a colour slot the pass lacks becomes Invalid with blending off, a
+slot whose format differs takes the pass's format, depth and stencil take the pass's, the class the draw's); the
+base state stays when a variant fails to build (logged). The descriptor copy a variant needs is kept for the
+pipeline's life: a form that released it at the first bind whose pass matched lost the variants for exactly the
+pipelines that switch targets (a fullscreen pipeline first drawn on an RGBA16F pass, then on the RGBA8 swapchain
+pass with depth). HB_MVK_PASS_VARIANTS=0 makes no copy and no variants. The declared primitive class stays as
+MoltenVK sets it: Metal refuses a pipeline whose vertex shader writes the layer index without one (an earlier form
+left it unspecified and lost 114,039 pipelines a flight). useResource skips a nil resource. Measured on the M4 on
+2026-10-16 (private/notes/msfs-2024-arm64-boot-2026-10-15.md).
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+index 92aa734..1f41f1b 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandEncoderState.mm
+@@ -50,10 +50,12 @@ static MTLRenderStages getMTLStages(MVKResourceUsageStages stages) {
+ }
+ 
+ static void useResourceGraphics(id<MTLCommandEncoder> encoder, id<MTLResource> resource, MTLResourceUsage usage, MVKResourceUsageStages stages) {
++	if ( !resource ) { return; }	// Highball: a null descriptor's resource
+ 	[static_cast<id<MTLRenderCommandEncoder>>(encoder) useResource:resource usage:usage stages:getMTLStages(stages)];
+ }
+ 
+ static void useResourceCompute(id<MTLCommandEncoder> encoder, id<MTLResource> resource, MTLResourceUsage usage, MVKResourceUsageStages stages) {
++	if ( !resource ) { return; }	// Highball: a null descriptor's resource
+ 	[static_cast<id<MTLComputeCommandEncoder>>(encoder) useResource:resource usage:usage];
+ }
+ 
+@@ -1434,8 +1436,10 @@ static bool shouldEmulateReversedDepthViewport(const MVKPhysicalDevice* physical
+ 		const MVKRenderSubpass* subpass = mvkEncoder.getSubpass();
+ 		if (subpass->isMultiview() && !pipeline->isTessellationPipeline()) {
+ 			mtlPipeline = pipeline->getMultiviewPipelineState(subpass->getViewCountInMetalPass(mvkEncoder.getMultiviewPassIndex()));
+-		} else {
++		} else if (pipeline->isTessellationPipeline()) {
+ 			mtlPipeline = pipeline->getMainPipelineState();
++		} else {
++			mtlPipeline = pipeline->hbPipelineStateForPass(&mvkEncoder, vk._renderState.primitiveType);	// Highball pass variants
+ 		}
+ 		if (mtlPipeline != _pipeline) {
+ 			_pipeline = mtlPipeline;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index 62ae193..f81e752 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -256,6 +256,10 @@ public:
+ 	/** Returns the MTLRenderPipelineState for the final stage of the pipeline */
+ 	id<MTLRenderPipelineState> getMainPipelineState() const { return _mtlPipelineState; }
+ 
++	// Highball pass variants (mvk_pass_variants.py): the Metal pipeline state matching the live render pass's attachment
++	// formats, the main state when they match, a cached variant otherwise
++	id<MTLRenderPipelineState> hbPipelineStateForPass(MVKCommandEncoder* cmdEncoder, uint8_t dynPrimitiveType);
++
+ 	/** Returns the MTLRenderPipelineState for the final stage of the pipeline */
+ 	id<MTLRenderPipelineState> getMultiviewPipelineState(uint32_t mv) const {
+ 		return _multiviewMTLPipelineStates.empty() ? _mtlPipelineState : _multiviewMTLPipelineStates.find(mv)->second;
+@@ -393,6 +397,9 @@ protected:
+ 	id<MTLComputePipelineState> _mtlTessVertexStageIndex32State = nil;
+ 	id<MTLComputePipelineState> _mtlTessControlStageState = nil;
+ 	id<MTLRenderPipelineState> _mtlPipelineState = nil;
++	MTLRenderPipelineDescriptor* _hbPLDesc = nil;	// Highball pass variants: a retained copy of the main descriptor
++	std::unordered_map<uint64_t, id<MTLRenderPipelineState>> _hbVariants;	// Highball pass variants: by pass shape (nil = failed)
++	std::mutex _hbVariantsLock;
+ 
+ 	MVKShaderImplicitRezBinding _reservedVertexAttributeBufferCount;
+ 	VkPrimitiveTopology _vkPrimitiveTopology;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 446d560..83de6db 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -995,6 +995,72 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ }
+ 
+ // Either returns an existing pipeline state or compiles a new one.
++// Highball pass variants (mvk_pass_variants.py). D3D12 lets a pipeline carry more colour targets than the pass binds
++// (writes to unbound targets are discarded), a depth-less pipeline draw with a depth buffer bound (ignored), and a
++// pipeline's colour format differ from the target's; Metal's validation calls each undefined and Apple GPUs hang on
++// them. The Metal pipeline state is rebuilt against the live pass's formats, once per distinct pass shape, and cached.
++static bool hbPassVariantsOn() { static const bool on = getenv("HB_MVK_PASS_VARIANTS") == nullptr || getenv("HB_MVK_PASS_VARIANTS")[0] != '0'; return on; }
++
++id<MTLRenderPipelineState> MVKGraphicsPipeline::hbPipelineStateForPass(MVKCommandEncoder* cmdEncoder, uint8_t dynPrimitiveType) {
++	if ( !hbPassVariantsOn() || !_mtlPipelineState ) { return _mtlPipelineState; }
++	MVKRenderSubpass* sp = cmdEncoder->getSubpass();
++	if ( !sp ) { return _mtlPipelineState; }
++	if ( !_hbPLDesc ) { return _mtlPipelineState; }
++	std::lock_guard<std::mutex> l(_hbVariantsLock);	// held throughout, one variant build at a time per pipeline
++	MVKPixelFormats* pixFmts = getPixelFormats();
++	MTLPixelFormat passClr[8];
++	const uint32_t caCnt = std::min<uint32_t>(sp->getColorAttachmentCount(), 8);
++	for (uint32_t i = 0; i < 8; i++) { passClr[i] = i < caCnt ? pixFmts->getMTLPixelFormat(sp->getColorAttachmentFormat(i)) : MTLPixelFormatInvalid; }
++	const MTLPixelFormat dFmt = pixFmts->getMTLPixelFormat(sp->getDepthFormat());
++	const MTLPixelFormat sFmt = pixFmts->getMTLPixelFormat(sp->getStencilFormat());
++	const MTLPixelFormat passDepth = pixFmts->isDepthFormat(dFmt) ? dFmt : (pixFmts->isDepthFormat(sFmt) ? sFmt : MTLPixelFormatInvalid);
++	const MTLPixelFormat passStencil = pixFmts->isStencilFormat(sFmt) ? sFmt : (pixFmts->isStencilFormat(dFmt) ? dFmt : MTLPixelFormatInvalid);
++	bool same = (_hbPLDesc.depthAttachmentPixelFormat == passDepth) && (_hbPLDesc.stencilAttachmentPixelFormat == passStencil);
++	for (uint32_t i = 0; i < 8 && same; i++) {
++		const MTLPixelFormat pf = _hbPLDesc.colorAttachments[i].pixelFormat;
++		// a pass attachment the pipeline does not write is fine; everything else needs the variant
++		if (pf != passClr[i] && !(pf == MTLPixelFormatInvalid && passClr[i] != MTLPixelFormatInvalid)) { same = false; }
++	}
++	// the primitive class: a triangle pipeline drawing lines or points under dynamic topology (or the reverse) gets a
++	// variant declaring the drawn class; a Point class stays (MoltenVK's polygon-mode-point form) and so does none
++	const uint8_t prim = _dynamicStateFlags.has(MVKRenderStateFlag::PrimitiveTopology) ? dynPrimitiveType : getStaticStateData().primitiveType;
++	const MTLPrimitiveTopologyClass drawnClass = (prim == MTLPrimitiveTypePoint) ? MTLPrimitiveTopologyClassPoint
++		: (prim == MTLPrimitiveTypeLine || prim == MTLPrimitiveTypeLineStrip) ? MTLPrimitiveTopologyClassLine : MTLPrimitiveTopologyClassTriangle;
++	const MTLPrimitiveTopologyClass plClass = _hbPLDesc.inputPrimitiveTopology;
++	const bool classDiff = plClass != MTLPrimitiveTopologyClassUnspecified && plClass != MTLPrimitiveTopologyClassPoint && plClass != drawnClass;
++	if (same && !classDiff) { return _mtlPipelineState; }
++	uint64_t key = ((uint64_t)passDepth << 48) ^ ((uint64_t)passStencil << 40) ^ ((uint64_t)(classDiff ? drawnClass : 0) << 36);
++	for (uint32_t i = 0; i < 8; i++) { key = (key * 1099511628211ull) ^ (uint64_t)passClr[i]; }
++	{
++		auto it = _hbVariants.find(key);
++		if (it != _hbVariants.end()) { return it->second ? it->second : _mtlPipelineState; }
++	}
++	MTLRenderPipelineDescriptor* desc = [_hbPLDesc copy];
++	std::string what;
++	for (uint32_t i = 0; i < 8; i++) {
++		MTLRenderPipelineColorAttachmentDescriptor* ca = desc.colorAttachments[i];
++		if (ca.pixelFormat == passClr[i]) { continue; }
++		if (passClr[i] == MTLPixelFormatInvalid) {
++			if (ca.pixelFormat != MTLPixelFormatInvalid) { what += " c" + std::to_string(i) + "->none"; ca.pixelFormat = MTLPixelFormatInvalid; ca.blendingEnabled = NO; }
++		} else if (ca.pixelFormat != MTLPixelFormatInvalid) {
++			what += " c" + std::to_string(i) + ":" + std::to_string((unsigned long)ca.pixelFormat) + "->" + std::to_string((unsigned long)passClr[i]);
++			ca.pixelFormat = passClr[i];
++			if (ca.blendingEnabled && !(pixFmts->getCapabilities(passClr[i]) & kMVKMTLFmtCapsBlend)) { ca.blendingEnabled = NO; }
++		}
++	}
++	if (desc.depthAttachmentPixelFormat != passDepth) { what += " d:" + std::to_string((unsigned long)desc.depthAttachmentPixelFormat) + "->" + std::to_string((unsigned long)passDepth); desc.depthAttachmentPixelFormat = passDepth; }
++	if (desc.stencilAttachmentPixelFormat != passStencil) { what += " s:" + std::to_string((unsigned long)desc.stencilAttachmentPixelFormat) + "->" + std::to_string((unsigned long)passStencil); desc.stencilAttachmentPixelFormat = passStencil; }
++	if (classDiff) { what += " class:" + std::to_string((unsigned long)plClass) + "->" + std::to_string((unsigned long)drawnClass); desc.inputPrimitiveTopology = drawnClass; }
++	MVKRenderPipelineCompiler* plc = new MVKRenderPipelineCompiler(this);
++	id<MTLRenderPipelineState> state = plc->newMTLRenderPipelineState(desc);	// retained; the compiler logs a failure
++	plc->destroy();
++	[desc release];
++	static std::atomic<int> logged {0};
++	if (logged.fetch_add(1) < 60) { fprintf(stderr, "[hb-pass-variant] pipeline %p%s: %s\n", this, what.c_str(), state ? "built" : "FAILED, base kept"); }
++	_hbVariants[key] = state;
++	return state ? state : _mtlPipelineState;
++}
++
+ id<MTLRenderPipelineState> MVKGraphicsPipeline::getOrCompilePipeline(MTLRenderPipelineDescriptor* plDesc,
+ 																	 id<MTLRenderPipelineState>& plState) {
+ 	if ( !plState ) {
+@@ -1128,6 +1194,10 @@ static bool usesConstantColor(MVKRenderStateFlags dynamic, const VkPipelineColor
+ 			} else {
+ 				getOrCompilePipeline(plDesc, _mtlPipelineState);
+ 			}
++			{	// Highball pass variants: the descriptor is kept for variants against other pass shapes and primitive classes
++				static const bool hbOn = getenv("HB_MVK_PASS_VARIANTS") == nullptr || getenv("HB_MVK_PASS_VARIANTS")[0] != '0';
++				_hbPLDesc = (hbOn && !_isTessellationPipeline) ? [plDesc copy] : nil;
++			}
+ 			[plDesc release];																				// temp release
+ 		} else {
+ 			_hasValidMTLPipelineStates = false;
+@@ -2406,6 +2476,8 @@ static void setEmulatedReversedDepthViewportConfig(SPIRVToMSLConversionConfigura
+ 		[_mtlTessVertexStageIndex32State release];
+ 		[_mtlTessControlStageState release];
+ 		[_mtlPipelineState release];
++		for (auto& kv : _hbVariants) { [kv.second release]; }	// Highball pass variants
++		[_hbPLDesc release];
+ 		if (_ownsVertexModule) delete _vertexModule;
+ 		if (_ownsTessCtlModule) delete _tessCtlModule;
+ 		if (_ownsTessEvalModule) delete _tessEvalModule;
+-- 
+2.54.0 (Apple Git-157)
+
