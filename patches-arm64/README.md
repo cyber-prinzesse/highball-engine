@@ -174,6 +174,12 @@ with it (MoltenVK and the Vulkan headers from Homebrew).
   cache folder (highball/<program>/com.apple.metal under the user's cache folder, as DXMT does per game) in
   macdrv_init, before the Cocoa side creates the first Metal device, after which Metal keeps its default folder, the
   loader's, shared by every program the engine runs. HB_METAL_SHADER_CACHE names another folder, 0 keeps the default.
+- `0039` ntdll: a process's memory counters on macOS from the task's physical footprint. The Mach virtual size,
+  which the emulator's reservations push past 450 GB, was reported as PagefileUsage (PrivateUsage) and
+  VirtualSize; Microsoft Flight Simulator 2024 budgeted on it, kept 102 MB of textures and cut its terrain
+  level of detail to a quarter (its own trace: memoryKiB 639,388,984, terrainLodMilli 251), the coarse Free
+  Flight map and menu globe. A 17 MB probe reports 16 MB of page file usage now instead of 463,651 MB (M4,
+  2026-10-16).
 - `0040-mfmediaengine-events-from-a-work-queue-thread-never-under-the-engine-lock.patch`: Wine's media engine called
   the application's IMFMediaEngineNotify::EventNotify with its own lock held (on the caller's thread in Play, Pause,
   SetSource and the setters, on the MF work-queue thread for the session events), so an application whose callback
