@@ -78,6 +78,12 @@ file for file, the MoltenVK tree of the gin19g build that the Microsoft Flight S
   one (a first form that left it unspecified lost 114,039 pipelines a flight and ran at 11 fps; a second that
   dropped the descriptor after a matching first bind missed the pipelines that switch targets). useResource skips
   a nil resource.
+- `0016` HB_MVK_NO_LOSSLESS keeps lossless-compressed (GPU-optimised) contents off textures: `1` every texture,
+  `large` the 2D 8-bit colour textures of 2048x2048 texels or more (static properties only). Microsoft
+  Flight Simulator 2024's in-flight GPU hangs on an M4 originate in a blit encoder copying a 3840x2160 BGRA8
+  private compressed image the game uploads from a buffer and copies every frame (the one FAULTED encoder under
+  MTLCommandBufferErrorOptionEncoderExecutionStatus); with the switch the same route flew with 0 hangs at no
+  frame-rate cost (2026-10-16). Off by default; the game's db row sets it.
 
 ## SPIRV-Cross (6c09849, MoltenVK 1.4.2's pin)
 
