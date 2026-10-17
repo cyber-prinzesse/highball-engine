@@ -68,7 +68,13 @@ from source with the series in [`fex/patches/`](fex/patches/) by default, or Han
 dispatched with `fex_build: hangover`, either with a Darwin build of FEX's Unix helper from
 [`fex/`](fex/)), and the series in [`patches-arm64/`](patches-arm64/). It runs only through Highball's signed Wine loader, the helper
 bundle inside Highball.app that carries Apple's cross-architecture entitlement; the loader in the
-tarball is for development. Measured on an M4 under macOS 27: a prefix boots in 2.4 s with both
+tarball is for development. Outside the app (a test harness, a hand-made install) an engine
+tarball needs three things beside it before an x86-64 game starts: `engine/bin/wine` pointed at the
+signed loader (the tarball's own is ad-hoc signed and cannot run x86-64 code), the renderers
+release unpacked or linked as `renderers/` (the tarball ships that folder empty; the manifest names
+the release), and a copy of `engine/lib/libMoltenVK.dylib` wherever the harness expects one. Every
+host library in `engine/lib` must load on its own: the build now follows `@rpath` dependencies and
+fails if one does not (the first r3 release shipped a FreeType whose brotli dependency was missing). Measured on an M4 under macOS 27: a prefix boots in 2.4 s with both
 halves populated, and 32-bit and 64-bit x86 programs run within 20 percent of Rosetta on a compute
 loop. The build ships the host libraries Wine opens by name (MoltenVK, FreeType, GnuTLS, SDL) in
 `lib/`, and games' videos play through Media Foundation with GStreamer, the official macOS framework
