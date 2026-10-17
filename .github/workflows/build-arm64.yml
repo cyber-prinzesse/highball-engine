@@ -223,9 +223,24 @@ jobs:
           prefix = subprocess.run(["brew", "--prefix"], capture_output=True, text=True).stdout.strip()
           roots = [os.path.join(prefix, "lib", n) for n in names] + [os.path.join(prefix, "lib", "libSDL3.0.dylib")]
           dest = "out/engine/lib"
+          # A dependency is a Homebrew path or an @rpath/ name (brotli's libbrotlidec links
+          # @rpath/libbrotlicommon, resolved beside it or in Homebrew's lib): both are shipped and
+          # rewritten to @loader_path; one that resolves nowhere fails the build.
           def deps(f):
               out = subprocess.run(["otool", "-L", f], capture_output=True, text=True).stdout.splitlines()[1:]
-              return [l.split()[0] for l in out if l.split()[0].startswith(("/opt/homebrew", "/usr/local"))]
+              res = []
+              for l in out:
+                  ref = l.split()[0]
+                  if ref.startswith(("/opt/homebrew", "/usr/local")):
+                      res.append((ref, ref))
+                  elif ref.startswith("@rpath/"):
+                      leaf = ref[len("@rpath/"):]
+                      here = os.path.join(os.path.dirname(os.path.realpath(f)), leaf)
+                      brew = os.path.join(prefix, "lib", leaf)
+                      path = here if os.path.exists(here) else brew
+                      assert os.path.exists(path), "unresolved @rpath dependency %s of %s" % (ref, f)
+                      res.append((ref, path))
+              return res
           todo, seen = list(roots), {}
           while todo:
               f = todo.pop()
@@ -233,16 +248,19 @@ jobs:
               leaf = os.path.basename(f)
               if leaf in seen: continue
               seen[leaf] = real
-              todo += deps(real)
+              todo += [path for ref, path in deps(real)]
           for leaf, real in seen.items():
               d = os.path.join(dest, leaf)
               shutil.copy2(real, d); os.chmod(d, 0o755)
               subprocess.run(["install_name_tool", "-id", "@loader_path/" + leaf, d], check=True, stderr=subprocess.DEVNULL)
-              for dep in deps(real):
-                  subprocess.run(["install_name_tool", "-change", dep, "@loader_path/" + os.path.basename(dep), d], check=True, stderr=subprocess.DEVNULL)
+              for ref, path in deps(real):
+                  subprocess.run(["install_name_tool", "-change", ref, "@loader_path/" + os.path.basename(path), d], check=True, stderr=subprocess.DEVNULL)
               subprocess.run(["codesign", "-f", "-s", "-", d], check=True, stderr=subprocess.DEVNULL)
-          left = [l for leaf in seen for l in deps(os.path.join(dest, leaf))]
+          left = [ref for leaf in seen for ref, path in deps(os.path.join(dest, leaf))]
           assert not left, left
+          for leaf in seen:
+              r = subprocess.run(["python3", "-c", "import ctypes,sys; ctypes.CDLL(sys.argv[1])", os.path.join(dest, leaf)], capture_output=True, text=True)
+              assert r.returncode == 0, "engine/lib/%s does not load: %s" % (leaf, r.stderr.strip()[-300:])
           print("host libraries in engine/lib:", sorted(seen))
           PY
           # winegstreamer.so looks for GStreamer at @loader_path/../../GStreamer.framework/Versions/1.0/lib,
