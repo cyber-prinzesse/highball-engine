@@ -105,6 +105,11 @@ them. That is the default since 2026-10-11. Dispatched with `fex_build: hangover
   `patches-arm64/0042` stops); either one alone flew. Diagnosis switches for the search: `HB_FEX_SMC_REINSTATE=0`
   (retire, never reinstate), `=2` (reinstate only where no page protection changes), `HB_FEX_SMC_SAME=0` (write
   stores that change nothing), `HB_FEX_SMC_VERIFY=1` (read every replayed store back).
+- `0022` exports `GuestProtection`, which Wine's ntdll (`patches-arm64/0043`) asks for the protection a program set
+  on a page: FEX makes read-write-execute pages that hold translated code read-execute so writes fault into its SMC
+  tracking, and the program saw that (VirtualQuery and VirtualProtect's old protection read 0x20 for a page it made
+  0x40). A program that saved a page's protection, changed it and restored the saved value locked its own page and
+  faulted on its next write (`smcprot.exe`, 100 of 100). Copy protections guard their pages this way.
 
 32-bit programs were measured with the engine built by CI (it has the i386 half): x87test32 120/128,
 the same eight x87 gaps as the 64-bit build; the string resume and the code patching probe pass.
