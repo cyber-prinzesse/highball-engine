@@ -84,6 +84,13 @@ file for file, the MoltenVK tree of the gin19g build that the Microsoft Flight S
   private compressed image the game uploads from a buffer and copies every frame (the one FAULTED encoder under
   MTLCommandBufferErrorOptionEncoderExecutionStatus); with the switch the same route flew with 0 hangs at no
   frame-rate cost (2026-10-16). Off by default; the game's db row sets it.
+- `0017` `HB_MVK_LOOP_CAP=<n>` bounds every loop of the vertex, tessellation and fragment shaders at n iterations
+  (SPIRV-Cross `0005`). Microsoft Flight Simulator 2024's terrain fragment shader scans a bindless table
+  "while (entry == 0)" with no bound of its own; when it reads zeros it spins until Metal's watchdog kills the
+  G-buffer pass ("Caused GPU Hang Error", a half-second freeze in flight), about once per 13,000 frames on the
+  game's start screen on an M4. Capped, such a fragment ends with wrong pixels for one frame instead. Compute
+  kernels are never capped. The cap is the last four bytes of the pipeline cache UUID, so patch 0012's disk cache
+  never reuses MSL made under another cap. Off unless set.
 
 ## SPIRV-Cross (6c09849, MoltenVK 1.4.2's pin)
 
@@ -97,3 +104,6 @@ file for file, the MoltenVK tree of the gin19g build that the Microsoft Flight S
 - `0004` `Options::texture_2D_as_2D_array` declares non-multisampled 2D textures as 2D arrays and reads layer 0, the
   same shape as `texture_1D_as_2D`, for D3D12 shaders that read a Texture2DArray descriptor through a Texture2D
   declaration (the game's compute passes).
+- `0005` `Options::hb_loop_iteration_cap`: when non-zero, every loop gets a counter declared before it and
+  `if (++counter > n) break;` as the first statement of its body, in all of CompilerGLSL's loop forms (for, while,
+  do-while, the generic `for (;;)`). MoltenVK sets it from `HB_MVK_LOOP_CAP` (its `0017`).

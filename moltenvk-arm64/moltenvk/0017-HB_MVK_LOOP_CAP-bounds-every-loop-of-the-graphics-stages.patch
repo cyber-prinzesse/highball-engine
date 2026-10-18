@@ -1,0 +1,51 @@
+HB_MVK_LOOP_CAP=<n> bounds every loop of the graphics stages at n iterations.
+
+Microsoft Flight Simulator 2024's terrain fragment shader (vkd3d-proton hash 8d17e8dd824912d8) scans a bindless
+table "while (entry == 0)" with no bound of its own. When it reads zeros the fragment spins until Metal's watchdog
+kills the G-buffer pass ("Caused GPU Hang Error (kIOGPUCommandBufferCallbackErrorHang)", the device resumed, a
+half-second freeze in flight), about once per 13,000 frames on the game's start screen on an M4. With the variable
+set, SPIRV-Cross (its patch 0005) declares a counter before every loop of a vertex, tessellation or fragment shader
+and breaks out once it passes n, so a spinning fragment ends with wrong pixels for that frame instead of a stalled
+GPU. Compute kernels are never capped: they may legitimately run long. The cap is the last four bytes of the
+pipeline cache UUID, so pipelines that patch 0012 cached under another cap, or none, are not reused.
+
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 222b740..c5d8dda 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -3283,6 +3283,12 @@ static uint32_t mvkGetEntryProperty(io_registry_entry_t entry, CFStringRef prope
+ 	mtlFeatures |= _isUsingMetalArgumentBuffers << 0;
+ 	*(uint32_t*)&_properties.pipelineCacheUUID[uuidComponentOffset] = NSSwapHostIntToBig(mtlFeatures);
+ 	uuidComponentOffset += sizeof(mtlFeatures);
++
++	// Highball: the last 4 bytes hold HB_MVK_LOOP_CAP, which changes the MSL of every graphics shader, so pipelines
++	// cached with another cap (or none) are not reused.
++	uint32_t hbLoopCap = getenv("HB_MVK_LOOP_CAP") ? (uint32_t)strtoul(getenv("HB_MVK_LOOP_CAP"), nullptr, 0) : 0;
++	*(uint32_t*)&_properties.pipelineCacheUUID[uuidComponentOffset] = NSSwapHostIntToBig(hbLoopCap);
++	uuidComponentOffset += sizeof(hbLoopCap);
+ }
+ 
+ // Combine OS major (8 bits), OS minor (8 bits), Mac GPU family (8 bits), and
+diff --git a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
+index 3b97f61..02ad8c8 100644
+--- a/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
++++ b/MoltenVKShaderConverter/MoltenVKShaderConverter/SPIRVToMSLConverter.cpp
+@@ -22,6 +22,7 @@
+ #include "FileSupport.h"
+ #include "SPIRVSupport.h"
+ #include <fstream>
++#include <cstdlib>
+ 
+ using namespace mvk;
+ using namespace std;
+@@ -306,6 +307,10 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
+ 		auto scOpts = pMSLCompiler->get_common_options();
+ 		scOpts.vertex.flip_vert_y = shaderConfig.options.shouldFlipVertexY;
+ 		scOpts.vertex.fixup_clipspace = shaderConfig.options.shouldFixupClipSpace;
++		// Highball: HB_MVK_LOOP_CAP=<n> bounds every loop of the graphics stages at n iterations (SPIRV-Cross patch 0005).
++		// Compute kernels are left alone: they may legitimately run long.
++		static const uint32_t hbLoopCap = getenv("HB_MVK_LOOP_CAP") ? (uint32_t)strtoul(getenv("HB_MVK_LOOP_CAP"), nullptr, 0) : 0;
++		if (shaderConfig.options.entryPointStage != ExecutionModelGLCompute) { scOpts.hb_loop_iteration_cap = hbLoopCap; }
+ 		pMSLCompiler->set_common_options(scOpts);
+ 
+ 		// Add shader inputs and outputs

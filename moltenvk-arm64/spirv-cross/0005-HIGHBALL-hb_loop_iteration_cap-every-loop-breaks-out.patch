@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 18 Oct 2026 12:35:53 +0200
+Subject: [PATCH] HIGHBALL: hb_loop_iteration_cap, every loop breaks out after
+ n iterations (MoltenVK HB_MVK_LOOP_CAP)
+
+---
+ spirv_glsl.cpp | 22 ++++++++++++++++++++++
+ spirv_glsl.hpp |  6 ++++++
+ 2 files changed, 28 insertions(+)
+
+diff --git a/spirv_glsl.cpp b/spirv_glsl.cpp
+index a296ed1a..af648ee1 100644
+--- a/spirv_glsl.cpp
++++ b/spirv_glsl.cpp
+@@ -18599,6 +18599,18 @@ void CompilerGLSL::emit_block_instructions_with_masked_debug(SPIRBlock &block)
+ 	block_debug_directives = old_block_debug_directives;
+ }
+ 
++void CompilerGLSL::emit_hb_loop_cap_declaration(const SPIRBlock &block)
++{
++	if (options.hb_loop_iteration_cap)
++		statement("uint _hb_loop_cap_", block.self, " = 0u;");
++}
++
++void CompilerGLSL::emit_hb_loop_cap_check(const SPIRBlock &block)
++{
++	if (options.hb_loop_iteration_cap)
++		statement("if (++_hb_loop_cap_", block.self, " > ", options.hb_loop_iteration_cap, "u) break;");
++}
++
+ bool CompilerGLSL::attempt_emit_loop_header(SPIRBlock &block, SPIRBlock::Method method)
+ {
+ 	SPIRBlock::ContinueBlockType continue_type = continue_block_type(get<SPIRBlock>(block.continue_block));
+@@ -18636,6 +18648,7 @@ bool CompilerGLSL::attempt_emit_loop_header(SPIRBlock &block, SPIRBlock::Method
+ 					condition = join("!", enclose_expression(condition));
+ 
+ 				emit_block_hints(block);
++				emit_hb_loop_cap_declaration(block);
+ 				if (method != SPIRBlock::MergeToSelectContinueForLoop)
+ 				{
+ 					auto continue_block = emit_continue_block(block.continue_block, false, false);
+@@ -18658,6 +18671,7 @@ bool CompilerGLSL::attempt_emit_loop_header(SPIRBlock &block, SPIRBlock::Method
+ 				if (execution_is_noop(get<SPIRBlock>(block.true_block), get<SPIRBlock>(block.merge_block)))
+ 					condition = join("!", enclose_expression(condition));
+ 
++				emit_hb_loop_cap_declaration(block);
+ 				statement("while (", condition, ")");
+ 				break;
+ 			}
+@@ -18670,6 +18684,7 @@ bool CompilerGLSL::attempt_emit_loop_header(SPIRBlock &block, SPIRBlock::Method
+ 			}
+ 
+ 			begin_scope();
++			emit_hb_loop_cap_check(block);
+ 			return true;
+ 		}
+ 		else
+@@ -18721,6 +18736,7 @@ bool CompilerGLSL::attempt_emit_loop_header(SPIRBlock &block, SPIRBlock::Method
+ 
+ 				auto continue_block = emit_continue_block(block.continue_block, false, false);
+ 				emit_block_hints(block);
++				emit_hb_loop_cap_declaration(block);
+ 				statement("for (", initializer, "; ", condition, "; ", continue_block, ")");
+ 				break;
+ 			}
+@@ -18738,6 +18754,7 @@ bool CompilerGLSL::attempt_emit_loop_header(SPIRBlock &block, SPIRBlock::Method
+ 					target_block = child.false_block;
+ 				}
+ 
++				emit_hb_loop_cap_declaration(block);
+ 				statement("while (", condition, ")");
+ 				break;
+ 			}
+@@ -18750,6 +18767,7 @@ bool CompilerGLSL::attempt_emit_loop_header(SPIRBlock &block, SPIRBlock::Method
+ 			}
+ 
+ 			begin_scope();
++			emit_hb_loop_cap_check(block);
+ 			branch(child.self, target_block);
+ 			return true;
+ 		}
+@@ -18959,8 +18977,10 @@ BlockID CompilerGLSL::emit_block_chain_inner(SPIRBlock &block)
+ 		// for (;;) { create-temporary; break; } consume-temporary;
+ 		// so force-declare temporaries here.
+ 		emit_hoisted_temporaries(block.potential_declare_temporary);
++		emit_hb_loop_cap_declaration(block);
+ 		statement("do");
+ 		begin_scope();
++		emit_hb_loop_cap_check(block);
+ 
+ 		emit_block_instructions(block);
+ 	}
+@@ -18980,8 +19000,10 @@ BlockID CompilerGLSL::emit_block_chain_inner(SPIRBlock &block)
+ 		// so force-declare temporaries here.
+ 		emit_hoisted_temporaries(block.potential_declare_temporary);
+ 		emit_block_hints(block);
++		emit_hb_loop_cap_declaration(block);
+ 		statement("for (;;)");
+ 		begin_scope();
++		emit_hb_loop_cap_check(block);
+ 
+ 		emit_block_instructions(block);
+ 	}
+diff --git a/spirv_glsl.hpp b/spirv_glsl.hpp
+index 349fb8d3..a599f0c6 100644
+--- a/spirv_glsl.hpp
++++ b/spirv_glsl.hpp
+@@ -150,6 +150,10 @@ public:
+ 		// compares.
+ 		bool relax_nan_checks = false;
+ 
++		// Highball: if non-zero, every loop breaks out after this many iterations (a bound for loops that spin on
++		// data the GPU reads as zero, which would otherwise hang the command buffer until the watchdog).
++		uint32_t hb_loop_iteration_cap = 0;
++
+ 		// Loading row-major matrices from UBOs on older AMD Windows OpenGL drivers is problematic.
+ 		// To load these types correctly, we must generate a wrapper. them in a dummy function which only purpose is to
+ 		// ensure row_major decoration is actually respected.
+@@ -717,6 +721,8 @@ protected:
+ 	void emit_specialization_constant_op(const SPIRConstantOp &constant);
+ 	std::string emit_continue_block(uint32_t continue_block, bool follow_true_block, bool follow_false_block);
+ 	bool attempt_emit_loop_header(SPIRBlock &block, SPIRBlock::Method method);
++	void emit_hb_loop_cap_declaration(const SPIRBlock &block);
++	void emit_hb_loop_cap_check(const SPIRBlock &block);
+ 
+ 	void branch(BlockID from, BlockID to);
+ 	void branch_to_continue(BlockID from, BlockID to);
+-- 
+2.54.0 (Apple Git-157)
+
