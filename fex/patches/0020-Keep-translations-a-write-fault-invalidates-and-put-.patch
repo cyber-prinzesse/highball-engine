@@ -1,0 +1,576 @@
+From 5c5b56e86af0b4118f2e912fb3f11edf05c530e0 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 18 Oct 2026 19:11:36 +0200
+Subject: [PATCH 20/20] Keep translations a write fault invalidates and put
+ them back when the same code returns
+
+Copy protections decrypt a function, run it and encrypt it again, and FEX translated the function at every round:
+Microsoft Flight Simulator 2024's main thread rewrote translated instruction bytes about 380 times a second on an M4,
+and its stutter followed that thread's translation time (2026-10-18).
+
+A block compiled normally (no single step, breakpoints or instruction limit, every instruction decoded) records an
+XXH3 hash of its guest instruction bytes. A write fault on code retires the page's blocks into a preallocated 4-way
+table of their code buffer's map (16,384 entries, about 2 MB a buffer; nothing is allocated in the fault path)
+instead of dropping them. On a lookup miss CompileBlock looks there first: a retired version whose pages are still
+executable has its pages protected again, then its bytes are hashed, and when they match, its host code is mapped
+back without translating (code buffers only grow, and the table goes with its buffer). Any other invalidation
+(protection change, free, unmap, an untracked write) purges retired blocks on its pages, so a block whose pages'
+executability changed never comes back, and a cache clear empties the table. An instruction that failed to decode
+now counts as instruction bytes for the store replay (15 bytes from its address), since it is compiled as a fault
+decided by those bytes. HB_FEX_SMC_RETIRE=0 turns retirement off. ThreadStats' last two slots count reinstated
+blocks and retired versions found with other bytes.
+
+smcretire.exe on an M4: decrypt, run, encrypt 41 against 155 us a round, two versions in turn 38 against 171 us,
+beside a thread writing data on the same page 3.4 times faster, eight versions in turn and a protection change
+between rounds right; 0 stale calls in every case. smcdata.exe, smcpatch.exe and smcpatch32.exe, the fiber, memory,
+context, debug-register (64 and 32-bit), string-resume and timer tests pass.
+---
+ FEXCore/Source/Interface/Context/Context.h    |   5 +
+ FEXCore/Source/Interface/Core/CodeCache.cpp   |   2 +-
+ FEXCore/Source/Interface/Core/Core.cpp        | 103 ++++++++++-
+ FEXCore/Source/Interface/Core/LookupCache.cpp |  12 ++
+ FEXCore/Source/Interface/Core/LookupCache.h   | 164 +++++++++++++++++-
+ FEXCore/include/FEXCore/Core/Context.h        |   3 +
+ FEXCore/include/FEXCore/Utils/SHMStats.h      |   5 +-
+ Source/Windows/Common/InvalidationTracker.cpp |  11 +-
+ Source/Windows/Common/InvalidationTracker.h   |   5 +-
+ 9 files changed, 295 insertions(+), 15 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 38aeab7..35b816b 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -19,6 +19,7 @@
+ #include <FEXCore/fextl/string.h>
+ #include <FEXCore/fextl/unordered_map.h>
+ #include <FEXCore/fextl/vector.h>
++#include <span>
+ 
+ #include <atomic>
+ #include <cstddef>
+@@ -227,6 +228,7 @@ public:
+   void ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer = true) override;
+   void InvalidateCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
+   bool SMCMarkPageCode(uint64_t Page, uint64_t Start, uint64_t Length, uint8_t* Mask) override;
++  void RetireCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
+   void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
+   FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() override {
+     return CodeInvalidationMutex;
+@@ -431,6 +433,9 @@ public:
+   CompileCodeResult CompileCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst = 0);
+   uintptr_t CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst = 0);
+   uintptr_t CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP);
++  // Highball smc-retire
++  static uint64_t HashCodeRanges(std::span<const std::pair<uint64_t, uint64_t>> Ranges);
++  uintptr_t ReinstateRetired(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP);
+ 
+   FEXCore::JITSymbols Symbols;
+ 
+diff --git a/FEXCore/Source/Interface/Core/CodeCache.cpp b/FEXCore/Source/Interface/Core/CodeCache.cpp
+index 0e4edda..c8baa35 100644
+--- a/FEXCore/Source/Interface/Core/CodeCache.cpp
++++ b/FEXCore/Source/Interface/Core/CodeCache.cpp
+@@ -808,7 +808,7 @@ bool CodeCache::EnableLoadedSection(Core::InternalThreadState* Thread, MappedCod
+       LOGMAN_THROW_A_FMT(Block.HostCode < Code.CodeBuffer.size_bytes(), "Host offset {:#x} out of range ({:#x})", Block.HostCode,
+                          Code.CodeBuffer.size_bytes());
+       auto HostCode = &Code.CodeBuffer[Block.HostCode];
+-      LookupCache.AddBlockMapping(Guest + BinarySection.FileStartVA, std::move(Block.CodePages), HostCode, {}, WriteLock);
++      LookupCache.AddBlockMapping(Guest + BinarySection.FileStartVA, std::move(Block.CodePages), HostCode, {}, 0, WriteLock);
+     }
+ 
+     // Guest code pages
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index e75fcd9..e06beb1 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -1012,6 +1012,17 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+     return HostCode;
+   }
+ 
++  // Highball smc-retire: blocks compiled for single steps, breakpoints or an instruction limit are neither kept nor
++  // reinstated. Otherwise a block a write fault retired comes back untranslated when the guest wrote the same
++  // instruction bytes back (copy protections decrypt a function, run it and encrypt it again).
++  const bool Reinstatable =
++    MaxInst == 0 && !Thread->DebugBreakpoints.Active() && !Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
++  if (Reinstatable) {
++    if (auto HostCode = ReinstateRetired(Thread, GuestRIP)) {
++      return HostCode;
++    }
++  }
++
+   Thread->FrontendDecoder->SetupDecodeInstructionsAtEntry(Thread, GuestRIP, MaxInst);
+ 
+   std::optional<ExecutableFileSectionInfo> Region = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
+@@ -1168,11 +1179,19 @@ RecompileForSMC:
+   // Highball smc-precise: the instruction bytes this compilation decoded (consecutive instructions merged into ranges), so
+   // a write fault on one of its pages can tell a store into data from a store into code
+   fextl::vector<std::pair<uint64_t, uint64_t>> CodeRanges;
++  // Highball smc-retire: and their hash, which lets a retired copy of this block come back (0: it may not)
++  uint64_t CodeHash = 0;
+   if (NeedsAddGuestCodeRanges) {
++    bool FailedInstruction = false;
+     for (const auto& B : Thread->FrontendDecoder->GetDecodedBlockInfo()->Blocks) {
+       for (uint64_t i = 0; i < B.NumInstructions; i++) {
+         const auto& I = B.DecodedInstructions[i];
+         if (!I.InstSize) {
++          // An instruction that failed to decode is compiled as a fault, decided by the bytes the decoder read: a store
++          // there must invalidate like a store into code. Such a block is not reinstated (that window may run into
++          // memory that cannot be read).
++          CodeRanges.emplace_back(I.PC, 15); // the longest x86 instruction
++          FailedInstruction = true;
+           continue;
+         }
+         if (!CodeRanges.empty() && CodeRanges.back().first + CodeRanges.back().second == I.PC) {
+@@ -1182,11 +1201,15 @@ RecompileForSMC:
+         }
+       }
+     }
++    // The pages are protected by now, so memory holds what was decoded unless a write landed before the protection
++    if (Reinstatable && !FailedInstruction && !CodeRanges.empty() && Thread->FrontendDecoder->DecodedCodeUnchanged()) {
++      CodeHash = HashCodeRanges(CodeRanges);
++    }
+   }
+ 
+   // Insert to lookup cache
+   for (auto [GuestAddr, HostAddr] : CompiledCode.EntryPoints) {
+-    Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, CodePages, HostAddr, CodeRanges);
++    Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, CodePages, HostAddr, CodeRanges, CodeHash);
+   }
+ 
+   // Clear any relocations that might have been generated
+@@ -1259,6 +1282,84 @@ bool ContextImpl::SMCMarkPageCode(uint64_t Page, uint64_t Start, uint64_t Length
+   return Touches;
+ }
+ 
++// Highball smc-retire: InvalidateCodeBuffersCodeRange for a write fault on code. Blocks whose bytes are known are kept
++// aside in their map (GuestToHostMap::RetiredBlock) for ReinstateRetired.
++void ContextImpl::RetireCodeBuffersCodeRange(uint64_t Start, uint64_t Length) {
++  FEXCORE_PROFILE_SCOPED("RetireCodeBuffersCodeRange");
++
++  LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
++  std::scoped_lock lk {CodeBufferListLock};
++  auto it = CodeBufferList.begin();
++  while (it != CodeBufferList.end()) {
++    if (auto Strong = it->lock()) {
++      Strong->LookupCache->InvalidateRange(Start, Length, true);
++      it++;
++    } else {
++      it = CodeBufferList.erase(it);
++    }
++  }
++}
++
++uint64_t ContextImpl::HashCodeRanges(std::span<const std::pair<uint64_t, uint64_t>> Ranges) {
++  uint64_t Hash = 0;
++  for (const auto& [Start, Size] : Ranges) {
++    Hash = XXH3_64bits_withSeed(reinterpret_cast<const void*>(Start), Size, Hash);
++  }
++  return Hash ? Hash : 1;
++}
++
++// Highball smc-retire: a retired block at GuestRIP in this thread's code buffer whose instruction bytes are back. The
++// caller holds CodeInvalidationMutex shared, so nothing retires or purges meanwhile. Its pages are protected again
++// before the bytes are hashed: a write after the protection faults and waits for this compilation to end, then
++// invalidates the reinstated block. Returns its host code, or 0 to translate.
++uintptr_t ContextImpl::ReinstateRetired(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP) {
++  auto& Map = *Thread->LookupCache->Shared;
++  std::array<GuestToHostMap::RetiredBlock, GuestToHostMap::GRAVE_WAYS> Found;
++  size_t Count;
++  uint64_t Generation;
++  {
++    auto lk = Map.AcquireReadLock();
++    Count = Map.FindRetired(GuestRIP, Found.data(), lk);
++    Generation = Map.ClearGeneration;
++  }
++  if (!Count) {
++    return 0;
++  }
++  if (HasCustomIRHandlers.load(std::memory_order_relaxed)) {
++    std::shared_lock lk(CustomIRMutex);
++    if (CustomIRHandlers.contains(GuestRIP)) {
++      return 0;
++    }
++  }
++
++  const std::array<uint64_t, 1> Entry {GuestRIP};
++  for (size_t i = 0; i < Count; i++) {
++    const auto& R = Found[i];
++    bool Executable = true;
++    for (auto Page : R.CodePages) {
++      Executable &= SyscallHandler->QueryGuestExecutableRange(Thread, Page).Size != 0;
++    }
++    if (!Executable) {
++      continue;
++    }
++    for (auto Page : R.CodePages) {
++      if (Thread->LookupCache->AddBlockExecutableRange(Thread, Entry, Page, FEXCore::Utils::FEX_PAGE_SIZE)) {
++        SyscallHandler->MarkGuestExecutableRange(Thread, Page, FEXCore::Utils::FEX_PAGE_SIZE);
++      }
++    }
++    if (HashCodeRanges(R.Ranges) != R.CodeHash) {
++      FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCRetiredMisses, 1);
++      continue;
++    }
++    if (!Thread->LookupCache->ReinstateRetiredBlock(Generation, R)) {
++      return 0;
++    }
++    FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCBlocksReinstated, 1);
++    return R.HostCode;
++  }
++  return 0;
++}
++
+ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) {
+   LOGMAN_THROW_A_FMT(CodeInvalidationMutex.try_lock() == false, "CodeInvalidationMutex needs to be unique_locked here");
+ 
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.cpp b/FEXCore/Source/Interface/Core/LookupCache.cpp
+index 0b23030..9322c6d 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.cpp
++++ b/FEXCore/Source/Interface/Core/LookupCache.cpp
+@@ -10,6 +10,8 @@ $end_info$
+ #include <FEXCore/Utils/LogManager.h>
+ #include <FEXCore/HLE/SyscallHandler.h>
+ 
++#include <cstdlib>
++
+ #include "Interface/Context/Context.h"
+ #include "Interface/Core/LookupCache.h"
+ 
+@@ -19,6 +21,11 @@ GuestToHostMap::GuestToHostMap()
+   BlockLinks_pma = fextl::make_unique<std::pmr::polymorphic_allocator<std::byte>>(&BlockLinks_mbr);
+   // Setup our PMR map.
+   BlockLinks = BlockLinks_pma->new_object<BlockLinksMapType>();
++  // Highball smc-retire: preallocated here so the write fault path never allocates (about 1.3 MB per code buffer)
++  if (const char* Retire = getenv("HB_FEX_SMC_RETIRE"); !Retire || Retire[0] != '0') {
++    Retired.resize(GRAVE_SETS * GRAVE_WAYS);
++    PurgeStamps.resize(PURGE_SLOTS);
++  }
+ }
+ 
+ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
+@@ -106,6 +113,11 @@ void GuestToHostMap::ClearCache(const LookupCacheWriteLockToken&) {
+   BlockLinks = BlockLinks_pma->new_object<BlockLinksMapType>();
+   // All code is gone, clear the block list
+   BlockList.clear();
++  // and the retired blocks (Highball smc-retire)
++  for (auto& R : Retired) {
++    R.Address = 0;
++  }
++  ClearGeneration++;
+ }
+ 
+ } // namespace FEXCore
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.h b/FEXCore/Source/Interface/Core/LookupCache.h
+index eac198f..59d85c9 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.h
++++ b/FEXCore/Source/Interface/Core/LookupCache.h
+@@ -89,8 +89,46 @@ struct GuestToHostMap {
+     // Highball smc-precise: the guest instruction bytes the block was decoded from, as [first, first + second); empty
+     // when unknown (a block from the disk cache), which the store replay treats as touching any store on its pages
+     fextl::vector<std::pair<uint64_t, uint64_t>> Ranges;
++    // Highball smc-retire: hash of the bytes in Ranges when the block was compiled (XXH3), 0 when the block may not be
++    // reinstated (unknown bytes, or compiled for single steps, breakpoints or an instruction limit)
++    uint64_t CodeHash {};
+   };
+ 
++  // Highball smc-retire: a block a write fault invalidated, kept so CompileBlock can reinstate its host code when the
++  // guest writes the same instruction bytes back (copy protections that decrypt a function, run it and encrypt it again
++  // made FEX translate the same code over and over). The host code stays valid: code buffers only grow, and this map
++  // goes away with its buffer. Slots are preallocated (no allocation in the fault path), GRAVE_WAYS per set of
++  // entry points, the oldest replaced first.
++  struct RetiredBlock {
++    uint64_t Address {}; // guest entry point, 0 when the slot is free
++    uint64_t HostCode {};
++    uint64_t CodeHash {};
++    uint64_t Stamp {};     // RetireClock when retired
++    uint64_t FirstPage {}; // CodePages' lowest and highest page numbers, for wide purges
++    uint64_t LastPage {};
++    fextl::vector<uint64_t> CodePages;
++    fextl::vector<std::pair<uint64_t, uint64_t>> Ranges;
++  };
++  static constexpr size_t GRAVE_SETS = 4096;
++  static constexpr size_t GRAVE_WAYS = 4;
++  // Pages whose code was invalidated for any other reason (protection change, free, unmap, an untracked write) since a
++  // block's retirement: such a block is not reinstated even when its bytes match, since what it was compiled against
++  // (the executability of the pages it ends on) may have changed. One stamp per hash slot of pages; collisions only
++  // refuse more.
++  static constexpr size_t PURGE_SLOTS = 65536;
++  fextl::vector<RetiredBlock> Retired;
++  fextl::vector<uint64_t> PurgeStamps;
++  uint64_t RetireClock {};
++  // Bumped by ClearCache: a reinstatement looked up before a clear is not committed after it
++  uint64_t ClearGeneration {};
++
++  static size_t GraveSet(uint64_t Address) {
++    return (Address * 0x9E3779B97F4A7C15ULL >> 32) % GRAVE_SETS;
++  }
++  static size_t PurgeSlot(uint64_t PageNumber) {
++    return (PageNumber * 0x9E3779B97F4A7C15ULL >> 40) % PURGE_SLOTS;
++  }
++
+   fextl::robin_map<uint64_t, BlockEntry> BlockList;
+ 
+   fextl::map<uint64_t, fextl::vector<uint64_t>> CodePages;
+@@ -99,14 +137,16 @@ struct GuestToHostMap {
+ 
+   // Adds to Guest -> Host code mapping
+   const BlockEntry& AddBlockMapping(uint64_t Address, std::span<const uint64_t> CodePages, void* HostCode,
+-                                    fextl::vector<std::pair<uint64_t, uint64_t>> Ranges, const LookupCacheWriteLockToken&) {
++                                    fextl::vector<std::pair<uint64_t, uint64_t>> Ranges, uint64_t CodeHash,
++                                    const LookupCacheWriteLockToken&) {
+     // This may replace an existing mapping
+     // NOTE: Generally no previous entry should exist, however there is one exception:
+     //       If the backend updates the active thread's CodeBuffer, the new associated LookupCache
+     //       may already contain the block address. Since is comparatively rare, we'll just leak
+     //       one of the two blocks in this case.
+     return BlockList
+-      .insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, fextl::vector<uint64_t>(CodePages.begin(), CodePages.end()), std::move(Ranges)})
++      .insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, fextl::vector<uint64_t>(CodePages.begin(), CodePages.end()),
++                                             std::move(Ranges), CodeHash})
+       .first->second;
+   }
+ 
+@@ -130,20 +170,121 @@ struct GuestToHostMap {
+     return BlockList.erase(Address) != 0;
+   }
+ 
+-  void InvalidateRange(uint64_t Start, uint64_t Length) {
++  // Retire (Highball smc-retire): the caller is a write fault on code, and blocks with a known CodeHash are kept for
++  // reinstatement instead of being dropped. Any other invalidation purges retired blocks on its pages.
++  void InvalidateRange(uint64_t Start, uint64_t Length, bool Retire = false) {
+     auto lk = AcquireWriteLock();
+ 
+     auto lower = CodePages.lower_bound(Start >> 12);
+     auto upper = CodePages.upper_bound((Start + Length - 1) >> 12);
+ 
++    if (!Retire) {
++      PurgeRetired(Start, Length, lk);
++    }
+     for (auto it = lower; it != upper; it++) {
+       for (const auto& Entry : it->second) {
++        if (Retire) {
++          RetireBlock(Entry, lk);
++        }
+         Erase(Entry, lk);
+       }
+     }
+     CodePages.erase(lower, upper);
+   }
+ 
++  // Moves a live block into its set's free or oldest slot (or refreshes the slot holding the same version). Only moves
++  // vectors: the slot's previous buffers are freed, nothing is allocated.
++  void RetireBlock(uint64_t Address, const LookupCacheWriteLockToken&) {
++    auto it = BlockList.find(Address);
++    if (it == BlockList.end() || !it->second.CodeHash || Retired.empty() || it->second.CodePages.empty()) {
++      return;
++    }
++    auto& Entry = it->second;
++    RetiredBlock* Set = &Retired[GraveSet(Address) * GRAVE_WAYS];
++    RetiredBlock* Slot = nullptr;
++    for (size_t w = 0; w < GRAVE_WAYS && !Slot; w++) {
++      if (Set[w].Address == Address && Set[w].CodeHash == Entry.CodeHash) {
++        Slot = &Set[w];
++      }
++    }
++    for (size_t w = 0; w < GRAVE_WAYS && !Slot; w++) {
++      if (!Set[w].Address) {
++        Slot = &Set[w];
++      }
++    }
++    if (!Slot) {
++      Slot = &Set[0];
++      for (size_t w = 1; w < GRAVE_WAYS; w++) {
++        if (Set[w].Stamp < Slot->Stamp) {
++          Slot = &Set[w];
++        }
++      }
++    }
++    Slot->Address = Address;
++    Slot->HostCode = Entry.HostCode;
++    Slot->CodeHash = Entry.CodeHash;
++    Slot->Stamp = ++RetireClock;
++    Slot->FirstPage = *std::min_element(Entry.CodePages.begin(), Entry.CodePages.end()) >> 12;
++    Slot->LastPage = *std::max_element(Entry.CodePages.begin(), Entry.CodePages.end()) >> 12;
++    Slot->CodePages = std::move(Entry.CodePages);
++    Slot->Ranges = std::move(Entry.Ranges);
++  }
++
++  void PurgeRetired(uint64_t Start, uint64_t Length, const LookupCacheWriteLockToken&) {
++    if (Retired.empty() || !Length) {
++      return;
++    }
++    const uint64_t FirstPage = Start >> 12;
++    const uint64_t LastPage = (Start + Length - 1) >> 12;
++    if (LastPage - FirstPage < PURGE_SLOTS) {
++      const uint64_t Stamp = ++RetireClock;
++      for (uint64_t Page = FirstPage; Page <= LastPage; Page++) {
++        PurgeStamps[PurgeSlot(Page)] = Stamp;
++      }
++    } else {
++      for (auto& R : Retired) {
++        if (R.Address && R.FirstPage <= LastPage && FirstPage <= R.LastPage) {
++          R.Address = 0;
++        }
++      }
++    }
++  }
++
++  // Copies out the retired versions of Address that no purge has touched since their retirement. Returns how many.
++  size_t FindRetired(uint64_t Address, RetiredBlock* Out, const LookupCacheBaseLockToken&) const {
++    if (Retired.empty()) {
++      return 0;
++    }
++    const RetiredBlock* Set = &Retired[GraveSet(Address) * GRAVE_WAYS];
++    size_t Count = 0;
++    for (size_t w = 0; w < GRAVE_WAYS; w++) {
++      const auto& R = Set[w];
++      if (R.Address != Address) {
++        continue;
++      }
++      bool Purged = false;
++      for (auto Page : R.CodePages) {
++        Purged |= PurgeStamps[PurgeSlot(Page >> 12)] > R.Stamp;
++      }
++      if (!Purged) {
++        Out[Count++] = R;
++      }
++    }
++    return Count;
++  }
++
++  void DropRetired(uint64_t Address, uint64_t CodeHash, const LookupCacheWriteLockToken&) {
++    if (Retired.empty()) {
++      return;
++    }
++    RetiredBlock* Set = &Retired[GraveSet(Address) * GRAVE_WAYS];
++    for (size_t w = 0; w < GRAVE_WAYS; w++) {
++      if (Set[w].Address == Address && Set[w].CodeHash == CodeHash) {
++        Set[w].Address = 0;
++      }
++    }
++  }
++
+   // Highball smc-precise: marks in Mask (FEX_PAGE_SIZE entries, zeroed by the caller) the guest instruction bytes of
+   // every block compiled from Page, and returns whether [Start, Start + Length) overlaps any of them. A block whose
+   // bytes are unknown counts as an overlap, so the caller falls back to invalidating the page.
+@@ -332,19 +473,32 @@ public:
+ 
+   // Adds to Guest -> Host code mapping
+   void AddBlockMapping(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, std::span<const uint64_t> CodePages, void* HostCode,
+-                       fextl::vector<std::pair<uint64_t, uint64_t>> Ranges = {}) {
++                       fextl::vector<std::pair<uint64_t, uint64_t>> Ranges = {}, uint64_t CodeHash = 0) {
+     std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> LockTime(
+       Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedCacheWriteLockTime : nullptr);
+     auto lk = Shared->AcquireWriteLock();
+     LockTime.reset();
+ 
+-    const auto& Entry = Shared->AddBlockMapping(Address, CodePages, HostCode, std::move(Ranges), lk);
++    const auto& Entry = Shared->AddBlockMapping(Address, CodePages, HostCode, std::move(Ranges), CodeHash, lk);
+ 
+     // There is no need to update L1 or L2, they will get updated on first lookup
+     // However, adding to L1 here increases performance
+     CacheBlockMapping(Address, Entry, true, lk);
+   }
+ 
++  // Highball smc-retire: puts a retired block back (its bytes verified by the caller) unless the map was cleared since
++  // the lookup that found it (Generation), and frees its slot. Returns whether it was put back.
++  bool ReinstateRetiredBlock(uint64_t Generation, const GuestToHostMap::RetiredBlock& R) {
++    auto lk = Shared->AcquireWriteLock();
++    if (Shared->ClearGeneration != Generation) {
++      return false;
++    }
++    const auto& Entry = Shared->AddBlockMapping(R.Address, R.CodePages, reinterpret_cast<void*>(R.HostCode), R.Ranges, R.CodeHash, lk);
++    Shared->DropRetired(R.Address, R.CodeHash, lk);
++    CacheBlockMapping(R.Address, Entry, true, lk);
++    return true;
++  }
++
+   // Invalidates L1/L2 for a given guest block
+   void InvalidateCache(uint64_t Address, const LookupCacheWriteLockToken& lk) {
+     // Do L1
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index a7fdfcb..c3ed817 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -157,6 +157,9 @@ public:
+   // Highball smc-precise: marks Page's translated instruction bytes in Mask (FEX_PAGE_SIZE entries) and returns whether
+   // [Start, Start + Length) overlaps them (or a block whose bytes are unknown). CodeInvalidationMutex must be held.
+   FEX_DEFAULT_VISIBILITY virtual bool SMCMarkPageCode(uint64_t Page, uint64_t Start, uint64_t Length, uint8_t* Mask) = 0;
++  // Highball smc-retire: InvalidateCodeBuffersCodeRange for a write fault on code; blocks whose instruction bytes are
++  // known are kept so they come back untranslated when those bytes do. CodeInvalidationMutex must be held.
++  FEX_DEFAULT_VISIBILITY virtual void RetireCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
+   FEX_DEFAULT_VISIBILITY virtual void
+   InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;
+   FEX_DEFAULT_VISIBILITY virtual FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() = 0;
+diff --git a/FEXCore/include/FEXCore/Utils/SHMStats.h b/FEXCore/include/FEXCore/Utils/SHMStats.h
+index ac3213b..0adf21d 100644
+--- a/FEXCore/include/FEXCore/Utils/SHMStats.h
++++ b/FEXCore/include/FEXCore/Utils/SHMStats.h
+@@ -81,8 +81,9 @@ struct ThreadStats {
+   uint64_t AccumulatedSMCStoresUnchanged;   // the store left memory as it was: nothing written, nothing invalidated
+   uint64_t AccumulatedSMCStoresOnCode;      // changed a translated instruction byte: the page invalidated as before
+   uint64_t AccumulatedSMCStoresUndecoded;   // not a store this path replays, or a burst on one page: the page invalidated as before
+-  uint64_t AccumulatedSMCRaceInvalidations; // instruction bytes changed while the page was open for the store: invalidated
+-  uint64_t AccumulatedSMCStoresPad;
++  // Highball smc-retire
++  uint64_t AccumulatedSMCRetiredMisses;    // a retired block at the entry point, its instruction bytes different: translated
++  uint64_t AccumulatedSMCBlocksReinstated; // a retired block put back, its instruction bytes the same: not translated
+ };
+ 
+ // Ensure 16-byte alignment to take advantage of ARM single-copy atomicity.
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 77c9406..dd1c742 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -475,7 +475,8 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+     {
+       std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
+ 
+-      InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
++      // Highball smc-retire: the page's blocks are kept aside, to come back if the guest writes their bytes back
++      InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE, true);
+ 
+       // Invalidate, then unprotect the faulting page with the compilation lock held to ensure that any racing invalidations are not dropped.
+       ULONG TmpProt;
+@@ -575,9 +576,13 @@ void InvalidationTracker::InvalidateIntervalInternal(uint64_t Address, uint64_t
+   InvalidateIntervalInternalLocked(Address, Size);
+ }
+ 
+-void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size) {
++void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size, bool Retire) {
+   // NOTE: This assumes CodeInvalidationMutex is locked by the caller
+-  CTX.InvalidateCodeBuffersCodeRange(Address, Size);
++  if (Retire) {
++    CTX.RetireCodeBuffersCodeRange(Address, Size);
++  } else {
++    CTX.InvalidateCodeBuffersCodeRange(Address, Size);
++  }
+   for (auto Thread : Threads) {
+     CTX.InvalidateThreadCachedCodeRange(Thread.second, Address, Size);
+   }
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index b0d5ed2..79651d5 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -53,8 +53,8 @@ private:
+   void DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC);
+   void DisableSMCDetection();
+   void InvalidateIntervalInternal(uint64_t Address, uint64_t Size);
+-  // NOTE: This assumed CodeInvalidationMutex is locked by the caller
+-  void InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size);
++  // NOTE: This assumed CodeInvalidationMutex is locked by the caller. Retire: a write fault on code (Highball smc-retire)
++  void InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size, bool Retire = false);
+ 
+   // NOTE: If ForWriteLocked is true then this assumes CodeInvalidationMutex is locked by the caller,
+   // and any code in the range will be invalidated before protection as RWX, otherwise protects as RX if false.
+@@ -86,7 +86,6 @@ private:
+   // replay costs about 8 us, recompiling a page's blocks milliseconds (smcdata.exe). HB_FEX_SMC_BURST overrides it.
+   uint32_t ReplayBurstLimit {2000};
+   std::array<uint8_t, 4096> ReplayMask {};
+-  std::array<uint8_t, 4096> ReplayBefore {};
+   struct ReplayBurst {
+     uint64_t Page;
+     uint64_t WindowStart;
+-- 
+2.54.0 (Apple Git-157)
+

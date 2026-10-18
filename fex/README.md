@@ -72,5 +72,33 @@ them. That is the default since 2026-10-11. Dispatched with `fex_build: hangover
   WoW64 (427,248 to 3,036,629); with it all pass in both. Found while Microsoft Flight Simulator 2024
   crashed in a game thread during loading.
 
+- `0019` stores into the data of a page that holds translated code no longer throw the page's
+  translations away. Blocks record the guest instruction bytes they were decoded from; on a write fault
+  in an RWX region the ARM64EC module decodes the faulting JIT store (STR, STUR, STR register, STLR,
+  STLUR, STP and STNP, general and SIMD registers) and, when it changes no instruction byte, writes it
+  for the guest through a second, writable mapping of the page (`AliasWrite` in
+  `fexunixlib_darwin.cpp`: `mach_vm_remap`), steps past it and keeps the page protected, so another
+  thread's write into code on that page still faults. Stores that change nothing are skipped. Stores
+  into code, undecoded stores and more than 2,000 replays into a page within 100 ms
+  (`HB_FEX_SMC_BURST`) take the old path; `HB_FEX_SMC_REPLAY=0` turns it off. `smcdata.exe` on the M4:
+  data beside a translated function 2.6 times faster, 0 stale calls with code rewritten beside a
+  thread writing data (opening the page for the store instead ran stale code 1,960 times in 2,000).
+  The DLL and the helper go together: the helper's call table gains `AliasWrite`, and Wine's unix
+  call dispatch has no bounds check.
+- `0020` translations a write fault invalidates are kept and put back when the same instruction bytes
+  return. Copy protections decrypt a function, run it and encrypt it again; Microsoft Flight Simulator
+  2024's main thread rewrote translated instruction bytes about 380 times a second and its stutter
+  followed that thread's translation time (2026-10-18). A block records an XXH3 hash of its bytes; a
+  write fault retires the page's blocks into a preallocated table of their code buffer (16,384 entries,
+  about 2 MB, no allocation in the fault path); a lookup miss checks it first, protects the block's
+  pages again, hashes the bytes and maps the old host code back when they match. Any other invalidation
+  (protection change, free, unmap) purges the retired blocks on its pages, and blocks compiled for
+  single steps, breakpoints, an instruction limit or with an instruction that failed to decode are
+  never kept. `HB_FEX_SMC_RETIRE=0` turns it off. `smcretire.exe` on the M4: decrypt, run, encrypt 41
+  against 155 us a round, two versions in turn 38 against 171 us, 0 stale calls in every case (beside a
+  data-writing thread, with eight versions, with a protection change between rounds); `smcpatch` 64
+  and 32-bit, `drtest` 64 and 32-bit, `fibertest`, `ctxtest`, `memtest`, `kattest`, `tsctest` and the
+  string resume pass.
+
 32-bit programs were measured with the engine built by CI (it has the i386 half): x87test32 120/128,
 the same eight x87 gaps as the 64-bit build; the string resume and the code patching probe pass.
