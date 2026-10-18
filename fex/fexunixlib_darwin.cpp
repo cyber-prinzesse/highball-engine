@@ -9,8 +9,10 @@
 #include <unistd.h>
 #include <mach/mach.h>
 #include <mach/mach_traps.h>
+#include <mach/mach_vm.h>
+#include <cstring>
 
-enum class FEXUnixLibFunctions : uint32_t { SetHardwareTSOControl, SetKernelUnalignedAtomicControl, Madvise, SetVMAName, GetSHMStatsVMA, DeleteSHMStatsFile, MapFile, GetPID, MAX };
+enum class FEXUnixLibFunctions : uint32_t { SetHardwareTSOControl, SetKernelUnalignedAtomicControl, Madvise, SetVMAName, GetSHMStatsVMA, DeleteSHMStatsFile, MapFile, GetPID, AliasWrite, MAX };
 struct FEXUnixLib_SetHardwareTSOControlArgs { bool Enable; };
 struct FEXUnixLib_SetKernelUnalignedAtomicControl { uint64_t Flags; };
 struct FEXUnixLib_Madvise { const void* Addr; size_t Size; int32_t Advise; uint32_t pad; };
@@ -18,12 +20,14 @@ struct FEXUnixLib_SetVMAName { const void* Addr; size_t Size; const char* Name; 
 struct FEXUnixLib_GetSHMStatsVMA { void* SHMBase; uint32_t MapSize; uint32_t MaxSize; };
 struct FEXUnixLib_MapFile { int32_t FD; uint64_t MapSize; void* Result; };
 struct FEXUnixLib_GetPID { uint32_t Result; };
+struct FEXUnixLib_AliasWrite { void* Addr; const void* Data; uint32_t Size; uint32_t Pad; };
 
 using NTSTATUS = int32_t;
 using unixlib_entry_t = NTSTATUS (*)(void*);
 constexpr NTSTATUS STATUS_SUCCESS = 0;
 constexpr NTSTATUS STATUS_NOT_SUPPORTED = 0xC00000BB;
 constexpr NTSTATUS STATUS_INTERNAL_ERROR = 0xC00000E5;
+constexpr NTSTATUS STATUS_ACCESS_DENIED = 0xC0000022;
 
 static void trace(const char* what, long a, long b) { if (getenv("FEXUNIX_TRACE")) fprintf(stderr, "fexunixlib: %s %lx %lx\n", what, a, b); }
 static NTSTATUS TSOControl(void* _Args) {
@@ -71,9 +75,40 @@ static NTSTATUS MapFile(void* _Args) {
   if (Args->Result == MAP_FAILED) { Args->Result = nullptr; return STATUS_INTERNAL_ERROR; }
   return STATUS_SUCCESS;
 }
+// Highball smc-precise (2026-10-18): writes Size bytes at Addr through a second, writable mapping of the same memory, so
+// the page keeps its read-execute protection for every thread. FEX replays a guest store into the data of a page that
+// holds translated code this way: opening the page instead let another thread's code write land unseen and run stale
+// (smcdata.exe, 1,960 stale calls of 2,000). Aligned 1, 2, 4 and 8 byte writes are single stores, as on x86.
+static NTSTATUS AliasWrite(void* _Args) {
+  auto Args = reinterpret_cast<const FEXUnixLib_AliasWrite*>(_Args);
+  const mach_vm_address_t Address = reinterpret_cast<mach_vm_address_t>(Args->Addr);
+  const mach_vm_address_t Page = Address & ~static_cast<mach_vm_address_t>(vm_page_size - 1);
+  if (Address - Page + Args->Size > vm_page_size) return STATUS_NOT_SUPPORTED;
+  mach_vm_address_t Alias = 0;
+  vm_prot_t Cur, Max;
+  kern_return_t kr = mach_vm_remap(mach_task_self(), &Alias, vm_page_size, 0, VM_FLAGS_ANYWHERE, mach_task_self(), Page, FALSE, &Cur, &Max,
+                                   VM_INHERIT_NONE);
+  if (kr != KERN_SUCCESS) { trace("AliasWrite remap", (long)Address, kr); return STATUS_INTERNAL_ERROR; }
+  kr = mach_vm_protect(mach_task_self(), Alias, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE);
+  if (kr == KERN_SUCCESS) {
+    void* Dst = reinterpret_cast<void*>(Alias + (Address - Page));
+    const uintptr_t D = reinterpret_cast<uintptr_t>(Dst);
+    switch (Args->Size) {
+      case 1: __atomic_store_n(static_cast<uint8_t*>(Dst), *static_cast<const uint8_t*>(Args->Data), __ATOMIC_SEQ_CST); break;
+      case 2: if (D % 2 == 0) { uint16_t v; memcpy(&v, Args->Data, 2); __atomic_store_n(static_cast<uint16_t*>(Dst), v, __ATOMIC_SEQ_CST); } else { memcpy(Dst, Args->Data, 2); } break;
+      case 4: if (D % 4 == 0) { uint32_t v; memcpy(&v, Args->Data, 4); __atomic_store_n(static_cast<uint32_t*>(Dst), v, __ATOMIC_SEQ_CST); } else { memcpy(Dst, Args->Data, 4); } break;
+      case 8: if (D % 8 == 0) { uint64_t v; memcpy(&v, Args->Data, 8); __atomic_store_n(static_cast<uint64_t*>(Dst), v, __ATOMIC_SEQ_CST); } else { memcpy(Dst, Args->Data, 8); } break;
+      default: memcpy(Dst, Args->Data, Args->Size); __atomic_thread_fence(__ATOMIC_SEQ_CST); break;
+    }
+  } else {
+    trace("AliasWrite protect", (long)Address, kr);
+  }
+  mach_vm_deallocate(mach_task_self(), Alias, vm_page_size);
+  return kr == KERN_SUCCESS ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
+}
 static NTSTATUS GetPID(void* _Args) { trace("GetPID", 0, 0); reinterpret_cast<FEXUnixLib_GetPID*>(_Args)->Result = getpid(); return STATUS_SUCCESS; }
 
 extern "C" __attribute__((visibility("default"))) const unixlib_entry_t __wine_unix_call_funcs[] = {
-  TSOControl, UnalignedAtomicControl, Madvise, SetVMAName, GetSHMStatsVMA, DeleteSHMStatsFile, MapFile, GetPID,
+  TSOControl, UnalignedAtomicControl, Madvise, SetVMAName, GetSHMStatsVMA, DeleteSHMStatsFile, MapFile, GetPID, AliasWrite,
 };
 static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == static_cast<uint32_t>(FEXUnixLibFunctions::MAX));
