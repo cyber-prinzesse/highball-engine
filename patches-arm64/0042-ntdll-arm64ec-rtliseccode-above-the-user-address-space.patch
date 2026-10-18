@@ -1,0 +1,28 @@
+ntdll: RtlIsEcCode answers FALSE for an address above the user address space instead of faulting.
+
+The ARM64EC code map has one bit per page of the user address space (alloc_arm64ec_map sizes it from
+address_space_limit, 0x7fffffff0000 for 64-bit processes). RtlIsEcCode indexed it with any address, so an address
+above that read past the map and faulted. The unwinder calls it through RtlLookupFunctionEntry for every frame it
+walks; when it met a garbage return address (an x64 frame without unwind data, a value such as
+0xffff000000000000 taken as the next pc), the fault was raised inside the dispatch, dispatched through the same
+frames, met the same address and faulted again, about 280 times, until the thread's 1.5 MB stack ran out
+("virtual_setup_exception stack overflow ... addr <ResetToConsistentStateImpl>"). Windows answers FALSE for such an
+address and the walk goes on or stops cleanly. Microsoft Flight Simulator 2024's main thread hung this way 45 s
+into every flight with FEX's store replay and smc-retire both on (hunt80, hunt83, hunt84, 2026-10-18; read from a
+dump of the thread's stack), and once before on 2026-10-16 (boot73): the exception that started it is the game's
+own, the endless recursion is this.
+
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -1553,6 +1553,11 @@
+ {
+     const UINT64 *map = (const UINT64 *)NtCurrentTeb()->Peb->EcCodeBitMap;
+     ULONG_PTR page = ptr / page_size;
++
++    /* Highball: the map covers the user address space only (unix/virtual.c's address_space_limit). Above it no
++     * address is EC code, as on Windows; reading the map there faulted, and when the unwinder met a garbage return
++     * address that fault was dispatched through the same unwind and faulted again until the stack ran out. */
++    if (ptr >= 0x7fffffff0000) return FALSE;
+     return (map[page / 64] >> (page & 63)) & 1;
+ }
+ 

@@ -1,0 +1,171 @@
+From 9af359a3d01e63419d5d6275d18ef41d333ef8d5 Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 18 Oct 2026 21:22:36 +0200
+Subject: [PATCH] smc-precise and smc-retire opt-in, with diagnosis switches
+
+With 0019's store replay and 0020's retirement both on, Microsoft Flight Simulator 2024 hung 45 s into every
+flight on an M4 (three flights of three, 2026-10-18): its main thread ran into an unmapped page and Wine's unwinder
+recursed until the thread's stack ran out. Either one alone flew. Until the cause is found both are off unless asked
+for: HB_FEX_SMC_REPLAY=1 turns the replay on, HB_FEX_SMC_RETIRE=1 retirement (the table is only allocated then).
+
+Diagnosis switches: HB_FEX_SMC_REINSTATE=0 keeps retiring blocks but never reinstates one, =2 reinstates only where
+every page still holds live code, so reinstating changes no page protection; HB_FEX_SMC_SAME=0 writes a store that
+changes nothing anyway; HB_FEX_SMC_VERIFY=1 reads every replayed store back through the program's own address and
+takes the old path when it does not show.
+---
+ FEXCore/Source/Interface/Core/Core.cpp        | 26 +++++++++++++++++++
+ FEXCore/Source/Interface/Core/LookupCache.cpp |  5 ++--
+ FEXCore/Source/Interface/Core/LookupCache.h   |  6 +++++
+ Source/Windows/Common/InvalidationTracker.cpp | 22 +++++++++++++---
+ Source/Windows/Common/InvalidationTracker.h   |  4 ++-
+ 5 files changed, 56 insertions(+), 7 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index e06beb1..c0cedc9 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -78,6 +78,7 @@ $end_info$
+ #include <cstring>
+ #include <utility>
+ #include <xxhash.h>
++#include <cstdlib>
+ 
+ // x87 instructions that execute without checking for a pending unmasked exception (the FN* forms and FNOP);
+ // every other x87 instruction and FWAIT delivers a pending #MF first
+@@ -1313,6 +1314,15 @@ uint64_t ContextImpl::HashCodeRanges(std::span<const std::pair<uint64_t, uint64_
+ // before the bytes are hashed: a write after the protection faults and waits for this compilation to end, then
+ // invalidates the reinstated block. Returns its host code, or 0 to translate.
+ uintptr_t ContextImpl::ReinstateRetired(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP) {
++  // HB_FEX_SMC_REINSTATE (diagnosis, 2026-10-18): 0 keeps retiring blocks but never puts one back, 2 puts one back only
++  // where every page still holds live code, so reinstating changes no page protection; 1 (default) puts them back.
++  static const int Mode = [] {
++    const char* Env = getenv("HB_FEX_SMC_REINSTATE");
++    return Env && Env[0] ? atoi(Env) : 1;
++  }();
++  if (Mode == 0) {
++    return 0;
++  }
+   auto& Map = *Thread->LookupCache->Shared;
+   std::array<GuestToHostMap::RetiredBlock, GuestToHostMap::GRAVE_WAYS> Found;
+   size_t Count;
+@@ -1321,6 +1331,22 @@ uintptr_t ContextImpl::ReinstateRetired(FEXCore::Core::InternalThreadState* Thre
+     auto lk = Map.AcquireReadLock();
+     Count = Map.FindRetired(GuestRIP, Found.data(), lk);
+     Generation = Map.ClearGeneration;
++    if (Mode == 2) {
++      size_t Kept = 0;
++      for (size_t i = 0; i < Count; i++) {
++        bool AllLive = true;
++        for (auto Page : Found[i].CodePages) {
++          AllLive &= Map.PageHoldsCode(Page, lk);
++        }
++        if (AllLive) {
++          if (Kept != i) {
++            Found[Kept] = Found[i];
++          }
++          Kept++;
++        }
++      }
++      Count = Kept;
++    }
+   }
+   if (!Count) {
+     return 0;
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.cpp b/FEXCore/Source/Interface/Core/LookupCache.cpp
+index 9322c6d..544ab1a 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.cpp
++++ b/FEXCore/Source/Interface/Core/LookupCache.cpp
+@@ -21,8 +21,9 @@ GuestToHostMap::GuestToHostMap()
+   BlockLinks_pma = fextl::make_unique<std::pmr::polymorphic_allocator<std::byte>>(&BlockLinks_mbr);
+   // Setup our PMR map.
+   BlockLinks = BlockLinks_pma->new_object<BlockLinksMapType>();
+-  // Highball smc-retire: preallocated here so the write fault path never allocates (about 1.3 MB per code buffer)
+-  if (const char* Retire = getenv("HB_FEX_SMC_RETIRE"); !Retire || Retire[0] != '0') {
++  // Highball smc-retire: opt-in (HB_FEX_SMC_RETIRE=1, see smc-precise's HB_FEX_SMC_REPLAY). Preallocated here so the
++  // write fault path never allocates (about 2 MB per code buffer).
++  if (const char* Retire = getenv("HB_FEX_SMC_RETIRE"); Retire && Retire[0] == '1') {
+     Retired.resize(GRAVE_SETS * GRAVE_WAYS);
+     PurgeStamps.resize(PURGE_SLOTS);
+   }
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.h b/FEXCore/Source/Interface/Core/LookupCache.h
+index 59d85c9..c62973a 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.h
++++ b/FEXCore/Source/Interface/Core/LookupCache.h
+@@ -273,6 +273,12 @@ struct GuestToHostMap {
+     return Count;
+   }
+ 
++  // Whether Page holds live translated code (and so is protected already): no protection changes to reinstate there
++  bool PageHoldsCode(uint64_t Page, const LookupCacheBaseLockToken&) const {
++    auto it = CodePages.find(Page >> 12);
++    return it != CodePages.end() && !it->second.empty();
++  }
++
+   void DropRetired(uint64_t Address, uint64_t CodeHash, const LookupCacheWriteLockToken&) {
+     if (Retired.empty()) {
+       return;
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index dd1c742..6286eba 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -21,9 +21,18 @@ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const s
+   , Threads {Threads} {
+   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
+   SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
+-  // Highball smc-precise: HB_FEX_SMC_REPLAY=0 keeps every write fault on the page invalidation (A/B runs)
+-  if (const char* Replay = getenv("HB_FEX_SMC_REPLAY"); Replay && Replay[0] == '0') {
+-    ReplayEnabled = false;
++  // Highball smc-precise: opt-in (HB_FEX_SMC_REPLAY=1). With the replay and smc-retire both on, Microsoft Flight
++  // Simulator 2024 hung 45 s into every flight on 2026-10-18 (its main thread ran into an unmapped page and Wine's
++  // unwinder recursed until the stack ran out), cause not yet found. HB_FEX_SMC_SAME=0 writes stores that change nothing
++  // anyway, HB_FEX_SMC_VERIFY=1 reads every replayed store back through the program's own address (diagnosis).
++  if (const char* Replay = getenv("HB_FEX_SMC_REPLAY"); Replay && Replay[0] == '1') {
++    ReplayEnabled = true;
++  }
++  if (const char* Same = getenv("HB_FEX_SMC_SAME"); Same && Same[0] == '0') {
++    ReplaySkipUnchanged = false;
++  }
++  if (const char* Verify = getenv("HB_FEX_SMC_VERIFY"); Verify && Verify[0] == '1') {
++    ReplayVerify = true;
+   }
+   if (const char* Burst = getenv("HB_FEX_SMC_BURST"); Burst && Burst[0]) {
+     ReplayBurstLimit = static_cast<uint32_t>(strtoul(Burst, nullptr, 0));
+@@ -431,7 +440,7 @@ bool InvalidationTracker::TryReplayCodePageStore(FEXCore::Core::InternalThreadSt
+ 
+   // A store that leaves memory as it is changes nothing, code or data: no write, no invalidation. (The game's copy
+   // protection writes code bytes back unchanged most of the time.)
+-  if (memcmp(reinterpret_cast<const void*>(S.Address), S.Data, S.Size) == 0) {
++  if (ReplaySkipUnchanged && memcmp(reinterpret_cast<const void*>(S.Address), S.Data, S.Size) == 0) {
+     Pc += 4;
+     CountReplay(Thread, &Stats::AccumulatedSMCStoresUnchanged);
+     return true;
+@@ -455,6 +464,11 @@ bool InvalidationTracker::TryReplayCodePageStore(FEXCore::Core::InternalThreadSt
+     CountReplay(Thread, &Stats::AccumulatedSMCStoresUndecoded);
+     return false;
+   }
++  // HB_FEX_SMC_VERIFY=1: the bytes must show through the program's own address; if not, the old path writes them
++  if (ReplayVerify && memcmp(reinterpret_cast<const void*>(S.Address), S.Data, S.Size) != 0) {
++    CountReplay(Thread, &Stats::AccumulatedSMCStoresUndecoded);
++    return false;
++  }
+ 
+   Pc += 4;
+   CountReplay(Thread, &Stats::AccumulatedSMCStoresEmulated);
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index 79651d5..2a0f1f5 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -81,7 +81,9 @@ private:
+ 
+   // Highball smc-precise state, protected by CodeInvalidationMutex (no allocation in the fault path: allocating there
+   // deadlocked a game through Wine's FLS critical section, 2026-10-16)
+-  bool ReplayEnabled {true};
++  bool ReplayEnabled {false};
++  bool ReplaySkipUnchanged {true};
++  bool ReplayVerify {false};
+   // Past this many replayed stores into one page within 100 ms, the old path (invalidate, leave writable) is cheaper: a
+   // replay costs about 8 us, recompiling a page's blocks milliseconds (smcdata.exe). HB_FEX_SMC_BURST overrides it.
+   uint32_t ReplayBurstLimit {2000};
+-- 
+2.54.0 (Apple Git-157)
+
