@@ -1,0 +1,110 @@
+From 63cca6c533bf985c173ba6f45ed0ccce510c37ec Mon Sep 17 00:00:00 2001
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Date: Sun, 18 Oct 2026 21:44:47 +0200
+Subject: [PATCH] ARM64EC: GuestProtection, the page protection a program set
+ rather than FEX's write trap
+
+FEX makes a program's read-write-execute pages that hold translated code read-execute so that writes fault into its
+SMC tracking. Windows has no such step, but the program saw it: NtProtectVirtualMemory returned read-execute as the
+old protection and VirtualQuery reported it, so a program that saved a page's protection, changed it and restored
+what it saved made its own page read-execute and faulted on its next write (smcprot.exe, 100 of 100). Copy
+protections guard their code pages this way; Microsoft Flight Simulator 2024's hung 45 s into every flight once
+smc-retire re-protected pages more often.
+
+New export GuestProtection(Address, Prot), used by Wine's ntdll (patches-arm64/0043): when the page lies in an
+interval the program made read-write-execute (or a DEP-promoted read-write one) and Prot is FEX's trap protection,
+it returns the program's own; anything else comes back unchanged. It only try-locks the interval lock, so a call
+that comes in while the tracker holds it never blocks.
+---
+ Source/Windows/ARM64EC/BTInterface.h          |  1 +
+ Source/Windows/ARM64EC/Module.cpp             | 12 ++++++++++++
+ Source/Windows/ARM64EC/libarm64ecfex.def      |  1 +
+ Source/Windows/Common/InvalidationTracker.cpp | 13 +++++++++++++
+ Source/Windows/Common/InvalidationTracker.h   |  5 +++++
+ 5 files changed, 32 insertions(+)
+
+diff --git a/Source/Windows/ARM64EC/BTInterface.h b/Source/Windows/ARM64EC/BTInterface.h
+index 97c480c..66fac89 100644
+--- a/Source/Windows/ARM64EC/BTInterface.h
++++ b/Source/Windows/ARM64EC/BTInterface.h
+@@ -27,4 +27,5 @@ void STDMETHODCALLTYPE GetX87State(XMM_SAVE_AREA32* FltSave);
+ void STDMETHODCALLTYPE KeepX64DebugRegisters(CONTEXT* Context);
+ BOOL STDMETHODCALLTYPE GetX64Mxcsr(UINT32* Mxcsr);
+ BOOL STDMETHODCALLTYPE SetX64Mxcsr(UINT32 Mxcsr);
++ULONG STDMETHODCALLTYPE GuestProtection(void* Address, ULONG Prot);
+ }
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index f762a39..9076bc9 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -1339,6 +1339,18 @@ void KeepX64DebugRegisters(CONTEXT* Context) {
+   Context->Dr7 = Regs.DR7;
+ }
+ 
++// Not part of the Windows emulator interface. The protection a program set on the page at Address, given the one the
++// page has (Prot), for ntdll's NtProtectVirtualMemory (the old protection it returns) and NtQueryVirtualMemory: FEX
++// makes the program's read-write-execute pages that hold translated code read-execute, so that a write faults into its
++// SMC tracking, and a program must not see that step. A program that saved a page's protection, changed it and
++// restored what it saved got read-execute back from FEX and faulted on its own next write (smcprot.exe, 2026-10-18).
++ULONG GuestProtection(void* Address, ULONG Prot) {
++  if (!InvalidationTracker) {
++    return Prot;
++  }
++  return InvalidationTracker->GuestProtection(reinterpret_cast<uint64_t>(Address), Prot);
++}
++
+ // Not part of the Windows emulator interface. The calling thread's x87 state, for ntdll's RtlCaptureContext and setjmp,
+ // which run as native code and cannot read it: x64 Windows captures the live control word and RtlRestoreContext and
+ // longjmp load it back, so a made up one would reset the precision and rounding of every program that unwinds an
+diff --git a/Source/Windows/ARM64EC/libarm64ecfex.def b/Source/Windows/ARM64EC/libarm64ecfex.def
+index e5ff9df..c1dd317 100644
+--- a/Source/Windows/ARM64EC/libarm64ecfex.def
++++ b/Source/Windows/ARM64EC/libarm64ecfex.def
+@@ -25,3 +25,4 @@ EXPORTS
+   KeepX64DebugRegisters
+   GetX64Mxcsr
+   SetX64Mxcsr
++  GuestProtection
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index 6286eba..a7b5a6a 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -508,6 +508,19 @@ bool InvalidationTracker::BeginUntrackedWriteLocked(uint64_t Address, uint64_t S
+   return ProtectRWXIntervalsInternal(Address, Size, true);
+ }
+ 
++ULONG InvalidationTracker::GuestProtection(uint64_t Address, ULONG Prot) {
++  std::shared_lock Lock(IntervalsLock, std::try_to_lock);
++  if (!Lock.owns_lock() || SMCDetectionDisabled || !RWXIntervals.Query(Address).Enclosed) {
++    return Prot;
++  }
++  // The modifiers (PAGE_GUARD, PAGE_NOCACHE, PAGE_WRITECOMBINE) stay as they are
++  constexpr ULONG Modifiers = PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE;
++  if ((Prot & ~Modifiers) == GetTrapProt(Address)) {
++    return GetUntrapProt(Address) | (Prot & Modifiers);
++  }
++  return Prot;
++}
++
+ FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
+   std::shared_lock Lock(IntervalsLock);
+   const auto XResult = XIntervals.Query(Address);
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index 2a0f1f5..e995d4a 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -49,6 +49,11 @@ public:
+ 
+   FEXCore::HLE::ExecutableRangeInfo QueryExecutableRange(uint64_t Address);
+ 
++  // The protection the program set at Address, given the one the page has: FEX's write trap on a read-write-execute
++  // page (read-execute, or read-only for a DEP-promoted one) reads back as the program's own protection. Never blocks
++  // (ntdll calls it while the program queries memory, maybe while this tracker's lock is held elsewhere).
++  ULONG GuestProtection(uint64_t Address, ULONG Prot);
++
+ private:
+   void DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC);
+   void DisableSMCDetection();
+-- 
+2.54.0 (Apple Git-157)
+

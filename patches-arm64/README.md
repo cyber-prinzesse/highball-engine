@@ -200,3 +200,7 @@ with it (MoltenVK and the Vulkan headers from Homebrew).
   thread's stack ran out: Microsoft Flight Simulator 2024's main thread hung this way 45 s into every flight with
   FEX's store replay and retirement both on (2026-10-18), and once before (boot73, 2026-10-16). Windows answers
   FALSE there.
+- `0043-ntdll-arm64ec-a-program-sees-its-own-page-protection.patch`: NtProtectVirtualMemory's old protection and
+  NtQueryVirtualMemory's (MemoryBasicInformation) go through the emulator's `GuestProtection` (FEX `0022`), so a
+  page FEX made read-execute to see writes into translated code reads back with the program's own protection, as on
+  Windows. NtQueryVirtualMemory is wrapped like the other memory calls for this; the emulator's own calls skip it.

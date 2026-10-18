@@ -1,0 +1,83 @@
+ntdll: a program sees the page protection it set, not the emulator's write trap.
+
+FEX makes a program's read-write-execute pages that hold translated code read-execute, so a write into them faults
+into its tracking of self-modifying code; Windows has no such step. NtProtectVirtualMemory returned that
+read-execute as the old protection and NtQueryVirtualMemory reported it, so a program that saved a page's
+protection, changed it and restored what it saved made its own page read-execute and faulted on its next write
+(smcprot.exe on the M4, 2026-10-18: VirtualQuery and VirtualProtect read 0x20 for a page the program made 0x40, and
+100 of 100 such writes reached the program's handler). Copy protections guard their code pages this way, and
+Microsoft Flight Simulator 2024's ran into an unmapped page 45 s into every flight once FEX re-protected pages more
+often (smc-retire).
+
+The emulator gains an export, GuestProtection (address, protection): the protection the program set, given the
+one the page has. NtProtectVirtualMemory passes its old protection through it before the post-call notification
+updates the emulator's view, and NtQueryVirtualMemory (now wrapped like the other memory calls) passes the
+Protect of a committed region through it for MemoryBasicInformation. The emulator's own calls skip both, as they
+skip the notifications. An emulator without the export changes nothing.
+
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -62,6 +62,7 @@
+ static void     (WINAPI *pKeepX64DebugRegisters)(CONTEXT*);
+ static BOOL     (WINAPI *pGetX64Mxcsr)(UINT*);
+ static BOOL     (WINAPI *pSetX64Mxcsr)(UINT);
++static ULONG    (WINAPI *pGuestProtection)(void*,ULONG);
+ 
+ static BOOLEAN emulated_processor_features[PROCESSOR_FEATURE_MAX];
+ static BYTE KiUserExceptionDispatcher_orig[16]; /* to detect patching */
+@@ -251,6 +252,7 @@
+     GET_PTR( KeepX64DebugRegisters );
+     GET_PTR( GetX64Mxcsr );
+     GET_PTR( SetX64Mxcsr );
++    GET_PTR( GuestProtection );
+ #undef GET_PTR
+ 
+     RtlGetCurrentPeb()->ChpeV2ProcessInfo = info;
+@@ -560,7 +562,7 @@
+ DEFINE_SYSCALL(NtQueryTimer, (HANDLE handle, TIMER_INFORMATION_CLASS class, void *info, ULONG len, ULONG *ret_len))
+ DEFINE_SYSCALL(NtQueryTimerResolution, (ULONG *min_res, ULONG *max_res, ULONG *current_res))
+ DEFINE_SYSCALL(NtQueryValueKey, (HANDLE handle, const UNICODE_STRING *name, KEY_VALUE_INFORMATION_CLASS info_class, void *info, DWORD length, DWORD *result_len))
+-DEFINE_SYSCALL(NtQueryVirtualMemory, (HANDLE process, LPCVOID addr, MEMORY_INFORMATION_CLASS info_class, PVOID buffer, SIZE_T len, SIZE_T *res_len))
++DEFINE_WRAPPED_SYSCALL(NtQueryVirtualMemory, (HANDLE process, LPCVOID addr, MEMORY_INFORMATION_CLASS info_class, PVOID buffer, SIZE_T len, SIZE_T *res_len))
+ DEFINE_SYSCALL(NtQueryVolumeInformationFile, (HANDLE handle, IO_STATUS_BLOCK *io, void *buffer, ULONG length, FS_INFORMATION_CLASS info_class))
+ DEFINE_SYSCALL(NtQueueApcThread, (HANDLE handle, PNTAPCFUNC func, ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3))
+ DEFINE_SYSCALL(NtQueueApcThreadEx, (HANDLE handle, HANDLE reserve_handle, PNTAPCFUNC func, ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3))
+@@ -872,6 +874,10 @@
+     else if (pNotifyMemoryProtect) pNotifyMemoryProtect( *addr_ptr, *size_ptr, new_prot, FALSE, 0 );
+ 
+     status = syscall_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
++
++    /* Highball: the emulator may have made the page read-execute to see writes into translated code; the program
++     * gets back the protection it set itself (asked before the notification below updates what the emulator knows) */
++    if (!status && is_current && old_prot && pGuestProtection) *old_prot = pGuestProtection( *addr_ptr, *old_prot );
+ 
+     if (!is_current) send_cross_process_notification( process, CrossProcessPostVirtualProtect,
+                                                       *addr_ptr, *size_ptr, 2, new_prot, status );
+@@ -881,6 +887,27 @@
+     return status;
+ }
+ 
++/* Highball: a page the emulator made read-execute to see writes into translated code reads back with the protection
++ * the program set itself, as on Windows, where no such step exists */
++NTSTATUS SYSCALL_API NtQueryVirtualMemory( HANDLE process, LPCVOID addr, MEMORY_INFORMATION_CLASS info_class,
++                                           PVOID buffer, SIZE_T len, SIZE_T *res_len )
++{
++    NTSTATUS status;
++
++    if (!enter_syscall_callback())
++        return syscall_NtQueryVirtualMemory( process, addr, info_class, buffer, len, res_len );
++
++    status = syscall_NtQueryVirtualMemory( process, addr, info_class, buffer, len, res_len );
++    if (!status && info_class == MemoryBasicInformation && len >= sizeof(MEMORY_BASIC_INFORMATION) &&
++        pGuestProtection && RtlIsCurrentProcess( process ))
++    {
++        MEMORY_BASIC_INFORMATION *info = buffer;
++        if (info->State == MEM_COMMIT) info->Protect = pGuestProtection( info->BaseAddress, info->Protect );
++    }
++    leave_syscall_callback();
++    return status;
++}
++
+ NTSTATUS SYSCALL_API NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class, void *info, ULONG size, ULONG *ret_size )
+ {
+     NTSTATUS status = syscall_NtQuerySystemInformation( class, info, size, ret_size );
