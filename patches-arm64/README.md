@@ -194,3 +194,9 @@ with it (MoltenVK and the Vulkan headers from Homebrew).
   gets the exception's code, address and parameters, rip, rsp, rbp, eflags and the general registers, with the TEB
   stack bounds and a note when rsp is outside them. Wine's own line names only the instruction; winedbg --auto is too
   slow on a 25 GB process; +seh costs MSFS 2024 two to three times its loading time. First chances print nothing.
+- `0042-ntdll-arm64ec-rtliseccode-above-the-user-address-space.patch`: RtlIsEcCode answers FALSE for an address
+  above the user address space instead of reading past the ARM64EC code map. When the unwinder met a garbage
+  return address, the fault was dispatched through the same unwind and faulted again, about 280 times, until the
+  thread's stack ran out: Microsoft Flight Simulator 2024's main thread hung this way 45 s into every flight with
+  FEX's store replay and retirement both on (2026-10-18), and once before (boot73, 2026-10-16). Windows answers
+  FALSE there.

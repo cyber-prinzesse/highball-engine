@@ -99,6 +99,12 @@ them. That is the default since 2026-10-11. Dispatched with `fex_build: hangover
   data-writing thread, with eight versions, with a protection change between rounds); `smcpatch` 64
   and 32-bit, `drtest` 64 and 32-bit, `fibertest`, `ctxtest`, `memtest`, `kattest`, `tsctest` and the
   string resume pass.
+- `0021` makes `0019` and `0020` opt-in: `HB_FEX_SMC_REPLAY=1` turns the replay on, `HB_FEX_SMC_RETIRE=1`
+  retirement. With both on, Microsoft Flight Simulator 2024 hung 45 s into every flight on the M4 (three of three,
+  2026-10-18: its main thread ran into an unmapped page and Wine's unwinder recursed until the stack ran out, which
+  `patches-arm64/0042` stops); either one alone flew. Diagnosis switches for the search: `HB_FEX_SMC_REINSTATE=0`
+  (retire, never reinstate), `=2` (reinstate only where no page protection changes), `HB_FEX_SMC_SAME=0` (write
+  stores that change nothing), `HB_FEX_SMC_VERIFY=1` (read every replayed store back).
 
 32-bit programs were measured with the engine built by CI (it has the i386 half): x87test32 120/128,
 the same eight x87 gaps as the 64-bit build; the string resume and the code patching probe pass.
