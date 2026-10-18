@@ -1,0 +1,105 @@
+CloseThreadpoolIo must not free a threadpool IO object that the completion
+thread is already releasing.
+
+TpReleaseIoCompletion() set shutting_down and, when pending_count and
+skipped_count were both 0, called tp_ioqueue_unlock(). That function asserts
+ioqueue.objcount (threadpool.c:2102) and then drops the object. The completion
+thread does the same drop when it dequeues a packet, sees shutting_down, and
+finds pending_count already 0. CancelThreadpoolIo() produces that state: it
+decrements pending_count while the completion is still queued. Whichever side
+runs second aborts in the assert, or frees the object twice.
+
+Scam With Your Friends (Unity 6000.3, Mono) hits this on every Kolkata OS
+recording teardown. The recorder disposes its audio named pipe from
+KolkataRecordingAudioSession.WriteAudio (KolkataWebMRecorder.cs:1729), Mono
+calls CloseThreadpoolIo, and ntdll aborts. Three crashes on 2026-10-18
+(13:04, 13:12, 13:26 UTC) on engine x64-crossover26.3-r4, macOS 27, Apple
+Silicon: the faulting instruction is RtlRaiseStatus from _assert, the caller
+is tp_object_prepare_shutdown, and the return into TpReleaseIoCompletion is
+the instruction after that call. The r4 ntdll strings are
+"../src/sources/wine/dlls/ntdll/threadpool.c", "ioqueue.objcount", line
+0x836. A later crash the same day was in d3d11 and is not this bug.
+
+CloseThreadpoolIo now only marks the object and posts one completion,
+STATUS_THREADPOOL_RELEASED_DURING_OPERATION, with the object as key. The
+completion thread ignores packets for an object that is already marked and
+releases it exactly once, when that marker is dequeued. Packets queued ahead
+of the marker are skipped rather than dispatched into a freed object.
+tp_ioqueue_unlock() no longer asserts when the count is already 0, so a
+cleanup-group shutdown cannot abort the process on the same line.
+
+Not yet built or run in the game. Upstream used this single-owner release in
+Paul Gofman's April 2021 threadpool IO queue (wine-devel, "Release IO thread
+pool object from ioqueue_thread_proc"); the July 2021 can_destroy path that
+Wine 11 and current master still ship is what races. The lost GetLastError()
+that makes the game log "recording audio pipe failed: Success" on r4 is
+patch 0011, which a build of this series already includes.
+
+--- a/dlls/ntdll/threadpool.c	2026-10-18 20:23:16
++++ b/dlls/ntdll/threadpool.c	2026-10-18 20:23:16
+@@ -1552,7 +1552,20 @@
+ 
+         TRACE( "io %p, iosb.Status %#lx.\n", io, iosb.Status );
+ 
+-        if (io && (io->shutdown || io->u.io.shutting_down))
++        /* TpReleaseIoCompletion() posts one marker and does not free the
++         * object. Packets already queued in front of it must not release
++         * it, and must not run a callback on it either. */
++        if (io && io->shutdown)
++        {
++            if (iosb.Status == STATUS_THREADPOOL_RELEASED_DURING_OPERATION && ioqueue.objcount)
++            {
++                --ioqueue.objcount;
++                TRACE( "Releasing io %p.\n", io );
++                tp_object_release( io );
++            }
++            io = NULL;
++        }
++        else if (io && io->u.io.shutting_down)
+         {
+             RtlEnterCriticalSection( &io->pool->cs );
+             if (!io->u.io.pending_count)
+@@ -2099,7 +2112,11 @@
+ 
+     RtlEnterCriticalSection( &ioqueue.cs );
+ 
+-    assert(ioqueue.objcount);
++    if (!ioqueue.objcount)
++    {
++        RtlLeaveCriticalSection( &ioqueue.cs );
++        return;
++    }
+ 
+     if (!io->shutdown && !--ioqueue.objcount)
+         NtSetIoCompletion( ioqueue.port, 0, 0, STATUS_SUCCESS, 0 );
+@@ -2874,21 +2891,19 @@
+ void WINAPI TpReleaseIoCompletion( TP_IO *io )
+ {
+     struct threadpool_object *this = impl_from_TP_IO( io );
+-    BOOL can_destroy;
+ 
+     TRACE( "%p\n", io );
+ 
+-    RtlEnterCriticalSection( &this->pool->cs );
+-    this->u.io.shutting_down = TRUE;
+-    can_destroy = !this->u.io.pending_count && !this->u.io.skipped_count;
+-    RtlLeaveCriticalSection( &this->pool->cs );
+-
+-    if (can_destroy)
+-    {
+-        tp_object_prepare_shutdown( this );
+-        this->shutdown = TRUE;
+-        tp_object_release( this );
++    /* The completion thread releases the object when it dequeues the marker
++     * posted here. Freeing on this thread races that release. */
++    RtlEnterCriticalSection( &ioqueue.cs );
++    if (ioqueue.objcount && !this->shutdown)
++    {
++        this->shutdown = TRUE;
++        NtSetIoCompletion( ioqueue.port, (ULONG_PTR)this, 0,
++                STATUS_THREADPOOL_RELEASED_DURING_OPERATION, 1 );
+     }
++    RtlLeaveCriticalSection( &ioqueue.cs );
+ }
+ 
+ /***********************************************************************
