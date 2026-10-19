@@ -4,8 +4,13 @@
 |---|---|---|---|
 | Wine (CrossOver sources) | media.codeweavers.com/pub/crossover/source | LGPL-2.1-or-later | yes, as the engine |
 | Highball patch series | patches/ | LGPL-2.1-or-later | yes |
-| MoltenVK | github.com/KhronosGroup/MoltenVK | Apache-2.0 | yes |
-| DXVK (macOS build) | github.com/doitsujin/dxvk, Gcenx/DXVK-macOS | zlib | as a renderer overlay |
+| Highball patch series of the arm64 line | patches-arm64/ (Wine), fex/patches/ (FEX), moltenvk-arm64/ (MoltenVK, SPIRV-Cross), renderers-arm64/ (vkd3d-proton, DXVK) | the licence of the component each patch changes | yes |
+| MoltenVK (the Intel line's build, and 1.4.2 with moltenvk-arm64/moltenvk/ for the arm64 line) | github.com/KhronosGroup/MoltenVK | Apache-2.0 | yes |
+| SPIRV-Cross (built into the arm64 line's MoltenVK, with moltenvk-arm64/spirv-cross/) | github.com/KhronosGroup/SPIRV-Cross | Apache-2.0 | yes, inside MoltenVK |
+| Mesa (the Apple GPU miptree layout of src/asahi/layout/layout.c, which moltenvk-arm64 patch 0010 follows) | gitlab.freedesktop.org/mesa/mesa | MIT | yes, inside MoltenVK |
+| DXVK (the macOS build on the Intel line, and master 1cad6cd with renderers-arm64/dxvk/ on the arm64 line) | github.com/doitsujin/dxvk, Gcenx/DXVK-macOS | zlib | as a renderer overlay |
+| vkd3d-proton (v3.0.1 with renderers-arm64/vkd3d-proton/, arm64 line) | github.com/HansKristian-Work/vkd3d-proton | LGPL-2.1-or-later | yes, as the arm64 engine's vkd3d renderer overlay |
+| dxil-spirv (built into vkd3d-proton) | github.com/HansKristian-Work/dxil-spirv | MIT | yes, inside vkd3d-proton |
 | DXMT | github.com/3Shain/dxmt | see upstream LICENSE | as a renderer overlay |
 | winetricks | github.com/Winetricks/winetricks | LGPL-2.1 | as a tool |
 | wine-mono, wine-gecko | dl.winehq.org | MIT / MPL | as Wine expects |
