@@ -8,15 +8,19 @@ same call table as FEX's Linux helper, with BSD calls, and TSO through `thread_s
 `build-arm64` builds `libarm64ecfex.dll` and `libwow64fex.dll` from FEX 2610 (`inputs-arm64.json`,
 `fex-source`) with this series applied, for x86-64 programs that see what real x86-64 Windows shows
 them. That is the default since 2026-10-11. Dispatched with `fex_build: hangover`, it uses Hangover
-11.16's FEX 2608 DLLs instead, which have none of this. Each patch was measured with
-`tests/x64-fidelity`, whose expectations hold on real x86-64 Windows, on an M1 Pro (2026-10-10 and
-2026-10-11). The Wine half is `patches-arm64/0022` to `0029`.
+11.16's FEX 2608 DLLs instead, which have none of this. 0001 to 0017 were measured with
+`tests/x64-fidelity`, whose expectations hold on real x86-64 Windows, on an M1 Pro and an M4 (2026-10-10
+and 2026-10-11), 0018 to 0023 on an M4 between 2026-10-12 and 2026-10-19 (`ordertest`, `smcdata` and
+`smcretire` are in `tests/x64-fidelity`, but `fpexc`, `smcpatch` and `smcprot` are not in this repository yet).
+The Wine half is `patches-arm64/0022` to `0029` and `0043`. A one-line summary of each patch is in
+[`patches/README.md`](patches/README.md). None has been sent to FEX upstream yet.
 
 - `0001` floating-point exceptions: unmasked SSE and x87 exceptions trap (FPCR trap enables armed
   from MXCSR in JIT code only), MXCSR status flags live in FPSR as on ARM64EC Windows, x87 status
   flags from SoftFloat, x87 #MF before the next waiting instruction.
 - `0002` integer divide errors: DIV and IDIV by zero raise STATUS_INTEGER_DIVIDE_BY_ZERO and a
   quotient overflow STATUS_INTEGER_OVERFLOW at the instruction (.NET, Mono and Java rely on them).
+  64-bit programs only: the check is emitted for ARM64EC, not for the WoW64 module.
 - `0003` the x64 state an ARM64 context has no room for (x87 words, EFLAGS, DAZ, YMM upper halves)
   travels through ntdll; exception handlers run with DF and TF clear.
 - `0004` FEX's own C++ code (compiler, linker) no longer leaves the inexact flag in the guest's
@@ -80,7 +84,7 @@ them. That is the default since 2026-10-11. Dispatched with `fex_build: hangover
   `fexunixlib_darwin.cpp`: `mach_vm_remap`), steps past it and keeps the page protected, so another
   thread's write into code on that page still faults. Stores that change nothing are skipped. Stores
   into code, undecoded stores and more than 2,000 replays into a page within 100 ms
-  (`HB_FEX_SMC_BURST`) take the old path; `HB_FEX_SMC_REPLAY=0` turns it off. `smcdata.exe` on the M4:
+  (`HB_FEX_SMC_BURST`) take the old path. Added on by default, off since `0021` unless `HB_FEX_SMC_REPLAY=1`. `smcdata.exe` on the M4:
   data beside a translated function 2.6 times faster, 0 stale calls with code rewritten beside a
   thread writing data (opening the page for the store instead ran stale code 1,960 times in 2,000).
   The DLL and the helper go together: the helper's call table gains `AliasWrite`, and Wine's unix
@@ -94,7 +98,8 @@ them. That is the default since 2026-10-11. Dispatched with `fex_build: hangover
   pages again, hashes the bytes and maps the old host code back when they match. Any other invalidation
   (protection change, free, unmap) purges the retired blocks on its pages, and blocks compiled for
   single steps, breakpoints, an instruction limit or with an instruction that failed to decode are
-  never kept. `HB_FEX_SMC_RETIRE=0` turns it off. `smcretire.exe` on the M4: decrypt, run, encrypt 41
+  never kept. Added on by default, off since `0021` unless `HB_FEX_SMC_RETIRE=1` (the Microsoft Flight
+  Simulator 2024 recipe sets it). `smcretire.exe` on the M4: decrypt, run, encrypt 41
   against 155 us a round, two versions in turn 38 against 171 us, 0 stale calls in every case (beside a
   data-writing thread, with eight versions, with a protection change between rounds); `smcpatch` 64
   and 32-bit, `drtest` 64 and 32-bit, `fibertest`, `ctxtest`, `memtest`, `kattest`, `tsctest` and the
@@ -120,7 +125,15 @@ them. That is the default since 2026-10-11. Dispatched with `fex_build: hangover
   `HB_FEX_SMC_DEFER_CALLRET=1` clears call-return stacks after the compile lock is released, `HB_FEX_WFE_US` sets the
   write-priority mutexes' spin, and `HB_FEX_HOST_ZERO=1` clears FEX's own memory with one call into
   `fexunixlib_darwin.cpp` (`ZeroPages`) instead of an ntdll decommit and commit. With `FEX_PROFILESTATS=1` it counts
-  translation and lock time per thread and what each invalidating write writes. The x86-64 fidelity programs pass
+  translation and lock time per thread and what each invalidating write writes. Also in the patch:
+  `HB_FEX_SMC_SKIP_BURST` (default 64) and `HB_FEX_SMC_HOT_SECONDS` (default 5) tune the skip and the small compile
+  units, and `HB_FEX_RWX_MAXINST` and `HB_FEX_RWX_NOCALLS` are kept for measurement only (they cost the game 24% of its
+  frame rate). `HB_FEX_WFE_US` defaults to 10 us, which is what FEX 2610's own wait computes
+  (`CycleCounterFrequency / CYCLECOUNT_DIVISOR`), so an unset variable changes nothing. The Microsoft Flight
+  Simulator 2024 recipe sets `HB_FEX_SMC_SKIP_SAME=1`, `HB_FEX_SMC_HOT_MAXINST=64`, `HB_FEX_VM_FASTPATH=1` and
+  `HB_FEX_SMC_DEFER_CALLRET=1`. The patch adds `ZeroPages` to the call table without a handler in FEX's Linux helper
+  (`Source/Windows/UnixLib/FEXUnixLib.cpp`), whose table-size check then fails: Highball builds only the Darwin
+  helper, but the series does not build FEX's Linux helper as it stands. The x86-64 fidelity programs pass
   with every switch off and on (`memtest`'s `code.writeprocessmemory` fails with 0022 as well).
 
 32-bit programs were measured with the engine built by CI (it has the i386 half): x87test32 120/128,
