@@ -110,6 +110,18 @@ them. That is the default since 2026-10-11. Dispatched with `fex_build: hangover
   tracking, and the program saw that (VirtualQuery and VirtualProtect's old protection read 0x20 for a page it made
   0x40). A program that saved a page's protection, changed it and restored the saved value locked its own page and
   faulted on its next write (`smcprot.exe`, 100 of 100). Copy protections guard their pages this way.
+- `0023` adds opt-in work against Microsoft Flight Simulator 2024's code rewriting, all off unless its variable is
+  set. Measured on a base M4: the game's stutter is its main thread recompiling code the copy protection rewrites,
+  about 220 page invalidations a second, in the memory that also holds the game's own code. `HB_FEX_SMC_SKIP_SAME=1`
+  steps over a store of the bytes already in memory without invalidating (36% of those faults in the game),
+  `HB_FEX_SMC_HOT_MAXINST` caps compile units only on pages a write fault invalidated recently, and
+  `HB_FEX_SMC_GRAVE_SETS` sizes smc-retire's graveyard. `HB_FEX_VM_FASTPATH=1` lets memory calls that cannot concern
+  translated code skip `ThreadCreationMutex` (held across every memory system call before),
+  `HB_FEX_SMC_DEFER_CALLRET=1` clears call-return stacks after the compile lock is released, `HB_FEX_WFE_US` sets the
+  write-priority mutexes' spin, and `HB_FEX_HOST_ZERO=1` clears FEX's own memory with one call into
+  `fexunixlib_darwin.cpp` (`ZeroPages`) instead of an ntdll decommit and commit. With `FEX_PROFILESTATS=1` it counts
+  translation and lock time per thread and what each invalidating write writes. The x86-64 fidelity programs pass
+  with every switch off and on (`memtest`'s `code.writeprocessmemory` fails with 0022 as well).
 
 32-bit programs were measured with the engine built by CI (it has the i386 half): x87test32 120/128,
 the same eight x87 gaps as the 64-bit build; the string resume and the code patching probe pass.

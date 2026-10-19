@@ -12,7 +12,7 @@
 #include <mach/mach_vm.h>
 #include <cstring>
 
-enum class FEXUnixLibFunctions : uint32_t { SetHardwareTSOControl, SetKernelUnalignedAtomicControl, Madvise, SetVMAName, GetSHMStatsVMA, DeleteSHMStatsFile, MapFile, GetPID, AliasWrite, MAX };
+enum class FEXUnixLibFunctions : uint32_t { SetHardwareTSOControl, SetKernelUnalignedAtomicControl, Madvise, SetVMAName, GetSHMStatsVMA, DeleteSHMStatsFile, MapFile, GetPID, AliasWrite, ZeroPages, MAX };
 struct FEXUnixLib_SetHardwareTSOControlArgs { bool Enable; };
 struct FEXUnixLib_SetKernelUnalignedAtomicControl { uint64_t Flags; };
 struct FEXUnixLib_Madvise { const void* Addr; size_t Size; int32_t Advise; uint32_t pad; };
@@ -21,6 +21,7 @@ struct FEXUnixLib_GetSHMStatsVMA { void* SHMBase; uint32_t MapSize; uint32_t Max
 struct FEXUnixLib_MapFile { int32_t FD; uint64_t MapSize; void* Result; };
 struct FEXUnixLib_GetPID { uint32_t Result; };
 struct FEXUnixLib_AliasWrite { void* Addr; const void* Data; uint32_t Size; uint32_t Pad; };
+struct FEXUnixLib_ZeroPages { void* Addr; uint64_t Size; uint32_t Prot; uint32_t Pad; };
 
 using NTSTATUS = int32_t;
 using unixlib_entry_t = NTSTATUS (*)(void*);
@@ -106,9 +107,18 @@ static NTSTATUS AliasWrite(void* _Args) {
   mach_vm_deallocate(mach_task_self(), Alias, vm_page_size);
   return kr == KERN_SUCCESS ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
 }
+// Highball HB_FEX_HOST_ZERO (2026-10-19): fresh zero pages over a range of FEX's own memory, in one call and atomically
+// for the other threads (the ntdll path decommits and commits again: two notified memory calls)
+static NTSTATUS ZeroPages(void* _Args) {
+  auto Args = reinterpret_cast<const FEXUnixLib_ZeroPages*>(_Args);
+  if (Args->Prot & ~(uint32_t)(PROT_READ | PROT_WRITE)) { return STATUS_NOT_SUPPORTED; }
+  void* r = mmap(Args->Addr, Args->Size, (int)Args->Prot, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (r != Args->Addr) { trace("ZeroPages", (long)Args->Addr, (long)Args->Size); return STATUS_INTERNAL_ERROR; }
+  return STATUS_SUCCESS;
+}
 static NTSTATUS GetPID(void* _Args) { trace("GetPID", 0, 0); reinterpret_cast<FEXUnixLib_GetPID*>(_Args)->Result = getpid(); return STATUS_SUCCESS; }
 
 extern "C" __attribute__((visibility("default"))) const unixlib_entry_t __wine_unix_call_funcs[] = {
-  TSOControl, UnalignedAtomicControl, Madvise, SetVMAName, GetSHMStatsVMA, DeleteSHMStatsFile, MapFile, GetPID, AliasWrite,
+  TSOControl, UnalignedAtomicControl, Madvise, SetVMAName, GetSHMStatsVMA, DeleteSHMStatsFile, MapFile, GetPID, AliasWrite, ZeroPages,
 };
 static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == static_cast<uint32_t>(FEXUnixLibFunctions::MAX));
