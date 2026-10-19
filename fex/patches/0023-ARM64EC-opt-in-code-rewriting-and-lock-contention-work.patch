@@ -1,0 +1,1176 @@
+From: Gauthier Piarrette <gauthierpiarrette@gmail.com>
+Subject: [PATCH] ARM64EC: opt-in work on code rewriting and lock contention (Microsoft Flight Simulator 2024)
+
+Every switch is off unless its variable is set; with none set the build behaves as 0001-0022.
+
+Measured on a base M4 in MSFS 2024 (2026-10-19, Gibraltar, three park-and-taxi windows a flight): the stutter is the
+game's main thread recompiling code its copy protection rewrites (about 220 page invalidations a second; the game's
+own code lives in the same read-write-execute memory).
+
+- HB_FEX_SMC_SKIP_SAME=1: a write fault whose store writes the bytes already in memory is stepped over (PC + 4, the
+  base register's writeback applied), the page kept protected and nothing invalidated, from translated or native code;
+  release stores, exclusives, atomics and page-crossing stores take the old path, as does a page past
+  HB_FEX_SMC_SKIP_BURST skips (default 64) within 100 ms. 36% of the invalidating faults in MSFS 2024.
+- HB_FEX_SMC_GRAVE_SETS=N: the smc-retire graveyard's set count (default 4096, 4 ways).
+- HB_FEX_SMC_HOT_MAXINST=N, HB_FEX_SMC_HOT_SECONDS=S (default 5): compile units starting on a page a write fault
+  invalidated within S seconds are capped at N instructions and end at calls.
+- HB_FEX_VM_FASTPATH=1: NtAllocateVirtualMemory, NtFreeVirtualMemory and NtProtectVirtualMemory calls that cannot
+  concern translated code (no executable protection, no executable interval in the range) skip ThreadCreationMutex,
+  which the memory notifications otherwise hold across the system call.
+- HB_FEX_SMC_DEFER_CALLRET=1: the call-return stacks an invalidation must clear (a decommit and a commit each on
+  Windows) are cleared after CodeInvalidationMutex is released, under ThreadCreationMutex.
+- HB_FEX_WFE_US=N: how long a waiter on FEX's write-priority mutexes spins before it sleeps (default 10 us).
+- HB_FEX_HOST_ZERO=1: FEX clears its own memory with one call into the unix library (fexunixlib_darwin.cpp
+  ZeroPages, an mmap MAP_FIXED of zero pages) instead of an ntdll decommit and commit.
+- HB_FEX_RWX_MAXINST, HB_FEX_RWX_NOCALLS: the same cap for every unit in read-write-execute memory (cost MSFS 2024 24%
+  of its frame rate: not for use, kept for measurement).
+- FEX_PROFILESTATS=1 counters (per thread): guest instructions translated and their read-write-execute share, compile
+  time proper, waits for CodeInvalidationMutex (compile, link, write fault: wait and hold, with the hold's parts),
+  ThreadCreationMutex waits and holds around memory calls, what each invalidating write fault writes (unchanged or
+  changed bytes, from translated or native code, the last native PC), and the hot-page compiles.
+---
+diff --git a/FEXCore/Source/Interface/Context/Context.h b/FEXCore/Source/Interface/Context/Context.h
+index 35b816b..b091bba 100644
+--- a/FEXCore/Source/Interface/Context/Context.h
++++ b/FEXCore/Source/Interface/Context/Context.h
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: MIT
+ #pragma once
++#include <FEXCore/Utils/SHMStats.h>
++#include <array>
+ 
+ #include "Common/JitSymbols.h"
+ #include "Interface/Core/CPUBackend.h"
+@@ -230,6 +232,28 @@ public:
+   bool SMCMarkPageCode(uint64_t Page, uint64_t Start, uint64_t Length, uint8_t* Mask) override;
+   void RetireCodeBuffersCodeRange(uint64_t Start, uint64_t Length) override;
+   void InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override;
++  void SetCallRetResetSink(CallRetResetSink* Sink) override {
++    HbCallRetSink = Sink;
++  }
++  void ResetThreadCallRetStack(FEXCore::Core::InternalThreadState* Thread) override;
++  CallRetResetSink* HbCallRetSink {}; // protected by CodeInvalidationMutex (exclusive)
++  // Highball HB_FEX_SMC_HOT_MAXINST: pages write faults invalidated, with when (cycle counter); a direct-mapped table
++  // written under CodeInvalidationMutex exclusive, read by compiles under it shared
++  struct HbHotPage {
++    uint64_t Page;
++    uint64_t Stamp;
++  };
++  std::array<HbHotPage, 8192> HbHotPages {};
++  void HbMarkSMCPage(uint64_t Page) override {
++    auto& E = HbHotPages[(Page >> 12) % HbHotPages.size()];
++    E.Page = Page;
++    E.Stamp = FEXCore::SHMStats::GetCycleCounter();
++  }
++  bool HbIsHotSMCPage(uint64_t Address, uint64_t WindowCycles) const {
++    const uint64_t Page = Address & ~0xFFFULL;
++    const auto& E = HbHotPages[(Page >> 12) % HbHotPages.size()];
++    return E.Page == Page && FEXCore::SHMStats::GetCycleCounter() - E.Stamp < WindowCycles;
++  }
+   FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() override {
+     return CodeInvalidationMutex;
+   }
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index c0cedc9..97550d7 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -933,6 +933,14 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
+   // Generate IR + Meta Info
+   auto [IRView, TotalInstructions, TotalInstructionsLength, StartAddr, Length, NeedsAddGuestCodeRanges] =
+     GenerateIR(Thread, GuestRIP, Config.GDBSymbols(), MaxInst);
++  FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITInstructions, TotalInstructions);
++  if (Thread->FrontendDecoder->IsEntryWritable()) {
++    FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITWritableInstructions, TotalInstructions);
++  }
++  if (Thread->FrontendDecoder->IsEntryHot()) {
++    FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITHotCount, 1);
++    FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITHotInstructions, TotalInstructions);
++  }
+   if (!IRView) {
+     Thread->FrontendDecoder->ValidateDisownedOrFree();
+     Thread->OpDispatcher->ValidateDisownedOrFree();
+@@ -1005,7 +1013,11 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
+   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
+ 
+   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
++  const uint64_t LockBegin = Thread->ThreadStats ? FEXCore::SHMStats::GetCycleCounter() : 0;
+   auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
++  if (Thread->ThreadStats) {
++    Thread->ThreadStats->AccumulatedJITLockWaitTime += FEXCore::SHMStats::GetCycleCounter() - LockBegin;
++  }
+ 
+   // Is the code in the cache?
+   // The backends only check L1 and L2, not L3
+@@ -1075,7 +1087,16 @@ RecompileForSMC:
+   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
+   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
+ 
++  const uint64_t CompileBegin = Thread->ThreadStats ? FEXCore::SHMStats::GetCycleCounter() : 0;
+   auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
++  if (Thread->ThreadStats) {
++    const uint64_t Took = FEXCore::SHMStats::GetCycleCounter() - CompileBegin;
++    Thread->ThreadStats->AccumulatedJITCompileTime += Took;
++    if (Thread->FrontendDecoder->IsEntryWritable()) {
++      Thread->ThreadStats->AccumulatedJITWritableCount++;
++      Thread->ThreadStats->AccumulatedJITWritableTime += Took;
++    }
++  }
+   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
+   if (CodePtr == nullptr) {
+     return 0;
+@@ -1141,7 +1162,11 @@ RecompileForSMC:
+     bool ProtectedNow = false;
+     for (auto CodePage : BlockInfo->CodePages) {
+       if (Thread->LookupCache->AddBlockExecutableRange(Thread, BlockInfo->EntryPoints, CodePage, FEXCore::Utils::FEX_PAGE_SIZE)) {
++        const uint64_t ProtectBegin = Thread->ThreadStats ? FEXCore::SHMStats::GetCycleCounter() : 0;
+         SyscallHandler->MarkGuestExecutableRange(Thread, CodePage, FEXCore::Utils::FEX_PAGE_SIZE);
++        if (Thread->ThreadStats) {
++          Thread->ThreadStats->AccumulatedJITProtectTime += FEXCore::SHMStats::GetCycleCounter() - ProtectBegin;
++        }
+         ProtectedNow = true;
+       }
+     }
+@@ -1396,11 +1421,19 @@ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadS
+   if (Thread->LookupCache->InvalidateCacheRange(Start, Length)) {
+     FEXCORE_PROFILE_SCOPED("InvalidateCallRet");
+ 
++    if (HbCallRetSink && HbCallRetSink->Count < std::size(HbCallRetSink->Threads)) {
++      HbCallRetSink->Threads[HbCallRetSink->Count++] = Thread;
++      return;
++    }
+     // This may cause access violations in the thread on Windows as zeroing is not atomic, this is handled by the frontend
+     Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+   }
+ }
+ 
++void ContextImpl::ResetThreadCallRetStack(FEXCore::Core::InternalThreadState* Thread) {
++  Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
++}
++
+ void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+   static_cast<ContextImpl*>(Frame->Thread->CTX)->SyscallHandler->InvalidateGuestCodeRange(Frame->Thread, GuestRIP, 1);
+ }
+@@ -1515,3 +1548,9 @@ void ContextImpl::ConfigureAOTGen(FEXCore::Core::InternalThreadState* Thread, fe
+   Thread->FrontendDecoder->SetExternalBranches(ExternalBranches);
+ }
+ } // namespace FEXCore::Context
++
++#ifdef _WIN32
++namespace FEXCore::Allocator {
++bool (*HbZeroPagesHook)(void* Ptr, size_t Size, uint32_t WinProt) = nullptr;
++}
++#endif
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index 75f17ce..ba522f5 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -6,6 +6,8 @@ desc: Extracts instruction & block meta info, frontend multiblock logic
+ $end_info$
+ */
+ 
++#include <FEXCore/Utils/SpinWaitLock.h>
++#include <cstdlib>
+ #include "Interface/Context/Context.h"
+ #include "Interface/Core/Frontend.h"
+ #include "Interface/Core/OpcodeDispatcher.h"
+@@ -1138,7 +1140,12 @@ void Decoder::BranchTargetInMultiblockRange() {
+   const auto InstEnd = DecodeInst->PC + DecodeInst->InstSize;
+ 
+   if (DecodeInst->TableInfo->Flags & FEXCore::X86Tables::InstFlags::FLAGS_CALL) {
+-    if (ExecutableRangeWritable && CTX->AreMonoHacksActive()) {
++    // Highball (2026-10-19): HB_FEX_RWX_NOCALLS=1 stops at calls for any code in read-write-execute memory
++    static const bool RwxNoCalls = [] {
++      const char* Env = getenv("HB_FEX_RWX_NOCALLS");
++      return Env && Env[0] == '1';
++    }();
++    if (ExecutableRangeWritable && (CTX->AreMonoHacksActive() || RwxNoCalls || EntryHot)) {
+       // Mono generated code often contains noreturn calls with garbage following them, and calls are always backpatched
+       // after CIL compilation leading to n recompiles for a multiblock with n calls. Choose to minimize stutters over
+       // raw performance and disable tracking past calls for mono generated code.
+@@ -1772,6 +1779,32 @@ void Decoder::SetupDecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState*
+   if (MaxInst == 0) {
+     MaxInst = CTX->Config.MaxInstPerBlock;
+   }
++  // Highball (2026-10-19): code in read-write-execute memory, a copy protection's or a JIT's, is rewritten often, and
++  // each rewrite translates again the whole compile unit holding it, on the thread that runs it next.
++  // HB_FEX_RWX_MAXINST caps the instructions of a unit that starts there (0, the default, leaves it as it is).
++  static const uint64_t RwxMaxInst = [] {
++    const char* Env = getenv("HB_FEX_RWX_MAXINST");
++    return Env && Env[0] ? strtoull(Env, nullptr, 10) : 0ULL;
++  }();
++  EntryWritable = Thread && CTX->SyscallHandler && CTX->SyscallHandler->QueryGuestExecutableRange(Thread, PC).Writable;
++  // Highball (2026-10-19): HB_FEX_SMC_HOT_MAXINST caps a unit starting on a page a write fault invalidated within
++  // HB_FEX_SMC_HOT_SECONDS (default 5); such units also end at calls
++  static const uint64_t HotMaxInst = [] {
++    const char* Env = getenv("HB_FEX_SMC_HOT_MAXINST");
++    return Env && Env[0] ? strtoull(Env, nullptr, 10) : 0ULL;
++  }();
++  static const uint64_t HotWindow = [] {
++    const char* Env = getenv("HB_FEX_SMC_HOT_SECONDS");
++    const uint64_t Seconds = Env && Env[0] ? strtoull(Env, nullptr, 10) : 5ULL;
++    return FEXCore::Utils::SpinWaitLock::CycleCounterFrequency * (Seconds ? Seconds : 1);
++  }();
++  EntryHot = HotMaxInst && EntryWritable && CTX->HbIsHotSMCPage(PC, HotWindow);
++  if (EntryHot && MaxInst > HotMaxInst) {
++    MaxInst = HotMaxInst;
++  }
++  if (EntryWritable && RwxMaxInst && MaxInst > RwxMaxInst) {
++    MaxInst = RwxMaxInst;
++  }
+   this->MaxInst = MaxInst;
+   MaxCondBranchForward = 0;
+   MaxCondBranchBackwards = ~0ULL;
+diff --git a/FEXCore/Source/Interface/Core/Frontend.h b/FEXCore/Source/Interface/Core/Frontend.h
+index c12579a..927ba1d 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.h
++++ b/FEXCore/Source/Interface/Core/Frontend.h
+@@ -92,6 +92,14 @@ public:
+     ExecutableRangeBase = ExecutableRangeEnd = 0;
+   }
+ 
++  // Highball: whether the current compile's entry point lies in read-write-execute memory
++  bool IsEntryWritable() const {
++    return EntryWritable;
++  }
++  bool IsEntryHot() const {
++    return EntryHot;
++  }
++
+ private:
+   // To pass any information from instruction prefixes
+   // down into the actual instruction handling machinery.
+@@ -154,6 +162,8 @@ private:
+   uint64_t ExecutableRangeBase {};
+   uint64_t ExecutableRangeEnd {};
+   bool ExecutableRangeWritable {};
++  bool EntryWritable {};
++  bool EntryHot {};
+   bool HitNonExecutableRange {};
+   bool HitBadRelocation {};
+ 
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index cff914c..98e7dd8 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -598,8 +598,12 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
+   } else {
+     {
+       // Guard the LookupCache lock with the code invalidation mutex, to avoid issues with forking
++      const uint64_t LockBegin = Thread->ThreadStats ? FEXCore::SHMStats::GetCycleCounter() : 0;
+       auto lk_inval =
+         GuardSignalDeferringSection<std::shared_lock>(static_cast<Context::ContextImpl*>(Thread->CTX)->CodeInvalidationMutex, Thread);
++      if (Thread->ThreadStats) {
++        Thread->ThreadStats->AccumulatedLinkLockWaitTime += FEXCore::SHMStats::GetCycleCounter() - LockBegin;
++      }
+       HostCode = Thread->LookupCache->FindBlock(Thread, GuestRip);
+     }
+     if (!HostCode) {
+@@ -622,10 +626,14 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
+   ExpectedKnownCallMarkerEmit.adr(TMP1, 0xC);
+ 
+   // Guard the LookupCache lock with the code invalidation mutex, to avoid issues with forking
++  const uint64_t LinkLockBegin = Thread->ThreadStats ? FEXCore::SHMStats::GetCycleCounter() : 0;
+   auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(static_cast<Context::ContextImpl*>(Thread->CTX)->CodeInvalidationMutex, Thread);
+ 
+   // Lock here is necessary to prevent simultaneous linking and delinking
+   auto lk = Thread->LookupCache->AcquireWriteLock();
++  if (Thread->ThreadStats) {
++    Thread->ThreadStats->AccumulatedLinkLockWaitTime += FEXCore::SHMStats::GetCycleCounter() - LinkLockBegin;
++  }
+ 
+   // For non-calls, this would extend into the block's code, however that's fine as an out-of-range adr would never
+   // be generated avoiding any false positives.
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.cpp b/FEXCore/Source/Interface/Core/LookupCache.cpp
+index 544ab1a..249d612 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.cpp
++++ b/FEXCore/Source/Interface/Core/LookupCache.cpp
+@@ -24,7 +24,10 @@ GuestToHostMap::GuestToHostMap()
+   // Highball smc-retire: opt-in (HB_FEX_SMC_RETIRE=1, see smc-precise's HB_FEX_SMC_REPLAY). Preallocated here so the
+   // write fault path never allocates (about 2 MB per code buffer).
+   if (const char* Retire = getenv("HB_FEX_SMC_RETIRE"); Retire && Retire[0] == '1') {
+-    Retired.resize(GRAVE_SETS * GRAVE_WAYS);
++    if (const char* Sets = getenv("HB_FEX_SMC_GRAVE_SETS"); Sets && Sets[0]) {
++      GraveSets = std::max<size_t>(1, strtoull(Sets, nullptr, 10));
++    }
++    Retired.resize(GraveSets * GRAVE_WAYS);
+     PurgeStamps.resize(PURGE_SLOTS);
+   }
+ }
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.h b/FEXCore/Source/Interface/Core/LookupCache.h
+index c62973a..f6987dc 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.h
++++ b/FEXCore/Source/Interface/Core/LookupCache.h
+@@ -109,7 +109,8 @@ struct GuestToHostMap {
+     fextl::vector<uint64_t> CodePages;
+     fextl::vector<std::pair<uint64_t, uint64_t>> Ranges;
+   };
+-  static constexpr size_t GRAVE_SETS = 4096;
++  // Highball (2026-10-19): HB_FEX_SMC_GRAVE_SETS overrides the number of sets (default 4096)
++  size_t GraveSets = 4096;
+   static constexpr size_t GRAVE_WAYS = 4;
+   // Pages whose code was invalidated for any other reason (protection change, free, unmap, an untracked write) since a
+   // block's retirement: such a block is not reinstated even when its bytes match, since what it was compiled against
+@@ -122,8 +123,8 @@ struct GuestToHostMap {
+   // Bumped by ClearCache: a reinstatement looked up before a clear is not committed after it
+   uint64_t ClearGeneration {};
+ 
+-  static size_t GraveSet(uint64_t Address) {
+-    return (Address * 0x9E3779B97F4A7C15ULL >> 32) % GRAVE_SETS;
++  size_t GraveSet(uint64_t Address) const {
++    return (Address * 0x9E3779B97F4A7C15ULL >> 32) % GraveSets;
+   }
+   static size_t PurgeSlot(uint64_t PageNumber) {
+     return (PageNumber * 0x9E3779B97F4A7C15ULL >> 40) % PURGE_SLOTS;
+diff --git a/FEXCore/Source/Utils/SpinWaitLock.cpp b/FEXCore/Source/Utils/SpinWaitLock.cpp
+index 3dba2d5..729e512 100644
+--- a/FEXCore/Source/Utils/SpinWaitLock.cpp
++++ b/FEXCore/Source/Utils/SpinWaitLock.cpp
+@@ -25,3 +25,17 @@ uint64_t CycleCounterFrequency = GetCycleCounterFrequency();
+ uint64_t CyclesPerNanosecond = CalculateCyclesPerNanosecond();
+ #endif
+ } // namespace FEXCore::Utils::SpinWaitLock
++
++#ifdef ARCHITECTURE_arm64
++#include <FEXCore/Utils/WritePriorityMutex.h>
++#include <cstdlib>
++namespace FEXCore::Utils::WritePriorityMutex {
++uint64_t HbSpinCycles = 0;
++uint64_t HbComputeSpinCycles() {
++  const char* Env = getenv("HB_FEX_WFE_US");
++  uint64_t Us = Env && Env[0] ? strtoull(Env, nullptr, 10) : 10;
++  const uint64_t Cycles = FEXCore::Utils::SpinWaitLock::CycleCounterFrequency * (Us ? Us : 1) / 1'000'000ULL;
++  return Cycles ? Cycles : 1;
++}
++} // namespace FEXCore::Utils::WritePriorityMutex
++#endif
+diff --git a/FEXCore/include/FEXCore/Core/Context.h b/FEXCore/include/FEXCore/Core/Context.h
+index c3ed817..2cf8a59 100644
+--- a/FEXCore/include/FEXCore/Core/Context.h
++++ b/FEXCore/include/FEXCore/Core/Context.h
+@@ -162,6 +162,17 @@ public:
+   FEX_DEFAULT_VISIBILITY virtual void RetireCodeBuffersCodeRange(uint64_t Start, uint64_t Length) = 0;
+   FEX_DEFAULT_VISIBILITY virtual void
+   InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) = 0;
++  // Highball (2026-10-19): with a sink set (CodeInvalidationMutex held exclusively), InvalidateThreadCachedCodeRange
++  // records the threads whose call-return stack needs clearing instead of clearing it, for the caller to clear
++  // with ResetThreadCallRetStack once the mutex is dropped. Past the sink's room it clears them itself.
++  struct CallRetResetSink {
++    FEXCore::Core::InternalThreadState* Threads[64];
++    size_t Count;
++  };
++  FEX_DEFAULT_VISIBILITY virtual void SetCallRetResetSink(CallRetResetSink* Sink) = 0;
++  // Highball (2026-10-19): a write fault invalidated the code on Page just now (HB_FEX_SMC_HOT_MAXINST)
++  FEX_DEFAULT_VISIBILITY virtual void HbMarkSMCPage(uint64_t Page) = 0;
++  FEX_DEFAULT_VISIBILITY virtual void ResetThreadCallRetStack(FEXCore::Core::InternalThreadState* Thread) = 0;
+   FEX_DEFAULT_VISIBILITY virtual FEXCore::Utils::WritePriorityMutex::Mutex& GetCodeInvalidationMutex() = 0;
+ 
+   FEX_DEFAULT_VISIBILITY virtual void
+diff --git a/FEXCore/include/FEXCore/Utils/AllocatorHooks.h b/FEXCore/include/FEXCore/Utils/AllocatorHooks.h
+index c4cadf4..a7d5e82 100644
+--- a/FEXCore/include/FEXCore/Utils/AllocatorHooks.h
++++ b/FEXCore/include/FEXCore/Utils/AllocatorHooks.h
+@@ -70,10 +70,17 @@ inline void VirtualFree(void* Ptr, size_t Size) {
+   ::VirtualFree(Ptr, 0, MEM_RELEASE);
+ }
+ 
++// Highball (2026-10-19): set by the ARM64EC frontend with HB_FEX_HOST_ZERO=1; zeroes the range in one host call and
++// returns true, or false for the ntdll path (protection it does not handle, no unix library entry)
++FEX_DEFAULT_VISIBILITY extern bool (*HbZeroPagesHook)(void* Ptr, size_t Size, uint32_t WinProt);
++
+ inline void VirtualDontNeed(void* Ptr, size_t Size, bool Recommit = true) {
+   // Zero the page-aligned region, preserving permissions.
+   MEMORY_BASIC_INFORMATION Info;
+   ::VirtualQuery(Ptr, &Info, sizeof(Info));
++  if (HbZeroPagesHook && Info.State == MEM_COMMIT && HbZeroPagesHook(Ptr, Size, Info.Protect)) {
++    return;
++  }
+   ::VirtualFree(Ptr, Size, MEM_DECOMMIT);
+   if (Recommit) {
+     ::VirtualAlloc(Ptr, Size, MEM_COMMIT, Info.Protect);
+diff --git a/FEXCore/include/FEXCore/Utils/SHMStats.h b/FEXCore/include/FEXCore/Utils/SHMStats.h
+index 0adf21d..d34f8f8 100644
+--- a/FEXCore/include/FEXCore/Utils/SHMStats.h
++++ b/FEXCore/include/FEXCore/Utils/SHMStats.h
+@@ -84,6 +84,39 @@ struct ThreadStats {
+   // Highball smc-retire
+   uint64_t AccumulatedSMCRetiredMisses;    // a retired block at the entry point, its instruction bytes different: translated
+   uint64_t AccumulatedSMCBlocksReinstated; // a retired block put back, its instruction bytes the same: not translated
++  // Highball (2026-10-19): where translation time goes
++  uint64_t AccumulatedJITInstructions;  // guest instructions translated
++  uint64_t AccumulatedJITWritableCount; // compiles whose entry point lies in read-write-execute memory
++  uint64_t AccumulatedJITWritableTime;  // their compile time (cycles)
++  uint64_t AccumulatedJITCompileTime;   // compile time proper: decoding, IR, code generation (cycles)
++  uint64_t AccumulatedJITLockWaitTime;  // a compile waiting for CodeInvalidationMutex shared (cycles)
++  uint64_t AccumulatedLinkLockWaitTime; // block linking waiting for CodeInvalidationMutex and the lookup cache (cycles)
++  uint64_t AccumulatedSMCLockWaitTime;  // a write fault on code waiting for CodeInvalidationMutex exclusive (cycles)
++  uint64_t AccumulatedSMCLockHoldTime;  // a write fault holding it: invalidation and the page's protection (cycles)
++  uint64_t AccumulatedJITWritableInstructions; // guest instructions of the compiles starting in read-write-execute memory
++  uint64_t AccumulatedJITProtectTime;  // a compile protecting the pages of its new code against writes (cycles)
++  // ARM64EC's ThreadCreationMutex, held across every memory allocation, free and protection change of the process
++  uint64_t AccumulatedTCMWaitTime;     // memory-call notifications waiting for it (cycles)
++  uint64_t AccumulatedAVTCMWaitTime;   // the access-violation handler waiting for it (cycles)
++  uint64_t AccumulatedVMNotifyCount;   // memory calls notified
++  uint64_t AccumulatedVMHoldTime;      // the mutex held across them: the call and FEX's bookkeeping (cycles)
++  uint64_t AccumulatedVMTrackerTime;   // FEX's bookkeeping after them: intervals, invalidation (cycles)
++  uint64_t HbVMHoldBegin;              // scratch: when the current memory call's hold began
++  // A write fault's exclusive section, in the faulting thread (cycles)
++  uint64_t AccumulatedSMCInvBuffersTime;   // invalidating the page in the code buffers
++  uint64_t AccumulatedSMCInvThreadsTime;   // in every thread's lookup cache, clearing call-return stacks unless deferred
++  uint64_t AccumulatedSMCUntrapTime;       // unprotecting the page
++  uint64_t AccumulatedSMCDeferredResetTime; // clearing call-return stacks after the unlock (HB_FEX_SMC_DEFER_CALLRET=1)
++  // What the write faults that go on to invalidate a page write (2026-10-19 04:45)
++  uint64_t AccumulatedSMCJitSame;     // from FEX's code buffer, the bytes already in memory
++  uint64_t AccumulatedSMCJitDiff;     // from FEX's code buffer, other bytes
++  uint64_t AccumulatedSMCNativeSame;  // from native code, the bytes already in memory
++  uint64_t AccumulatedSMCNativeDiff;  // from native code, other bytes
++  uint64_t AccumulatedSMCNativeUndec; // from native code, a store the decoder does not know
++  uint64_t SMCLastNativePc;           // the last native fault's PC
++  // HB_FEX_SMC_HOT_MAXINST: compiles starting on a page a write fault invalidated recently, and their instructions
++  uint64_t AccumulatedJITHotCount;
++  uint64_t AccumulatedJITHotInstructions;
+ };
+ 
+ // Ensure 16-byte alignment to take advantage of ARM single-copy atomicity.
+diff --git a/FEXCore/include/FEXCore/Utils/WritePriorityMutex.h b/FEXCore/include/FEXCore/Utils/WritePriorityMutex.h
+index bf1bd2b..bfeae90 100644
+--- a/FEXCore/include/FEXCore/Utils/WritePriorityMutex.h
++++ b/FEXCore/include/FEXCore/Utils/WritePriorityMutex.h
+@@ -21,6 +21,19 @@
+ #include <FEXCore/Utils/SpinWaitLock.h>
+ 
+ namespace FEXCore::Utils::WritePriorityMutex {
++#ifdef ARCHITECTURE_arm64
++// Highball (2026-10-19): how long a waiter spins on WFE before it sleeps: HB_FEX_WFE_US microseconds (default 10)
++FEX_DEFAULT_VISIBILITY extern uint64_t HbSpinCycles;
++FEX_DEFAULT_VISIBILITY uint64_t HbComputeSpinCycles();
++static inline uint64_t SpinDurationCycles() {
++  uint64_t Cycles = __atomic_load_n(&HbSpinCycles, __ATOMIC_RELAXED);
++  if (!Cycles) {
++    Cycles = HbComputeSpinCycles();
++    __atomic_store_n(&HbSpinCycles, Cycles, __ATOMIC_RELAXED);
++  }
++  return Cycles;
++}
++#endif
+ 
+ // A custom mutex that prioritizes exclusive locks.
+ // In highly contested scenarios, this can help minimize overall contention time.
+@@ -325,7 +338,7 @@ private:
+ #ifdef ARCHITECTURE_arm64
+     const auto Begin = FEXCore::Utils::SpinWaitLock::GetCycleCounter();
+     auto Now = Begin;
+-    const auto Duration = FEXCore::Utils::SpinWaitLock::CycleCounterFrequency / CYCLECOUNT_DIVISOR;
++    const auto Duration = SpinDurationCycles();
+ 
+     auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
+     uint32_t Expected = AtomicFutex.load(std::memory_order_relaxed);
+@@ -357,7 +370,7 @@ private:
+     //  - Don't add read-waiters bit on failure, return false.
+     const auto Begin = FEXCore::Utils::SpinWaitLock::GetCycleCounter();
+     auto Now = Begin;
+-    const auto Duration = FEXCore::Utils::SpinWaitLock::CycleCounterFrequency / CYCLECOUNT_DIVISOR;
++    const auto Duration = SpinDurationCycles();
+ 
+     auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
+     uint32_t Expected = AtomicFutex.load(std::memory_order_relaxed);
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+index 9076bc9..2312437 100644
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -140,6 +140,9 @@ struct ThreadCPUArea {
+ 
+ struct FrontendThreadData {
+   bool InLockedRWXRead {};
++  // Highball HB_FEX_VM_FASTPATH: per nesting depth of memory notifications, whether the call skipped ThreadCreationMutex
++  uint32_t HbVMDepth {};
++  uint64_t HbVMSkipBits {};
+ };
+ 
+ namespace {
+@@ -156,6 +159,94 @@ std::recursive_mutex ThreadCreationMutex;
+ // Map of TIDs to their FEX thread state, `ThreadCreationMutex` must be locked when accessing
+ std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*> Threads;
+ 
++// Highball (2026-10-19): the per-thread waits for ThreadCreationMutex in the memory notifications (FEX_PROFILESTATS=1)
++FEXCore::SHMStats::ThreadStats* HbStats(FEXCore::Core::InternalThreadState* Thread) {
++  return Thread ? Thread->ThreadStats : nullptr;
++}
++void HbLockForMemoryCall(FEXCore::Core::InternalThreadState* Thread);
++FrontendThreadData* GetFrontendThreadData(FEXCore::Core::InternalThreadState* Thread);
++// Before a memory call: takes ThreadCreationMutex unless the call may skip it, and remembers which at this depth
++void HbBeforeMemoryCall(FEXCore::Core::InternalThreadState* Thread, bool CanSkip) {
++  auto* FD = GetFrontendThreadData(Thread);
++  const uint32_t Depth = FD->HbVMDepth++;
++  const bool Skip = CanSkip && Depth < 64;
++  if (Depth < 64) {
++    FD->HbVMSkipBits = Skip ? (FD->HbVMSkipBits | (1ULL << Depth)) : (FD->HbVMSkipBits & ~(1ULL << Depth));
++  }
++  if (!Skip) {
++    HbLockForMemoryCall(Thread);
++  }
++}
++// After it: whether the call skipped the mutex (then it is not held)
++bool HbAfterMemoryCallSkipped(FEXCore::Core::InternalThreadState* Thread) {
++  auto* FD = GetFrontendThreadData(Thread);
++  if (FD->HbVMDepth == 0) {
++    return false;
++  }
++  const uint32_t Depth = --FD->HbVMDepth;
++  return Depth < 64 && ((FD->HbVMSkipBits >> Depth) & 1);
++}
++
++void HbLockForMemoryCall(FEXCore::Core::InternalThreadState* Thread) {
++  auto* S = HbStats(Thread);
++  const uint64_t Begin = S ? FEXCore::SHMStats::GetCycleCounter() : 0;
++  ThreadCreationMutex.lock();
++  if (S) {
++    const uint64_t Now = FEXCore::SHMStats::GetCycleCounter();
++    S->AccumulatedTCMWaitTime += Now - Begin;
++    S->AccumulatedVMNotifyCount++;
++    S->HbVMHoldBegin = Now;
++  }
++}
++void HbUnlockAfterMemoryCall(FEXCore::Core::InternalThreadState* Thread) {
++  auto* S = HbStats(Thread);
++  if (S && S->HbVMHoldBegin) {
++    S->AccumulatedVMHoldTime += FEXCore::SHMStats::GetCycleCounter() - S->HbVMHoldBegin;
++    S->HbVMHoldBegin = 0;
++  }
++  ThreadCreationMutex.unlock();
++}
++std::atomic<int> HbVMFastPathState {-1};
++bool HbVMFastPath() {
++  int State = HbVMFastPathState.load(std::memory_order_relaxed);
++  if (State < 0) {
++    const char* Env = getenv("HB_FEX_VM_FASTPATH");
++    State = Env && Env[0] == '1';
++    HbVMFastPathState.store(State, std::memory_order_relaxed);
++  }
++  return State != 0;
++}
++
++// The extent of the allocation a MEM_RELEASE at Address frees (0 when it cannot tell: the old path then runs)
++uint64_t HbAllocationExtent(void* Address) {
++  const auto Base = reinterpret_cast<uint64_t>(Address);
++  uint64_t Cur = Base;
++  for (int i = 0; i < 16; i++) {
++    MEMORY_BASIC_INFORMATION Info;
++    if (!VirtualQuery(reinterpret_cast<LPCVOID>(Cur), &Info, sizeof(Info))) {
++      return 0;
++    }
++    if (Info.State == MEM_FREE || reinterpret_cast<uint64_t>(Info.AllocationBase) != Base) {
++      return Cur - Base;
++    }
++    Cur = reinterpret_cast<uint64_t>(Info.BaseAddress) + Info.RegionSize;
++  }
++  return 0;
++}
++
++struct HbTrackerTimer {
++  FEXCore::SHMStats::ThreadStats* S;
++  uint64_t Begin;
++  explicit HbTrackerTimer(FEXCore::Core::InternalThreadState* Thread)
++    : S {HbStats(Thread)}
++    , Begin {S ? FEXCore::SHMStats::GetCycleCounter() : 0} {}
++  ~HbTrackerTimer() {
++    if (S) {
++      S->AccumulatedVMTrackerTime += FEXCore::SHMStats::GetCycleCounter() - Begin;
++    }
++  }
++};
++
+ std::pair<NTSTATUS, ThreadCPUArea> GetThreadCPUArea(HANDLE Thread) {
+   THREAD_BASIC_INFORMATION Info;
+   const NTSTATUS Err = NtQueryInformationThread(Thread, ThreadBasicInformation, &Info, sizeof(Info), nullptr);
+@@ -798,6 +889,20 @@ NTSTATUS ProcessInit() {
+ 
+   FEX::Windows::Allocator::SetupHooks(NtDll);
+   FEX::Windows::UnixLib::Init(NtDll);
++  // Highball HB_FEX_HOST_ZERO=1: FEX's own memory cleared by the unix library (see FEXCore::Allocator::HbZeroPagesHook)
++  if (const char* HostZero = getenv("HB_FEX_HOST_ZERO"); HostZero && HostZero[0] == '1' && FEX::Windows::UnixLib::Available()) {
++    FEXCore::Allocator::HbZeroPagesHook = [](void* Ptr, size_t Size, uint32_t WinProt) -> bool {
++      uint32_t HostProt;
++      if (WinProt == PAGE_READWRITE) {
++        HostProt = 3; // PROT_READ | PROT_WRITE
++      } else if (WinProt == PAGE_READONLY) {
++        HostProt = 1; // PROT_READ
++      } else {
++        return false;
++      }
++      return FEX::Windows::UnixLib::ZeroPages(Ptr, Size, HostProt);
++    };
++  }
+   if (FEX::Windows::UnixLib::Available()) {
+     FEXCore::DiskCache::SetFileMapper(FEX::Windows::UnixLib::MapFile);
+   }
+@@ -813,6 +918,7 @@ NTSTATUS ProcessInit() {
+   CTX->InitCore();
+   Exception::HandlerConfig.emplace(*CTX);
+   InvalidationTracker.emplace(*CTX, Threads);
++  InvalidationTracker->HbThreadsMutex = &ThreadCreationMutex;
+   ImageTracker.emplace(*CTX, false);
+ 
+   auto MainModule = reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->ImageBaseAddress;
+@@ -875,7 +981,11 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+       return true;
+     }
+ 
++    const uint64_t HbAVBegin = Thread->ThreadStats ? FEXCore::SHMStats::GetCycleCounter() : 0;
+     std::scoped_lock Lock(ThreadCreationMutex);
++    if (Thread->ThreadStats) {
++      Thread->ThreadStats->AccumulatedAVTCMWaitTime += FEXCore::SHMStats::GetCycleCounter() - HbAVBegin;
++    }
+     // Highball smc-precise: a JIT store into the data of a page that holds translated code is written for the guest with
+     // the page kept protected and its blocks kept compiled; anything else (code bytes changed, other instructions, bursts)
+     // takes the page invalidation below.
+@@ -884,6 +994,29 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
+                                                     NativeContext->Pc, reinterpret_cast<const __uint128_t*>(NativeContext->V), FaultAddress)) {
+       return true;
+     }
++    // Highball (2026-10-19, measurement): what the write that is about to invalidate a page writes
++    if (InvalidationTracker && Thread->ThreadStats && Exception->ExceptionInformation[0] == 1) {
++      const bool FromJit = CTX->IsAddressInCodeBuffer(Thread, NativeContext->Pc);
++      const int Class = InvalidationTracker->ClassifyCodePageStore(reinterpret_cast<const uint64_t*>(NativeContext->X), NativeContext->Sp,
++                                                                  NativeContext->Pc, reinterpret_cast<const __uint128_t*>(NativeContext->V),
++                                                                  FaultAddress);
++      auto* S = Thread->ThreadStats;
++      if (Class >= 0) {
++        if (FromJit) {
++          (Class == 1 ? S->AccumulatedSMCJitSame : S->AccumulatedSMCJitDiff)++;
++        } else {
++          (Class == 1 ? S->AccumulatedSMCNativeSame : Class == 2 ? S->AccumulatedSMCNativeDiff : S->AccumulatedSMCNativeUndec)++;
++          S->SMCLastNativePc = NativeContext->Pc;
++        }
++      }
++    }
++    // Highball HB_FEX_SMC_SKIP_SAME=1: a store of the bytes already there is stepped over, nothing invalidated
++    if (InvalidationTracker && Exception->ExceptionInformation[0] == 1 &&
++        InvalidationTracker->TrySkipUnchangedStore(reinterpret_cast<uint64_t*>(NativeContext->X), NativeContext->Sp, NativeContext->Pc,
++                                                   reinterpret_cast<const __uint128_t*>(NativeContext->V), FaultAddress)) {
++      FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCStoresUnchanged, 1);
++      return true;
++    }
+     if (InvalidationTracker && InvalidationTracker->HandleRWXAccessViolation(Thread, NativeContext->Pc, FaultAddress)) {
+       FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
+       if (CTX->IsAddressInCodeBuffer(Thread, NativeContext->Pc) && !CTX->IsCurrentBlockSingleInst(CPUArea.ThreadState()) &&
+@@ -1018,13 +1151,24 @@ void NotifyMemoryAlloc(void* Address, SIZE_T Size, ULONG Type, ULONG Prot, BOOL
+   }
+ 
+   if (!After) {
+-    ThreadCreationMutex.lock();
++    const bool Fresh = !Address || (Type & MEM_RESERVE);
++    HbBeforeMemoryCall(GetCPUArea().ThreadState(),
++                       HbVMFastPath() && ((Type & (MEM_RESET | MEM_RESET_UNDO)) ||
++                                          InvalidationTracker->MemoryCallCannotConcernCode(reinterpret_cast<uint64_t>(Address),
++                                                                                          static_cast<uint64_t>(Size), Prot, Fresh)));
++  } else if (HbAfterMemoryCallSkipped(GetCPUArea().ThreadState())) {
++    if (!Status && !(Type & (MEM_RESET | MEM_RESET_UNDO)) &&
++        !InvalidationTracker->MemoryCallCannotConcernCode(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), Prot, false)) {
++      std::scoped_lock Lock(ThreadCreationMutex);
++      InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), Prot);
++    }
+   } else {
+     // MEM_RESET(_UNDO) ignores the passed permissions
+     if (!Status && !(Type & (MEM_RESET | MEM_RESET_UNDO))) {
++      HbTrackerTimer Timer {GetCPUArea().ThreadState()};
+       InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), Prot);
+     }
+-    ThreadCreationMutex.unlock();
++    HbUnlockAfterMemoryCall(GetCPUArea().ThreadState());
+   }
+ }
+ 
+@@ -1034,12 +1178,24 @@ void NotifyMemoryFree(void* Address, SIZE_T Size, ULONG FreeType, BOOL After, NT
+   }
+ 
+   if (!After) {
+-    ThreadCreationMutex.lock();
++    bool CanSkip = false;
++    if (HbVMFastPath()) {
++      const uint64_t Extent = Size ? static_cast<uint64_t>(Size) : HbAllocationExtent(Address);
++      CanSkip = Extent && InvalidationTracker->MemoryCallCannotConcernCode(reinterpret_cast<uint64_t>(Address), Extent, PAGE_NOACCESS, false);
++    }
++    HbBeforeMemoryCall(GetCPUArea().ThreadState(), CanSkip);
++  } else if (HbAfterMemoryCallSkipped(GetCPUArea().ThreadState())) {
++    // An executable interval in the freed range now came from another thread's call in between: the old path
++    if (!Status && Size && !InvalidationTracker->MemoryCallCannotConcernCode(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), PAGE_NOACCESS, false)) {
++      std::scoped_lock Lock(ThreadCreationMutex);
++      InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), true);
++    }
+   } else {
+     if (!Status) {
++      HbTrackerTimer Timer {GetCPUArea().ThreadState()};
+       InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), true);
+     }
+-    ThreadCreationMutex.unlock();
++    HbUnlockAfterMemoryCall(GetCPUArea().ThreadState());
+   }
+ }
+ 
+@@ -1049,12 +1205,20 @@ void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After,
+   }
+ 
+   if (!After) {
+-    ThreadCreationMutex.lock();
++    HbBeforeMemoryCall(GetCPUArea().ThreadState(),
++                       HbVMFastPath() && InvalidationTracker->MemoryCallCannotConcernCode(reinterpret_cast<uint64_t>(Address),
++                                                                                          static_cast<uint64_t>(Size), NewProt, false));
++  } else if (HbAfterMemoryCallSkipped(GetCPUArea().ThreadState())) {
++    if (!Status && !InvalidationTracker->MemoryCallCannotConcernCode(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), NewProt, false)) {
++      std::scoped_lock Lock(ThreadCreationMutex);
++      InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), NewProt);
++    }
+   } else {
+     if (!Status) {
++      HbTrackerTimer Timer {GetCPUArea().ThreadState()};
+       InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), NewProt);
+     }
+-    ThreadCreationMutex.unlock();
++    HbUnlockAfterMemoryCall(GetCPUArea().ThreadState());
+   }
+ }
+ 
+diff --git a/Source/Windows/Common/FEXUnixLib.cpp b/Source/Windows/Common/FEXUnixLib.cpp
+index 2c69f4c..24ba92d 100644
+--- a/Source/Windows/Common/FEXUnixLib.cpp
++++ b/Source/Windows/Common/FEXUnixLib.cpp
+@@ -222,4 +222,17 @@ bool AliasWrite(void* Addr, const void* Data, uint32_t Size) {
+   return Call(FEXUnixLibFunctions::AliasWrite, &Args) == STATUS_SUCCESS;
+ }
+ 
++bool ZeroPages(void* Addr, size_t Size, uint32_t Prot) {
++  if (!Available()) {
++    return false;
++  }
++  FEXUnixLib_ZeroPages Args {
++    .Addr = Addr,
++    .Size = Size,
++    .Prot = Prot,
++    .Pad = 0,
++  };
++  return Call(FEXUnixLibFunctions::ZeroPages, &Args) == STATUS_SUCCESS;
++}
++
+ } // namespace FEX::Windows::UnixLib
+diff --git a/Source/Windows/Common/FEXUnixLib.h b/Source/Windows/Common/FEXUnixLib.h
+index f2a94e1..8d85b73 100644
+--- a/Source/Windows/Common/FEXUnixLib.h
++++ b/Source/Windows/Common/FEXUnixLib.h
+@@ -57,4 +57,8 @@ uint32_t GetPID();
+ // Needs the engine's matching unix library: an older one has no such entry.
+ bool AliasWrite(void* Addr, const void* Data, uint32_t Size);
+ 
++// Highball HB_FEX_HOST_ZERO: maps fresh zero pages over the range, host protection Prot; false if the unix library
++// lacks the entry or the call fails (the caller then takes the ntdll path)
++bool ZeroPages(void* Addr, size_t Size, uint32_t Prot);
++
+ } // namespace FEX::Windows::UnixLib
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index a7b5a6a..342525a 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -10,6 +10,7 @@
+ #include "InvalidationTracker.h"
+ #include "FEXUnixLib.h"
+ #include <atomic>
++#include <mutex>
+ #include <cstdlib>
+ #include <cstring>
+ #include <windef.h>
+@@ -28,6 +29,15 @@ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const s
+   if (const char* Replay = getenv("HB_FEX_SMC_REPLAY"); Replay && Replay[0] == '1') {
+     ReplayEnabled = true;
+   }
++  if (const char* Skip = getenv("HB_FEX_SMC_SKIP_SAME"); Skip && Skip[0] == '1') {
++    SkipSameEnabled = true;
++  }
++  if (const char* SkipBurst = getenv("HB_FEX_SMC_SKIP_BURST"); SkipBurst && SkipBurst[0]) {
++    SkipBurstLimit = static_cast<uint32_t>(strtoul(SkipBurst, nullptr, 0));
++  }
++  if (const char* Defer = getenv("HB_FEX_SMC_DEFER_CALLRET"); Defer && Defer[0] == '1') {
++    DeferCallRet = true;
++  }
+   if (const char* Same = getenv("HB_FEX_SMC_SAME"); Same && Same[0] == '0') {
+     ReplaySkipUnchanged = false;
+   }
+@@ -390,6 +400,106 @@ bool DecodeReplayableStore(uint32_t I, const uint64_t* X, uint64_t Sp, const __u
+   return false;
+ }
+ 
++// Highball (measurement): the replay decoder, then STR, STP (general and SIMD) with writeback, for classification only
++bool DecodeStoreForClass(uint32_t I, const uint64_t* X, uint64_t Sp, const __uint128_t* V, ReplayedStore& S) {
++  if (DecodeReplayableStore(I, X, Sp, V, S)) {
++    return true;
++  }
++  const uint32_t Rt = I & 31;
++  const uint32_t Rn = (I >> 5) & 31;
++  const uint64_t Base = Rn == 31 ? Sp : X[Rn];
++  auto GPR = [&](uint32_t R) -> uint64_t {
++    return R == 31 ? 0 : X[R];
++  };
++  // STR (immediate) post-index 0x..000400, pre-index 0x..000C00, general registers
++  if ((I & 0x3FE00400) == 0x38000400) {
++    S.Size = 1u << (I >> 30);
++    const uint64_t Imm = SignExtend((I >> 12) & 0x1FF, 9);
++    S.Address = ((I >> 11) & 1) ? Base + Imm : Base;
++    const uint64_t Value = GPR(Rt);
++    memcpy(S.Data, &Value, S.Size);
++    return true;
++  }
++  // STP general registers post-index (0x28800000) and pre-index (0x29800000)
++  if ((I & 0x3FC00000) == 0x28800000 || (I & 0x3FC00000) == 0x29800000) {
++    const uint32_t Opc = I >> 30;
++    if (Opc != 0 && Opc != 2) {
++      return false;
++    }
++    const uint32_t Element = Opc == 2 ? 8 : 4;
++    const uint64_t Imm = SignExtend((I >> 15) & 0x7F, 7) * Element;
++    S.Size = 2 * Element;
++    S.Address = ((I & 0x3FC00000) == 0x29800000) ? Base + Imm : Base;
++    const uint64_t A = GPR(Rt), B = GPR((I >> 10) & 31);
++    memcpy(S.Data, &A, Element);
++    memcpy(S.Data + Element, &B, Element);
++    return true;
++  }
++  // STP SIMD post-index (0x2C800000) and pre-index (0x2D800000)
++  if ((I & 0x3FC00000) == 0x2C800000 || (I & 0x3FC00000) == 0x2D800000) {
++    const uint32_t Opc = I >> 30;
++    if (Opc == 3) {
++      return false;
++    }
++    const uint32_t Element = 4u << Opc;
++    const uint64_t Imm = SignExtend((I >> 15) & 0x7F, 7) * Element;
++    S.Size = 2 * Element;
++    S.Address = ((I & 0x3FC00000) == 0x2D800000) ? Base + Imm : Base;
++    const __uint128_t A = V[Rt], B = V[(I >> 10) & 31];
++    memcpy(S.Data, &A, Element);
++    memcpy(S.Data + Element, &B, Element);
++    return true;
++  }
++  // STR SIMD post-index and pre-index (0x3C000400 / 0x3C000C00 forms)
++  if ((I & 0x3F600400) == 0x3C000400) {
++    const uint32_t Size = I >> 30;
++    uint32_t Bytes = ((I >> 23) & 1) ? (Size == 0 ? 16 : 0) : (1u << Size);
++    if (!Bytes) {
++      return false;
++    }
++    const uint64_t Imm = SignExtend((I >> 12) & 0x1FF, 9);
++    S.Size = Bytes;
++    S.Address = ((I >> 11) & 1) ? Base + Imm : Base;
++    const __uint128_t A = V[Rt];
++    memcpy(S.Data, &A, Bytes);
++    return true;
++  }
++  return false;
++}
++
++// Highball HB_FEX_SMC_SKIP_SAME: the stores DecodeStoreForClass knows, with what stepping over one must do: the base
++// register's writeback (pre- and post-index both add the immediate), and whether it is a release store (not skipped)
++struct StoreStep {
++  bool Release {};
++  bool Writeback {};
++  uint32_t Rn {};
++  int64_t Delta {};
++};
++bool DecodeStoreStep(uint32_t I, const uint64_t* X, uint64_t Sp, const __uint128_t* V, ReplayedStore& S, StoreStep& Step) {
++  if (!DecodeStoreForClass(I, X, Sp, V, S)) {
++    return false;
++  }
++  Step = {};
++  Step.Rn = (I >> 5) & 31;
++  // STLR, STLUR: release semantics
++  if ((I & 0x3FFFFC00) == 0x089FFC00 || (I & 0x3FE00C00) == 0x19000000) {
++    Step.Release = true;
++  }
++  if ((I & 0x3FE00400) == 0x38000400 || (I & 0x3F600400) == 0x3C000400) { // STR general or SIMD, pre/post-index
++    Step.Writeback = true;
++    Step.Delta = static_cast<int64_t>(SignExtend((I >> 12) & 0x1FF, 9));
++  } else if ((I & 0x3FC00000) == 0x28800000 || (I & 0x3FC00000) == 0x29800000) { // STP general, post/pre-index
++    const uint32_t Element = (I >> 30) == 2 ? 8 : 4;
++    Step.Writeback = true;
++    Step.Delta = static_cast<int64_t>(SignExtend((I >> 15) & 0x7F, 7) * Element);
++  } else if ((I & 0x3FC00000) == 0x2C800000 || (I & 0x3FC00000) == 0x2D800000) { // STP SIMD, post/pre-index
++    const uint32_t Element = 4u << (I >> 30);
++    Step.Writeback = true;
++    Step.Delta = static_cast<int64_t>(SignExtend((I >> 15) & 0x7F, 7) * Element);
++  }
++  return true;
++}
++
+ void CountReplay(FEXCore::Core::InternalThreadState* Thread, uint64_t FEXCore::SHMStats::ThreadStats::* Field) {
+   if (Thread->ThreadStats) {
+     std::atomic_ref<uint64_t>(Thread->ThreadStats->*Field).fetch_add(1, std::memory_order_relaxed);
+@@ -485,18 +595,60 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
+   }(FaultAddress);
+ 
+   if (NeedsInvalidate) {
++    FEXCore::Context::Context::CallRetResetSink Sink;
++    Sink.Count = 0;
++    const bool Stats = Thread && Thread->ThreadStats;
+     // IntervalsLock cannot be held during invalidation
+     {
++      const uint64_t LockBegin = Stats ? FEXCore::SHMStats::GetCycleCounter() : 0;
+       std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
++      // Highball (2026-10-19): how long a write fault waits for the compilation lock and holds it (the timer is
++      // declared after the lock, so it stops just before the unlock)
++      struct HoldTimer {
++        FEXCore::Core::InternalThreadState* Thread;
++        uint64_t Begin;
++        ~HoldTimer() {
++          if (Thread) {
++            Thread->ThreadStats->AccumulatedSMCLockHoldTime += FEXCore::SHMStats::GetCycleCounter() - Begin;
++          }
++        }
++      } Hold {Stats ? Thread : nullptr, Stats ? FEXCore::SHMStats::GetCycleCounter() : 0};
++      if (Stats) {
++        Thread->ThreadStats->AccumulatedSMCLockWaitTime += Hold.Begin - LockBegin;
++      }
+ 
++      if (DeferCallRet) {
++        CTX.SetCallRetResetSink(&Sink);
++      }
++      HbFaultStats = Stats ? Thread->ThreadStats : nullptr;
++      CTX.HbMarkSMCPage(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK);
+       // Highball smc-retire: the page's blocks are kept aside, to come back if the guest writes their bytes back
+       InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE, true);
++      HbFaultStats = nullptr;
++      if (DeferCallRet) {
++        CTX.SetCallRetResetSink(nullptr);
++      }
+ 
+       // Invalidate, then unprotect the faulting page with the compilation lock held to ensure that any racing invalidations are not dropped.
++      const uint64_t UntrapBegin = Stats ? FEXCore::SHMStats::GetCycleCounter() : 0;
+       ULONG TmpProt;
+       void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
+       SIZE_T TmpSize = 1;
+       NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
++      if (Stats) {
++        Thread->ThreadStats->AccumulatedSMCUntrapTime += FEXCore::SHMStats::GetCycleCounter() - UntrapBegin;
++      }
++    }
++    // Highball HB_FEX_SMC_DEFER_CALLRET: the call-return stacks of the threads whose cached blocks this invalidated,
++    // cleared with compilation open again (the caller holds ThreadCreationMutex, which keeps those threads alive)
++    if (Sink.Count) {
++      const uint64_t ResetBegin = Stats ? FEXCore::SHMStats::GetCycleCounter() : 0;
++      for (size_t i = 0; i < Sink.Count; i++) {
++        CTX.ResetThreadCallRetStack(Sink.Threads[i]);
++      }
++      if (Stats) {
++        Thread->ThreadStats->AccumulatedSMCDeferredResetTime += FEXCore::SHMStats::GetCycleCounter() - ResetBegin;
++      }
+     }
+     DetectMonoBackpatcherBlock(Thread, HostPc);
+     return true;
+@@ -521,6 +673,84 @@ ULONG InvalidationTracker::GuestProtection(uint64_t Address, ULONG Prot) {
+   return Prot;
+ }
+ 
++bool InvalidationTracker::MemoryCallCannotConcernCode(uint64_t Address, uint64_t Size, ULONG Prot, bool Fresh) {
++  if (ProtHasExec(Prot) || (!Fresh && Size == 0)) {
++    return false;
++  }
++  std::shared_lock Lock(IntervalsLock);
++  if (DEPDisabled) {
++    return false;
++  }
++  if (Fresh) {
++    return true;
++  }
++  const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
++  const auto AlignedSize = (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
++  return !XIntervals.Intersect({AlignedBase, AlignedBase + AlignedSize});
++}
++
++int InvalidationTracker::ClassifyCodePageStore(const uint64_t* X, uint64_t Sp, uint64_t Pc, const __uint128_t* V, uint64_t FaultAddress) {
++  {
++    std::shared_lock Lock(IntervalsLock, std::try_to_lock);
++    if (!Lock.owns_lock() || !RWXIntervals.Query(FaultAddress).Enclosed) {
++      return -1;
++    }
++  }
++  ReplayedStore S;
++  const uint32_t Instr = *reinterpret_cast<const uint32_t*>(Pc);
++  if (!DecodeStoreForClass(Instr, X, Sp, V, S) || FaultAddress < S.Address || FaultAddress >= S.Address + S.Size ||
++      S.Size > sizeof(S.Data) ||
++      (S.Address & FEXCore::Utils::FEX_PAGE_MASK) != ((S.Address + S.Size - 1) & FEXCore::Utils::FEX_PAGE_MASK)) {
++    return 0; // not decoded, or a store across two pages (the next one may not be readable)
++  }
++  // the page is read-execute (trapped), so reading it is fine
++  return memcmp(reinterpret_cast<const void*>(S.Address), S.Data, S.Size) == 0 ? 1 : 2;
++}
++
++bool InvalidationTracker::TrySkipUnchangedStore(uint64_t* X, uint64_t& Sp, uint64_t& Pc, const __uint128_t* V, uint64_t FaultAddress) {
++  if (!SkipSameEnabled) {
++    return false;
++  }
++  {
++    std::shared_lock Lock(IntervalsLock);
++    if (SMCDetectionDisabled || !RWXIntervals.Query(FaultAddress).Enclosed) {
++      return false;
++    }
++  }
++  ReplayedStore S;
++  StoreStep Step;
++  const uint32_t Instr = *reinterpret_cast<const uint32_t*>(Pc);
++  if (!DecodeStoreStep(Instr, X, Sp, V, S, Step) || Step.Release || FaultAddress < S.Address || FaultAddress >= S.Address + S.Size ||
++      S.Size > sizeof(S.Data) ||
++      (S.Address & FEXCore::Utils::FEX_PAGE_MASK) != ((S.Address + S.Size - 1) & FEXCore::Utils::FEX_PAGE_MASK)) {
++    return false;
++  }
++  if (memcmp(reinterpret_cast<const void*>(S.Address), S.Data, S.Size) != 0) {
++    return false;
++  }
++  // a bulk copy of unchanged bytes is cheaper as one invalidation than as a fault per store
++  const uint64_t Page = S.Address & FEXCore::Utils::FEX_PAGE_MASK;
++  uint64_t Now, Frequency;
++  __asm__ volatile("mrs %0, cntvct_el0" : "=r"(Now));
++  __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(Frequency));
++  auto& Burst = SkipBursts[(Page >> 12) % SkipBursts.size()];
++  if (Burst.Page != Page || Now - Burst.WindowStart > Frequency / 10) {
++    Burst = {Page, Now, 0};
++  }
++  if (++Burst.Count > SkipBurstLimit) {
++    return false;
++  }
++  if (Step.Writeback) {
++    if (Step.Rn == 31) {
++      Sp += Step.Delta;
++    } else {
++      X[Step.Rn] += Step.Delta;
++    }
++  }
++  Pc += 4;
++  return true;
++}
++
+ FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
+   std::shared_lock Lock(IntervalsLock);
+   const auto XResult = XIntervals.Query(Address);
+@@ -599,20 +829,44 @@ ULONG InvalidationTracker::GetUntrapProt(uint64_t Address) const {
+ }
+ 
+ void InvalidationTracker::InvalidateIntervalInternal(uint64_t Address, uint64_t Size) {
+-  std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
+-  InvalidateIntervalInternalLocked(Address, Size);
++  FEXCore::Context::Context::CallRetResetSink Sink;
++  Sink.Count = 0;
++  const bool Defer = DeferCallRet && HbThreadsMutex;
++  {
++    std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
++    if (Defer) {
++      CTX.SetCallRetResetSink(&Sink);
++    }
++    InvalidateIntervalInternalLocked(Address, Size);
++    if (Defer) {
++      CTX.SetCallRetResetSink(nullptr);
++    }
++  }
++  // Highball HB_FEX_SMC_DEFER_CALLRET: the call-return stacks, cleared with compilation open again
++  if (Sink.Count) {
++    std::scoped_lock ThreadsLock(*HbThreadsMutex);
++    for (size_t i = 0; i < Sink.Count; i++) {
++      CTX.ResetThreadCallRetStack(Sink.Threads[i]);
++    }
++  }
+ }
+ 
+ void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size, bool Retire) {
+   // NOTE: This assumes CodeInvalidationMutex is locked by the caller
++  const uint64_t BuffersBegin = HbFaultStats ? FEXCore::SHMStats::GetCycleCounter() : 0;
+   if (Retire) {
+     CTX.RetireCodeBuffersCodeRange(Address, Size);
+   } else {
+     CTX.InvalidateCodeBuffersCodeRange(Address, Size);
+   }
++  const uint64_t ThreadsBegin = HbFaultStats ? FEXCore::SHMStats::GetCycleCounter() : 0;
+   for (auto Thread : Threads) {
+     CTX.InvalidateThreadCachedCodeRange(Thread.second, Address, Size);
+   }
++  if (HbFaultStats) {
++    HbFaultStats->AccumulatedSMCInvBuffersTime += ThreadsBegin - BuffersBegin;
++    HbFaultStats->AccumulatedSMCInvThreadsTime += FEXCore::SHMStats::GetCycleCounter() - ThreadsBegin;
++  }
+ }
+ 
+ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t Size, bool ForWriteLocked) {
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index e995d4a..9d0d04e 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -2,6 +2,7 @@
+ #pragma once
+ 
+ #include <FEXCore/Utils/IntervalList.h>
++#include <FEXCore/Utils/SHMStats.h>
+ #include <FEXCore/HLE/SyscallHandler.h>
+ #include <array>
+ #include <mutex>
+@@ -49,6 +50,19 @@ public:
+ 
+   FEXCore::HLE::ExecutableRangeInfo QueryExecutableRange(uint64_t Address);
+ 
++  // Highball (2026-10-19, measurement): a write fault about to invalidate FaultAddress's page: 0 when the store at
++  // Pc is not decoded, 1 when it writes the bytes already there, 2 when it changes them. X, Sp, V: the faulting context.
++  int ClassifyCodePageStore(const uint64_t* X, uint64_t Sp, uint64_t Pc, const __uint128_t* V, uint64_t FaultAddress);
++
++  // Highball HB_FEX_SMC_SKIP_SAME=1: steps over a store that writes the bytes already at FaultAddress (Pc + 4, writeback
++  // applied to X or Sp), leaving the page protected and its code compiled. ThreadCreationMutex must be held.
++  bool TrySkipUnchangedStore(uint64_t* X, uint64_t& Sp, uint64_t& Pc, const __uint128_t* V, uint64_t FaultAddress);
++
++  // Highball (2026-10-19): whether a memory call setting Prot over [Address, Address + Size) leaves this tracker's
++  // state as it is: Prot is not executable (DEP on) and no executable interval meets the range; Fresh: the range is
++  // a new reservation, which holds no interval. The memory notifications then skip ThreadCreationMutex.
++  bool MemoryCallCannotConcernCode(uint64_t Address, uint64_t Size, ULONG Prot, bool Fresh);
++
+   // The protection the program set at Address, given the one the page has: FEX's write trap on a read-write-execute
+   // page (read-execute, or read-only for a DEP-promoted one) reads back as the program's own protection. Never blocks
+   // (ntdll calls it while the program queries memory, maybe while this tracker's lock is held elsewhere).
+@@ -87,6 +101,23 @@ private:
+   // Highball smc-precise state, protected by CodeInvalidationMutex (no allocation in the fault path: allocating there
+   // deadlocked a game through Wine's FLS critical section, 2026-10-16)
+   bool ReplayEnabled {false};
++  // Highball (2026-10-19): HB_FEX_SMC_DEFER_CALLRET=1, and the faulting thread's stats during a write fault's
++  // invalidation (both protected by CodeInvalidationMutex)
++  bool DeferCallRet {false};
++  // HB_FEX_SMC_SKIP_SAME state, protected by ThreadCreationMutex
++  bool SkipSameEnabled {false};
++  uint32_t SkipBurstLimit {64};
++  struct SkipBurst {
++    uint64_t Page;
++    uint64_t WindowStart;
++    uint32_t Count;
++  };
++  std::array<SkipBurst, 1024> SkipBursts {};
++public:
++  // The mutex that keeps Threads stable (ARM64EC's ThreadCreationMutex); without it nothing is deferred
++  std::recursive_mutex* HbThreadsMutex {};
++private:
++  FEXCore::SHMStats::ThreadStats* HbFaultStats {};
+   bool ReplaySkipUnchanged {true};
+   bool ReplayVerify {false};
+   // Past this many replayed stores into one page within 100 ms, the old path (invalidate, leave writable) is cheaper: a
+diff --git a/Source/Windows/UnixLib/FEXUnixLib.h b/Source/Windows/UnixLib/FEXUnixLib.h
+index fafab4e..beb5fce 100644
+--- a/Source/Windows/UnixLib/FEXUnixLib.h
++++ b/Source/Windows/UnixLib/FEXUnixLib.h
+@@ -13,6 +13,7 @@ enum class FEXUnixLibFunctions : uint32_t {
+   MapFile,
+   GetPID,
+   AliasWrite,
++  ZeroPages,
+   MAX,
+ };
+ 
+@@ -75,3 +76,12 @@ struct FEXUnixLib_AliasWrite {
+   uint32_t Pad;
+ };
+ static_assert(sizeof(FEXUnixLib_GetPID) == 4);
++
++// Highball (2026-10-19): fresh zero pages over [Addr, Addr + Size) with host protection Prot (PROT_ bits), in one call
++struct FEXUnixLib_ZeroPages {
++  void* Addr;
++  uint64_t Size;
++  uint32_t Prot;
++  uint32_t Pad;
++};
++static_assert(sizeof(FEXUnixLib_ZeroPages) == 24);
