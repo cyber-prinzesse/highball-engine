@@ -214,7 +214,12 @@ jobs:
           # GnuTLS, SDL), and what they link, in engine/lib: patches-arm64/0030 looks for them there
           # when a process has no DYLD variables (the children of a Windows program). Their Homebrew
           # install names become @loader_path ones, so they load from there with nothing set. SDL2
-          # is sdl2-compat, which opens SDL3 by name at run time: SDL3 goes along.
+          # is sdl2-compat, which opens SDL3 at run time as @loader_path/libSDL3.dylib (then the same
+          # name in the program's folder and the Frameworks folders), never as libSDL3.0.dylib: SDL3
+          # goes along under that name too. Without it sdl2-compat shows an error dialog from
+          # winedevice, which no one sees and which never returns, so winebus never finished starting
+          # its SDL bus and never started IOHID: no joystick, yoke or gamepad reached any program on
+          # this line until 2026-10-20.
           python3 - <<'PY'
           import os, re, shutil, subprocess
           conf = open("build/include/config.h").read()
@@ -261,7 +266,15 @@ jobs:
           for leaf in seen:
               r = subprocess.run(["python3", "-c", "import ctypes,sys; ctypes.CDLL(sys.argv[1])", os.path.join(dest, leaf)], capture_output=True, text=True)
               assert r.returncode == 0, "engine/lib/%s does not load: %s" % (leaf, r.stderr.strip()[-300:])
-          print("host libraries in engine/lib:", sorted(seen))
+          os.symlink("libSDL3.0.dylib", os.path.join(dest, "libSDL3.dylib"))
+          # Loading is not enough: sdl2-compat finds SDL3 in its constructor, and a missing SDL3 only
+          # shows when it is used. SDL_Init(0) through it must succeed, with a timeout in case its
+          # error dialog waits for an answer.
+          check = ("import ctypes,sys; s=ctypes.CDLL(sys.argv[1]); s.SDL_GetError.restype=ctypes.c_char_p; "
+                   "r=s.SDL_Init(0); sys.exit('SDL_Init failed: %s' % s.SDL_GetError().decode()) if r else s.SDL_Quit()")
+          r = subprocess.run(["python3", "-c", check, os.path.join(dest, names[3])], capture_output=True, text=True, timeout=120)
+          assert r.returncode == 0, "sdl2-compat cannot use the shipped SDL3: %s" % (r.stderr.strip()[-300:])
+          print("host libraries in engine/lib:", sorted(seen), "+ libSDL3.dylib -> libSDL3.0.dylib")
           PY
           # winegstreamer.so looks for GStreamer at @loader_path/../../GStreamer.framework/Versions/1.0/lib,
           # that is engine/lib/GStreamer.framework. Highball links it to frameworks/ (EngineStore.linkRuntime);
