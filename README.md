@@ -10,7 +10,43 @@ Two engine lines are built here. The Intel line is Highball's opt-in Wine 11 eng
 `x64-crossover26.3-r*` revisions in the app's engine manifests), next to the default Wine 10 engine.
 The launchers and games whose recipes need it name it, and the app never moves an environment to it
 without the user asking. The arm64 line (below) is the native Apple silicon engine for the end of
-Rosetta. It is in development and not offered to players yet.
+Rosetta. It is offered as a preview engine to the games whose recipe asks for it (Microsoft Flight
+Simulator 2024), and to nothing else.
+
+## Patches at a glance
+
+102 patches across five folders. Each folder's README starts with a table, one line per
+patch: what it fixes, the game or program that needed it, what kind of change it is, and where it
+stands upstream. The paragraphs under each table give the details and the measurements.
+
+| Folder | Patches | On top of | Engine line |
+|---|---|---|---|
+| [`patches/`](patches/) | 24 | CodeWeavers' CrossOver 26.3 Wine source | Intel (Wine 11, `x64-crossover26.3-r*`) |
+| [`patches-arm64/`](patches-arm64/) | 25 | WineHQ Wine 11.18 | arm64 |
+| [`fex/patches/`](fex/patches/) | 23 | FEX 2610 | arm64 |
+| [`moltenvk-arm64/`](moltenvk-arm64/) | 16 + 4 | MoltenVK 1.4.2 and the SPIRV-Cross it pins | arm64 |
+| [`renderers-arm64/`](renderers-arm64/) | 7 + 3 | vkd3d-proton 3.0.1 and DXVK | arm64 |
+
+The kinds used in the tables:
+
+- **general**: a bug any user of that project can hit, on any system. These are the ones worth
+  reporting upstream.
+- **macOS**: a bug or gap that only shows on macOS, so it matters to any Wine on a Mac, CrossOver
+  included.
+- **CrossOver tree**: undoes or fixes code that only CrossOver's tree has (its hacks, msync).
+- **arm64 port**: part of running Wine natively on Apple silicon. WineHQ and CodeWeavers have their
+  own versions of this work in progress, and ours goes when theirs lands.
+- **x86-64 fidelity**: makes translated x86-64 code see what real x86-64 Windows shows it. The FEX
+  patches and their Wine half.
+- **Apple GPU**: works within a limit or a behaviour of Metal and Apple GPUs.
+- **performance**: makes something faster without changing what the program sees.
+- **workaround**: avoids or hides a problem rather than fixing its cause.
+- **Highball**: only means something with Highball's own setup (its renderer overlays,
+  per-program switches, its signed loader). Nobody else needs these.
+- **diagnostics**: messages or logs only.
+
+"opt-in: VAR" after a kind means the change does nothing unless that variable is set (a game's
+recipe sets it), "off-switch: VAR" that it is on unless the variable turns it off.
 
 ## What it builds from
 
@@ -19,8 +55,9 @@ Rosetta. It is in development and not offered to players yet.
   This is the tree that currently fixes things the upstream-derived builds cannot (the Rockstar
   installer's service start, for one), and it is the only public source of a current macOS-capable
   Wine.
-- **Patches:** the series in [`patches/`](patches/), applied in order. Kept as small as possible,
-  each one sent upstream the day it is verified, and dropped the day upstream ships it.
+- **Patches:** the series in [`patches/`](patches/), applied in order, each dropped the day
+  upstream ships the same fix. Where each one stands upstream is in the folder's table. Most have
+  not been sent.
 - **Components** the engine bundles or expects: MoltenVK (Apache 2.0), DXVK (zlib), DXMT (see its
   licence), winetricks (LGPL). D3DMetal is never included; Highball gates it behind Apple's licence
   at install time.
@@ -34,6 +71,12 @@ Rosetta. It is in development and not offered to players yet.
   here is written independently but follows the same shape (pinned inputs, nix-free where
   possible, mingw-w64 for the PE half, ccache).
 - The DXMT, DXVK and MoltenVK authors.
+- The people whose code is in these series: athei (Alexander Theissen) for `patches/0012`, `0013`
+  and `0020`, Tx for `patches/0022` and `0023`, Moritz Jost for `patches/0025`, Paul Gofman for
+  `patches/0017` (upstream Wine) and `0024` (from Proton), Proton for `patches/0010`, the MacPorts
+  game-porting-toolkit port for `0003` in both Wine series,
+  Michael Liendo for the start of `renderers-arm64/dxvk/0003` and the Microsoft Flight Simulator
+  2024 teardown (highball-db#6), and Mesa's AGX driver for the layout in `moltenvk-arm64` 0010.
 
 ## Licensing
 

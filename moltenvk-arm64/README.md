@@ -5,12 +5,43 @@ Language translator) at the revision MoltenVK 1.4.2 pins, with Highball's patche
 them for arm64 and packages `lib/libMoltenVK.dylib`, the library the engine's winevulkan opens. The Intel line's
 MoltenVK is built separately, for x86-64, by the app repository's `Scripts/build-moltenvk.sh`.
 
-Each series is `git format-patch` output against its pinned commit. Applied in order, MoltenVK 0001 to 0004 rebuild,
-file for file, the MoltenVK tree of the gin19g build that the Microsoft Flight Simulator 2024 runs of 2026-10-12 used
-(checked on the M4 against that tree), and the SPIRV-Cross series is the commits that build carried. MoltenVK 0005 to
-0011 came from the runs of 2026-10-12 and 13.
+Each series applies in order to its pinned commit with `git apply`. Most files are `git format-patch` output, while MoltenVK
+0015 and 0016 are a plain description followed by the diff. Applied in order, MoltenVK 0001 to 0004 rebuild, file for
+file, the MoltenVK tree of the gin19g build that the Microsoft Flight Simulator 2024 runs of 2026-10-12 used (checked
+on the M4 against that tree), and the SPIRV-Cross series is the commits that build carried. MoltenVK 0005 to 0011 came
+from the runs of 2026-10-12 and 13, 0012 to 0016 from the runs of 2026-10-15 to 17.
 
-## MoltenVK (v1.4.2, db66022)
+## At a glance
+
+Kinds are explained in the [top-level README](../README.md#patches-at-a-glance). None of these has been sent to
+MoltenVK or SPIRV-Cross yet (the two open MoltenVK pull requests, #2813 and #2825, are for the Intel line's MoltenVK).
+
+| Patch | What it fixes | Needed by | Kind | Pairs with |
+|---|---|---|---|---|
+| MoltenVK `0001` rebind descriptor sets | GPU hangs and garbage after MoltenVK's own clears, copies or fills. | Microsoft Flight Simulator 2024 | general | |
+| MoltenVK `0002` release 3 s late | Metal objects were freed while the GPU could still be using them. | Direct3D 12 games | workaround | |
+| MoltenVK `0003` name the device | Command buffer errors did not say which device failed. | general | diagnostics | |
+| MoltenVK `0004` 2D views as 2D arrays | Holes in the ground: shaders read texture arrays through 2D declarations, which Metal does not promise to allow. | Microsoft Flight Simulator 2024 (its recipe sets it) | Apple GPU (opt-in: `HB_MVK_TEXTURE_2D_AS_ARRAY=1`) | SPIRV-Cross 0004 |
+| MoltenVK `0005` resident placement heaps | Textures made from a heap were not resident when shaders used them. | Microsoft Flight Simulator 2024 | general | |
+| MoltenVK `0006` imported texture as memory | A texture shared from D3D11 to D3D12 read back the wrong content. | game videos | general | 0008, Wine 0036 |
+| MoltenVK `0007` shared textures uncompressed | Magenta blocks flickered in game videos. | game videos | workaround | 0006 |
+| MoltenVK `0008` retain imported textures | Crashes and a hung game once videos were shared between D3D11 and D3D12. | game videos | general | 0006, Wine 0036 |
+| MoltenVK `0009` sliced 3D views | Hard-edged slabs of light and haze over the scene. | Microsoft Flight Simulator 2024 | Apple GPU | |
+| MoltenVK `0010` Apple GPU mip layout | Smaller mip levels of compressed textures went to the wrong place and stayed stale. | Microsoft Flight Simulator 2024 | Apple GPU | layout from Mesa's AGX driver (MIT) |
+| MoltenVK `0011` render pass size limit | Command buffers failed outright: block noise in cockpit displays, garbage ground textures. | Microsoft Flight Simulator 2024 | Apple GPU | |
+| MoltenVK `0012` pipeline cache on disk | Every start converted all shaders again (7 to 8 minutes for the game). | Microsoft Flight Simulator 2024 | general (off-switch: `HB_MVK_PIPELINE_CACHE=0`) | SPIRV-Cross 0004, Wine 0038 |
+| MoltenVK `0013` descriptor pool guard room | GPU page faults at the end of the loading screens. | Microsoft Flight Simulator 2024 | workaround (off-switch: `HB_MVK_POOL_GUARD=0`) | |
+| MoltenVK `0014` partial edge blocks | Copies from compressed to uncompressed images lost their last row and column of blocks. | a standalone probe | general | |
+| MoltenVK `0015` pass variants | GPU hangs when a pipeline's formats or primitive class differ from the render pass. | Microsoft Flight Simulator 2024 | Apple GPU (off-switch: `HB_MVK_PASS_VARIANTS=0`) | |
+| MoltenVK `0016` no lossless compression | GPU hangs in flight, a one to two second freeze each. | Microsoft Flight Simulator 2024 (its recipe sets `=1`) | workaround (opt-in: `HB_MVK_NO_LOSSLESS=1` or `=large`) | 0010 |
+| SPIRV-Cross `0001` restrict alias casts | Metal rejected translated shaders (about 55 of the game's failures). | Microsoft Flight Simulator 2024 | general | |
+| SPIRV-Cross `0002` restrict on element pointers | Hull shaders failed to compile ("no matching function for call to 'patch_main'"). | tessellation through vkd3d-proton | general | |
+| SPIRV-Cross `0003` swizzle widened inputs | A widened input array element was copied back without narrowing it. | general | general | |
+| SPIRV-Cross `0004` texture_2D_as_2D_array | The shader side of MoltenVK 0004. | Microsoft Flight Simulator 2024 | Apple GPU (opt-in, set by MoltenVK 0004) | MoltenVK 0004, 0012 |
+
+## Details
+
+### MoltenVK (v1.4.2, db66022)
 
 - `0001` a descriptor set is bound again after MoltenVK's own clears, copies and fills replaced its argument buffer at
   the same Metal index. Without it the next draw or dispatch read the helper's buffer as the set: GPU hangs and
@@ -20,7 +51,8 @@ file for file, the MoltenVK tree of the gin19g build that the Microsoft Flight S
   crude: releasing when the submitted work completes would be exact.
 - `0003` command buffer error messages name the VkDevice (DXVK's and vkd3d-proton's both label theirs "Queue 0-0").
 - `0004` `HB_MVK_TEXTURE_2D_AS_ARRAY=1` creates shader-readable 2D views as one-layer 2D array textures and converts
-  shaders with SPIRV-Cross's `texture_2D_as_2D_array` (SPIRV-Cross `0004`). Off unless set.
+  shaders with SPIRV-Cross's `texture_2D_as_2D_array` (SPIRV-Cross `0004`). Off unless set. The Microsoft Flight
+  Simulator 2024 recipe sets it.
 - `0005` placement heaps go into the device's residency set. Images placed in a heap had their own texture added,
   but the textures MoltenVK makes from the heap later (block-texel views of compressed images, 2D views of 3D images)
   did not, and shader validation reported them used while not resident in three compute pipelines of Microsoft
@@ -37,7 +69,8 @@ file for file, the MoltenVK tree of the gin19g build that the Microsoft Flight S
   with 0006 and patches-arm64/0036.
 - `0009` VK_EXT_image_sliced_view_of_3d for one-level 3D images. D3D12 UAVs can cover a range of a 3D texture's
   slices, and without the extension vkd3d-proton views the whole volume, so a shader writing "its" slice at z 0 wrote
-  slice 0 (the game builds a 64x64x64 volume one slice per UAV). A sliced view is a 3D texture of the slice count
+  slice 0 (the game builds 32-slice volumes one slice per UAV, which drew hard-edged slabs of light and haze over the
+  scene). A sliced view is a 3D texture of the slice count
   placed in the image's heap at the first slice, which works because an uncompressed one-level 3D texture keeps its
   slices whole at a fixed stride (measured on Apple GPUs for 1 to 16 byte formats, 4x4 to 256x128). With mip levels
   Metal interleaves the levels, so those images keep the whole-image view. Such images go in a heap uncompressed.
@@ -58,7 +91,10 @@ file for file, the MoltenVK tree of the gin19g build that the Microsoft Flight S
   device under highball/<program> in the user's cache folder, named with the pipelineCacheUUID. Libraries read from
   cache data compile their MSL on first use. The SPIR-V to MSL conversions of one start serve the next (Microsoft
   Flight Simulator 2024: about 11,000 at 100 to 140 ms each, the critical path of its 7 to 8 minute shader
-  preparation). HB_MVK_PIPELINE_CACHE names another folder, 0 disables.
+  preparation). HB_MVK_PIPELINE_CACHE names another folder, 0 disables. The patch also tightens how a cached shader
+  library is matched, for every pipeline cache, the application's included: it now needs every output the next stage
+  reads, compares the base type and the other stage's SPIR-V hash, so a cached library serves one stage pairing only.
+  It saves SPIRV-Cross 0004's option with the library.
 - `0013` an update-after-bind descriptor pool (a D3D12 bindless heap under vkd3d-proton) gets 8 MiB + 64 KiB of guard
   room after its GPU buffer: the shaders declare the descriptor arrays at the layout maximum (1,000,003 entries of 8
   bytes) while the pool holds what the app asked for, and a descriptor index past the pool's end reads an unmapped
@@ -83,13 +119,15 @@ file for file, the MoltenVK tree of the gin19g build that the Microsoft Flight S
   Flight Simulator 2024's in-flight GPU hangs on an M4 originate in a blit encoder copying a 3840x2160 BGRA8
   private compressed image the game uploads from a buffer and copies every frame (the one FAULTED encoder under
   MTLCommandBufferErrorOptionEncoderExecutionStatus); with the switch the same route flew with 0 hangs at no
-  frame-rate cost (2026-10-16). Off by default; the game's db row sets it.
+  frame-rate cost (2026-10-16), but two of three boots with `=1` then crashed in their loading, which led to `=large`.
+  Off by default. The Microsoft Flight Simulator 2024 recipe sets `=1`, and the engine r5 flights of 2026-10-19 ran
+  with it.
 
-## SPIRV-Cross (6c09849, MoltenVK 1.4.2's pin)
+### SPIRV-Cross (6c09849, MoltenVK 1.4.2's pin)
 
 - `0001` alias casts keep the base variable's `__restrict` (Metal refused casts that dropped it, about 55 of the
   game's failing shaders), `raster_order_group` stays off arrays of buffer pointers, and an OpCopyObject of an access
-  chain keeps its access chain flag.
+  chain keeps its access chain flag. Part of it is in `spirv_glsl.cpp`, which every backend shares.
 - `0002` `__restrict` goes on the element pointer of buffer arrays passed by reference, so the parameter binds to the
   argument buffer member (hull shaders failed with "no matching function for call to 'patch_main'").
 - `0003` a flattened input array element widened to the previous stage's vector size (a float3 read as a float4) is
