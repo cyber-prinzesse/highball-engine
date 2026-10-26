@@ -1,0 +1,83 @@
+A DLL a program keeps in its <exe>.local folder is found, as on Windows.
+
+Windows' DLL redirection: when a folder named like the main exe with ".local"
+appended sits next to it, the loader looks there first for a DLL loaded by
+name. Wine's loader never looked there (upstream neither, checked at commit
+eba89375a05, 2026-10-02), so a program that ships its DLLs that way stopped
+before its first window with each of them "not found". Fahrenheit: Indigo
+Prophecy Remastered keeps Qt5, SDL2, the MinGW runtime and steam_api in
+Fahrenheit.exe.local, failed the same way in every graphics mode, and ran once
+the player linked those DLLs next to the exe (highball-db#700).
+
+Known DLLs are not redirected, as on Windows: they are opened before this
+search. A DLL of the wrong architecture in the folder falls through to the
+normal search. The folder is checked once per process, under the loader lock.
+Windows also redirects loads given a full path and ignores the folder for a
+program with a manifest unless DevOverrideEnable is set; neither is done here.
+
+Checked on the M4 with dltest.exe, which imports dlhelper.dll and loads
+dlhelper2.dll by name, both kept only in dltest.exe.local: engines
+x64-sikarugir10.0_6-r28 and x64-crossover26.3-r25 fail it at the import
+(c0000135), 32-bit and 64-bit alike. Not sent upstream.
+
+--- a/dlls/ntdll/loader.c	2026-10-26 14:46:57
++++ b/dlls/ntdll/loader.c	2026-10-26 14:46:57
+@@ -3867,6 +3867,44 @@
+ }
+ 
+ /***********************************************************************
++ *	get_dotlocal_dir
++ *
++ * The folder of the main exe's DLL redirection: a directory named like the
++ * exe with ".local" appended, next to it. Windows looks there first for a DLL
++ * loaded by name, and Wine's loader never did, so a game shipping its DLLs
++ * that way stopped before its first window with every one of them "not
++ * found" (Fahrenheit: Indigo Prophecy Remastered, Fahrenheit.exe.local).
++ * Checked once, under the loader lock.
++ */
++static const WCHAR *get_dotlocal_dir(void)
++{
++    static BOOL checked;
++    static WCHAR *dotlocal_dir;
++    const UNICODE_STRING *image = &NtCurrentTeb()->Peb->ProcessParameters->ImagePathName;
++    FILE_BASIC_INFORMATION info;
++    OBJECT_ATTRIBUTES attr;
++    UNICODE_STRING nt_name;
++    WCHAR *dir;
++
++    if (checked) return dotlocal_dir;
++    checked = TRUE;
++    if (!image->Buffer || !image->Length) return NULL;
++    if (!(dir = RtlAllocateHeap( GetProcessHeap(), 0, image->Length + sizeof(L".local") ))) return NULL;
++    memcpy( dir, image->Buffer, image->Length );
++    wcscpy( dir + image->Length / sizeof(WCHAR), L".local" );
++    if (!RtlDosPathNameToNtPathName_U_WithStatus( dir, &nt_name, NULL, NULL ))
++    {
++        InitializeObjectAttributes( &attr, &nt_name, OBJ_CASE_INSENSITIVE, 0, NULL );
++        if (!NtQueryAttributesFile( &attr, &info ) && (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY))
++            dotlocal_dir = dir;
++        RtlFreeUnicodeString( &nt_name );
++    }
++    if (dotlocal_dir) TRACE( "DLL redirection folder %s\n", debugstr_w(dotlocal_dir) );
++    else RtlFreeHeap( GetProcessHeap(), 0, dir );
++    return dotlocal_dir;
++}
++
++/***********************************************************************
+  *	find_dll_file
+  *
+  * Find the file (or already loaded module) for a given dll name.
+@@ -3917,7 +3955,12 @@
+ 
+     if (RtlDetermineDosPathNameType_U( libname ) == RtlPathTypeRelative)
+     {
+-        status = search_dll_file( load_path, libname, nt_name, pwm, mapping, image_info, id );
++        const WCHAR *dotlocal = get_dotlocal_dir();
++
++        status = STATUS_DLL_NOT_FOUND;
++        if (dotlocal) status = search_dll_file( dotlocal, libname, nt_name, pwm, mapping, image_info, id );
++        if (status == STATUS_DLL_NOT_FOUND || status == STATUS_NOT_SUPPORTED)
++            status = search_dll_file( load_path, libname, nt_name, pwm, mapping, image_info, id );
+         if (status == STATUS_DLL_NOT_FOUND)
+             status = find_builtin_without_file( libname, nt_name, pwm, mapping, image_info, id );
+     }
