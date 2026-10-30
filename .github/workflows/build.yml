@@ -12,6 +12,10 @@ on:
         description: "why this build (free text, goes in the artifact name)"
         required: false
         default: "manual"
+      cosmos_revision:
+        description: "Cosmos engine revision (names the tarball cosmos-<wine version>-r<N>; empty keeps Highball's engine-… name)"
+        required: false
+        default: ""
 permissions:
   contents: write   # the optional release step creates a release and uploads the tarball
 jobs:
@@ -115,6 +119,16 @@ jobs:
           echo "engine size: ${before} MB -> $(du -sm out/engine | cut -f1) MB"
           out/engine/bin/wine --version
           name="engine-$(out/engine/bin/wine --version | tr ' ()' '-' | tr -s '-' | sed 's/-$//')-$(date -u +%Y%m%dT%H%M%SZ)-${{ github.event.inputs.ref_note }}"
+          rev="${{ github.event.inputs.cosmos_revision }}"
+          if [ -n "$rev" ]; then
+            # Cosmos (Cosmopolitan's engine): its app reads engines/<name>/wswine.bundle/{bin,lib,share}, so the engine folder gets that alias,
+            # and the build records what went in (source pin, patch list, commit) next to it.
+            ln -s engine out/wswine.bundle
+            { echo "Cosmos engine r$rev, built by run ${{ github.run_id }} from ${{ github.repository }}@${{ github.sha }}"
+              echo "Wine: $(out/engine/bin/wine --version) from $(python3 -c 'import json;print(json.load(open("inputs.json"))["wine"]["url"])')"
+              echo "Patches:"; ls patches/*.patch | sed 's|^patches/|  |'; } > out/COSMOS-BUILD.txt
+            name="cosmos-$(out/engine/bin/wine --version | sed 's/^wine-//; s/ .*//')-r$rev"
+          fi
           tar -C out -czf "${name}.tar.gz" .
           shasum -a 256 "${name}.tar.gz" | tee "${name}.tar.gz.sha256"
           ls -la "${name}.tar.gz"
@@ -124,6 +138,8 @@ jobs:
           path: |
             engine-*.tar.gz
             engine-*.tar.gz.sha256
+            cosmos-*.tar.gz
+            cosmos-*.tar.gz.sha256
           retention-days: 14
       - name: publish release
         if: ${{ github.event.inputs.publish_release == 'true' }}
@@ -131,6 +147,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          f=$(ls engine-*.tar.gz | head -1)
+          f=$(ls cosmos-*.tar.gz engine-*.tar.gz 2>/dev/null | head -1)
           tag="${f%.tar.gz}"
           gh release create "$tag" "$f" "$f.sha256" --title "$tag" --notes "Wine from the pinned CrossOver source (inputs.json) with the patch series in patches/. Built by run ${{ github.run_id }}. Checksum in the .sha256 file."
